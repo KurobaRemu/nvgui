@@ -3,12 +3,16 @@ package connection_test
 import (
 	"bytes"
 	"context"
+	"errors"
+	"io"
 	"os/exec"
 	"strconv"
 	"strings"
 	"sync"
 	"testing"
 	"time"
+
+	"github.com/neovim/go-client/msgpack/rpc"
 
 	"nvgui/connection"
 	"nvgui/protocol"
@@ -86,8 +90,10 @@ func TestConnectionLifecycleAndTap(t *testing.T) {
 	if observedRedraws == 0 {
 		t.Fatal("OnRedraw was never called")
 	}
-	if err := conn.Nvim().Command("qa!"); err != nil {
-		t.Fatalf(":qa!: %v", err)
+	if err := conn.Nvim().Command("qa!"); err != nil &&
+		!errors.Is(err, io.EOF) && !errors.Is(err, rpc.ErrClosed) &&
+		!strings.Contains(err.Error(), "session closed") {
+		t.Fatalf(":qa! returned an unexpected error: %v", err)
 	}
 	select {
 	case <-conn.Exited():

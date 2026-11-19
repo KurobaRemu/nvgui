@@ -13,7 +13,66 @@ import (
 	"nvgui/protocol"
 )
 
+var requiredRedrawEvents = map[string]bool{
+	"grid_resize":        true,
+	"grid_clear":         true,
+	"grid_destroy":       true,
+	"grid_cursor_goto":   true,
+	"grid_line":          true,
+	"grid_scroll":        true,
+	"hl_attr_define":     true,
+	"default_colors_set": true,
+	"mode_info_set":      true,
+	"mode_change":        true,
+	"win_pos":            true,
+	"win_float_pos":      true,
+	"win_external_pos":   true,
+	"win_hide":           true,
+	"win_close":          true,
+	"msg_set_pos":        true,
+	"flush":              true,
+}
+
+var requiredEventExamples = map[string][]any{
+	"grid_resize":        {"grid_resize", []any{int64(1), int64(80), int64(24)}},
+	"grid_clear":         {"grid_clear", []any{int64(1)}},
+	"grid_destroy":       {"grid_destroy", []any{int64(1)}},
+	"grid_cursor_goto":   {"grid_cursor_goto", []any{int64(1), int64(0), int64(0)}},
+	"grid_line":          {"grid_line", []any{int64(1), int64(0), int64(0), []any{}, false}},
+	"grid_scroll":        {"grid_scroll", []any{int64(1), int64(0), int64(24), int64(80), int64(0), int64(1), int64(0)}},
+	"hl_attr_define":     {"hl_attr_define", []any{int64(1), map[string]any{}}},
+	"default_colors_set": {"default_colors_set", []any{int64(0), int64(0), int64(0), int64(0), int64(0)}},
+	"mode_info_set":      {"mode_info_set", []any{true, []any{}}},
+	"mode_change":        {"mode_change", []any{"normal", int64(0)}},
+	"win_pos":            {"win_pos", []any{int64(1), int64(1000), int64(0), int64(0), int64(80), int64(24)}},
+	"win_float_pos":      {"win_float_pos", []any{int64(2), int64(1001), "NW", int64(1), float64(0), float64(0), false, int64(50), int64(1), int64(0), int64(0)}},
+	"win_external_pos":   {"win_external_pos", []any{int64(2), int64(1001)}},
+	"win_hide":           {"win_hide", []any{int64(1)}},
+	"win_close":          {"win_close", []any{int64(1)}},
+	"msg_set_pos":        {"msg_set_pos", []any{int64(3), int64(22), false, "", int64(200), int64(2)}},
+	"flush":              {"flush", []any{}},
+}
+
+func TestRequiredEventsNotUnknown(t *testing.T) {
+	for name, group := range requiredEventExamples {
+		events, err := protocol.DecodeRedraw([]any{group})
+		if err != nil {
+			t.Fatalf("DecodeRedraw(%s): %v", name, err)
+		}
+		if len(events) == 0 {
+			t.Fatalf("required event %q was dropped", name)
+		}
+		for _, event := range events {
+			if _, isUnknown := event.(protocol.Unknown); isUnknown {
+				t.Fatalf("required event %q decoded as Unknown: %#v", name, event)
+			}
+		}
+	}
+}
+
 func TestGoldenMessagesAndRedraws(t *testing.T) {
+	allOtherEventNames := map[string]bool{}
+	allUnknownEventNames := map[string]bool{}
 	for _, golden := range oracle.List() {
 		golden := golden
 		t.Run(golden.Name, func(t *testing.T) {
@@ -23,7 +82,7 @@ func TestGoldenMessagesAndRedraws(t *testing.T) {
 			}
 			var joined []byte
 			redrawCount := 0
-			knownEvents := map[string]bool{}
+			sawFlush := false
 			for _, message := range messages {
 				joined = append(joined, message.Raw...)
 				if message.Method != "redraw" || message.Type != 2 {
@@ -34,11 +93,47 @@ func TestGoldenMessagesAndRedraws(t *testing.T) {
 				if err != nil {
 					t.Fatalf("DecodeRedraw for redraw %d: %v", redrawCount, err)
 				}
-				for _, event := range events {
-					if _, isUnknown := event.(protocol.Unknown); isUnknown {
-						t.Fatalf("redraw %d decoded a known event as Unknown: %#v", redrawCount, event)
+				otherGroupCounts := map[string]int{}
+				for _, rawGroup := range message.Args {
+					group, ok := rawGroup.([]any)
+					if !ok || len(group) == 0 {
+						t.Fatalf("redraw %d has a malformed event group: %#v", redrawCount, rawGroup)
 					}
-					knownEvents[event.EventName()] = true
+					name, ok := group[0].(string)
+					if !ok {
+						t.Fatalf("redraw %d event name is %T, want string", redrawCount, group[0])
+					}
+					if requiredRedrawEvents[name] {
+						continue
+					}
+					allOtherEventNames[name] = true
+					otherGroupCounts[name]++
+				}
+				unknownCounts := map[string]int{}
+				for _, event := range events {
+					unknown, isUnknown := event.(protocol.Unknown)
+					if !isUnknown {
+						if event.EventName() == "flush" {
+							sawFlush = true
+						}
+						if !requiredRedrawEvents[event.EventName()] {
+							t.Fatalf("non-required event %q decoded as %T, want protocol.Unknown", event.EventName(), event)
+						}
+						continue
+					}
+					if requiredRedrawEvents[unknown.Name] {
+						t.Fatalf("required event %q decoded as Unknown: %#v", unknown.Name, unknown)
+					}
+					unknownCounts[unknown.Name]++
+					allUnknownEventNames[unknown.Name] = true
+					if len(unknown.Args) == 0 {
+						t.Fatalf("Unknown %q lost its parameters: %#v", unknown.Name, unknown.Args)
+					}
+				}
+				for name, groupCount := range otherGroupCounts {
+					if unknownCounts[name] < groupCount {
+						t.Fatalf("non-required event %q was dropped in %s redraw %d: got %d Unknown, want at least %d", name, golden.Name, redrawCount, unknownCounts[name], groupCount)
+					}
 				}
 			}
 			if !bytes.Equal(joined, golden.Inbound) {
@@ -47,13 +142,18 @@ func TestGoldenMessagesAndRedraws(t *testing.T) {
 			if redrawCount != golden.Meta.RedrawCount {
 				t.Fatalf("redraw count = %d, want %d", redrawCount, golden.Meta.RedrawCount)
 			}
-			if knownEvents["unknown"] || knownEvents["Unknown"] {
-				t.Fatal("a known redraw event decoded with name Unknown")
-			}
-			if !knownEvents["flush"] {
+			if !sawFlush {
 				t.Fatal("no flush event decoded")
 			}
 		})
+	}
+	if len(allOtherEventNames) == 0 {
+		t.Fatal("goldens contain no non-required redraw events to check Unknown decoding")
+	}
+	for name := range allOtherEventNames {
+		if !allUnknownEventNames[name] {
+			t.Fatalf("non-required event %q was never decoded as Unknown", name)
+		}
 	}
 }
 
