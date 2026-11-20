@@ -33,36 +33,37 @@ func TestRecorderGoldenExportReplay(t *testing.T) {
 	for _, golden := range oracle.List() {
 		golden := golden
 		t.Run(golden.Name, func(t *testing.T) {
-			exportAt := len(golden.Inbound) / 2
-			if exportAt == 0 {
-				t.Fatal("golden inbound is empty")
-			}
-			clock := &fakeClock{now: time.Unix(0, 0)}
-			recorder := diag.NewRecorder(30*time.Second, clock)
-			reducer := screen.NewReducer()
-			var latest *screen.State
 			allMessages, err := protocol.ReadMessages(golden.Inbound)
 			if err != nil {
 				t.Fatalf("ReadMessages: %v", err)
 			}
-			appliedMsgs := 0
-			bytesWritten := 0
+			exportOffsets := committedOffsets(t, allMessages, golden.Inbound)
+			if len(exportOffsets) == 0 {
+				t.Fatal("golden has no committed state")
+			}
+			clock := &fakeClock{now: time.Unix(0, 0)}
+			recorder := diag.NewRecorder(30*time.Second, clock)
+			reducer := screen.NewReducer()
+			appliedMessages := 0
+			writtenBytes := 0
+			latest := (*screen.State)(nil)
+			exportIndex := 0
 			random := rand.New(rand.NewSource(int64(len(golden.Name)) + 1))
-			for bytesWritten < exportAt {
-				remaining := exportAt - bytesWritten
+			for writtenBytes < len(golden.Inbound) {
+				remaining := len(golden.Inbound) - writtenBytes
 				chunkSize := 1 + random.Intn(97)
 				if chunkSize > remaining {
 					chunkSize = remaining
 				}
-				chunk := golden.Inbound[bytesWritten : bytesWritten+chunkSize]
+				chunk := golden.Inbound[writtenBytes : writtenBytes+chunkSize]
 				count, err := recorder.Write(chunk)
 				if err != nil || count != len(chunk) {
 					t.Fatalf("Write = (%d, %v), want (%d, nil)", count, err, len(chunk))
 				}
-				bytesWritten += count
+				writtenBytes += count
 				clock.Advance(time.Duration(1+random.Intn(20)) * time.Millisecond)
-				completeCount := completeMessageCount(t, allMessages, golden.Inbound, golden.Inbound[:bytesWritten])
-				for _, message := range allMessages[appliedMsgs:completeCount] {
+				completeCount := completeMessageCount(t, allMessages, golden.Inbound, golden.Inbound[:writtenBytes])
+				for _, message := range allMessages[appliedMessages:completeCount] {
 					if message.Type != 2 || message.Method != "redraw" {
 						continue
 					}
@@ -79,41 +80,47 @@ func TestRecorderGoldenExportReplay(t *testing.T) {
 						latest = state
 					}
 				}
-				appliedMsgs = completeCount
+				appliedMessages = completeCount
+				for exportIndex < len(exportOffsets) && writtenBytes >= exportOffsets[exportIndex] {
+					if latest == nil {
+						t.Fatalf("no committed state after commit %d", exportIndex+1)
+					}
+					wantCanonical, err := screen.Canonical(latest)
+					if err != nil {
+						t.Fatalf("Canonical(Latest): %v", err)
+					}
+					directory := filepath.Join(t.TempDir(), fmt.Sprintf("bundle-%d", exportIndex))
+					meta := diag.Meta{
+						NvimVersion: golden.Meta.NvimVersion,
+						APILevel:    golden.Meta.APILevel,
+						UIOptions:   golden.Meta.UIOptions,
+						GUIVersion:  "test",
+						GOOS:        "test",
+					}
+					if err := recorder.Export(directory, meta); err != nil {
+						t.Fatalf("Export after commit %d: %v", exportIndex+1, err)
+					}
+					assertBundleFiles(t, directory)
+					replayed, err := diag.Replay(directory)
+					if err != nil {
+						t.Fatalf("Replay after commit %d: %v", exportIndex+1, err)
+					}
+					if len(replayed) == 0 {
+						t.Fatalf("Replay after commit %d returned no states", exportIndex+1)
+					}
+					gotCanonical, err := screen.Canonical(replayed[len(replayed)-1])
+					if err != nil {
+						t.Fatalf("Canonical(Replay last): %v", err)
+					}
+					_, difference := compareCanonical(wantCanonical, gotCanonical)
+					if difference != "" {
+						t.Fatalf("Replay last frame differs from Latest after commit %d at %s", exportIndex+1, difference)
+					}
+					exportIndex++
+				}
 			}
-			if latest == nil {
-				t.Fatal("no committed state before export")
-			}
-			wantCanonical, err := screen.Canonical(latest)
-			if err != nil {
-				t.Fatalf("Canonical(Latest): %v", err)
-			}
-			directory := filepath.Join(t.TempDir(), "bundle")
-			meta := diag.Meta{
-				NvimVersion: golden.Meta.NvimVersion,
-				APILevel:    golden.Meta.APILevel,
-				UIOptions:   golden.Meta.UIOptions,
-				GUIVersion:  "test",
-				GOOS:        "test",
-			}
-			if err := recorder.Export(directory, meta); err != nil {
-				t.Fatalf("Export: %v", err)
-			}
-			assertBundleFiles(t, directory)
-			states, err := diag.Replay(directory)
-			if err != nil {
-				t.Fatalf("Replay: %v", err)
-			}
-			if len(states) == 0 {
-				t.Fatal("Replay returned no states")
-			}
-			gotCanonical, err := screen.Canonical(states[len(states)-1])
-			if err != nil {
-				t.Fatalf("Canonical(Replay last): %v", err)
-			}
-			_, difference := compareCanonical(wantCanonical, gotCanonical)
-			if difference != "" {
-				t.Fatalf("Replay last frame differs from Latest at %s", difference)
+			if exportIndex != len(exportOffsets) {
+				t.Fatalf("exported %d committed states, want %d", exportIndex, len(exportOffsets))
 			}
 		})
 	}
@@ -377,8 +384,17 @@ func TestWatchdogStallAndFlushRearm(t *testing.T) {
 				if err != nil {
 					t.Fatalf("DecodeRedraw: %v", err)
 				}
-				watchdog.Observe(events)
-				watchdog.Observe(events)
+				firstPending := true
+				for _, event := range events {
+					if _, isFlush := event.(protocol.Flush); isFlush {
+						watchdog.Observe([]protocol.Event{event})
+						continue
+					}
+					if firstPending {
+						watchdog.Observe([]protocol.Event{event})
+						firstPending = false
+					}
+				}
 				clock.Advance(time.Second)
 				watchdog.Tick()
 			}
@@ -438,6 +454,31 @@ func completeMessageCount(t *testing.T, messages []protocol.Message, full, prefi
 func completeMessagesInPrefix(t *testing.T, messages []protocol.Message, full, prefix []byte) []protocol.Message {
 	t.Helper()
 	return messages[:completeMessageCount(t, messages, full, prefix)]
+}
+
+func committedOffsets(t *testing.T, messages []protocol.Message, full []byte) []int {
+	t.Helper()
+	offsets := []int{}
+	offset := 0
+	for _, message := range messages {
+		offset += len(message.Raw)
+		if message.Type != 2 || message.Method != "redraw" {
+			continue
+		}
+		events, err := protocol.DecodeRedraw(message.Args)
+		if err != nil {
+			t.Fatalf("DecodeRedraw: %v", err)
+		}
+		for _, event := range events {
+			if _, isFlush := event.(protocol.Flush); isFlush {
+				offsets = append(offsets, offset)
+			}
+		}
+	}
+	if offset != len(full) {
+		t.Fatalf("messages cover %d bytes, want %d", offset, len(full))
+	}
+	return offsets
 }
 
 func replayAllGoldenStates(t *testing.T, golden oracle.Golden) []*screen.State {

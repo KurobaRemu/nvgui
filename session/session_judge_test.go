@@ -3,7 +3,9 @@ package session_test
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -12,6 +14,8 @@ import (
 	"sync"
 	"testing"
 	"time"
+
+	"github.com/neovim/go-client/msgpack/rpc"
 
 	"nvgui/connection"
 	"nvgui/diag"
@@ -118,8 +122,10 @@ func TestSessionEndToEnd(t *testing.T) {
 	if err := sess.Nvim().Eval("getpid()", &pid); err != nil {
 		t.Fatalf("getpid(): %v", err)
 	}
-	if err := sess.Nvim().Command("qa!"); err != nil {
-		t.Fatalf(":qa!: %v", err)
+	if err := sess.Nvim().Command("qa!"); err != nil &&
+		!errors.Is(err, io.EOF) && !errors.Is(err, rpc.ErrClosed) &&
+		!strings.Contains(err.Error(), "session closed") {
+		t.Fatalf(":qa! returned an unexpected error: %v", err)
 	}
 	select {
 	case <-sess.Exited():
