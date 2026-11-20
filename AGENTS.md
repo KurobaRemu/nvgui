@@ -11,3 +11,12 @@
 ## Go 命令
 
 所有 Go 命令必须使用前缀 `env -u GOROOT nice -n 15`，并且只运行契约指定的 Go 包。
+
+## M1 依赖约定
+
+- `github.com/egoist/mygo` 固定为 `v0.10.1-0.20261118142248-400ba3b17c3e`，不使用本地 `replace`。
+- 只有 `text` / `render` / `input` / `app` 与 `cmd/nvgui` 可引用 `github.com/egoist/mygo` 或 `github.com/egoist/mygo/ui`；`cmd/nvgui` 属于 `app` 启动入口。
+- 禁止引用 `github.com/egoist/mygo/internal/*`、`github.com/egoist/mygo/plugins/terminal` 与 mygo 未导出 API。
+- `connection` / `protocol` / `screen` / `diag` / `session` / `drawlist` / `renderlist` / `oracle` 及其测试依赖均不得包含 mygo。
+- 生产依赖只能向下：`app`、`cmd/nvgui` 可引用所有下层；`render` 可引用 `drawlist` / `renderlist` / `text` / `screen` / `protocol`；`input` 可引用 `screen` / `diag` / `protocol`；`diag` 可引用 `drawlist` / `renderlist` / `screen` / `protocol`（禁止引用 `input` 与 `mygo`；`TraceKind`/`TraceEvent` 定义在 `diag`，由 `input` 通过类型别名复用）；`session` 可引用 `connection` / `diag` / `protocol` / `screen`；`drawlist` 与 `text` 只引用 `screen` / `protocol`；下层不得引用上层。
+- `tools/check.sh` 控制生产依赖方向、mygo 白名单与包循环；测试依赖不参与分层方向判定。
