@@ -410,10 +410,10 @@ func decodeGridLine(args []any) (Event, error) {
 			if err != nil {
 				return nil, fmt.Errorf("grid_line cell %d repeat: %w", index, err)
 			}
+			if value < 0 {
+				return nil, fmt.Errorf("grid_line cell %d repeat is negative: %d", index, value)
+			}
 			repeat = int(value)
-		}
-		if repeat < 1 {
-			repeat = 1
 		}
 		cells = append(cells, LineCell{Text: text, HL: highlight, Repeat: repeat})
 	}

@@ -245,6 +245,12 @@ func replaySplitBatches(t *testing.T, batches []redrawBatch) []*screen.State {
 func remapHighlightIDs(t *testing.T, batches []redrawBatch, seed int64) []redrawBatch {
 	t.Helper()
 	used := map[int64]bool{}
+	collectID := func(value any) {
+		id, ok := integerValue(value)
+		if ok && id > 0 {
+			used[id] = true
+		}
+	}
 	for _, batch := range batches {
 		for _, group := range eventGroups(t, batch.Args) {
 			name, ok := group[0].(string)
@@ -255,18 +261,14 @@ func remapHighlightIDs(t *testing.T, batches []redrawBatch, seed int64) []redraw
 			case "hl_attr_define":
 				for _, tuple := range parameterTuples(t, group) {
 					if len(tuple) > 0 {
-						if id, ok := integerValue(tuple[0]); ok {
-							used[id] = true
-						}
+						collectID(tuple[0])
 					}
 				}
 			case "grid_line":
 				for _, tuple := range parameterTuples(t, group) {
 					for _, item := range cellsOf(t, tuple) {
 						if len(item) > 1 {
-							if id, ok := integerValue(item[1]); ok {
-								used[id] = true
-							}
+							collectID(item[1])
 						}
 					}
 				}
@@ -279,9 +281,7 @@ func remapHighlightIDs(t *testing.T, batches []redrawBatch, seed int64) []redraw
 								continue
 							}
 							for _, key := range []string{"attr_id", "attr_id_lm"} {
-								if id, ok := integerValue(info[key]); ok {
-									used[id] = true
-								}
+								collectID(info[key])
 							}
 						}
 					}
@@ -455,7 +455,7 @@ func integerValue(value any) (int64, bool) {
 
 func mapID(value any, mapping map[int64]int64) any {
 	id, ok := integerValue(value)
-	if !ok {
+	if !ok || id <= 0 {
 		return value
 	}
 	if mapped, found := mapping[id]; found {
