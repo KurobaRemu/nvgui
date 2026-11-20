@@ -253,29 +253,35 @@ func remapHighlightIDs(t *testing.T, batches []redrawBatch, seed int64) []redraw
 			}
 			switch name {
 			case "hl_attr_define":
-				if len(group) > 1 {
-					if id, ok := integerValue(group[1]); ok {
-						used[id] = true
-					}
-				}
-			case "grid_line":
-				for _, item := range cellsOf(t, group) {
-					if len(item) > 1 {
-						if id, ok := integerValue(item[1]); ok {
+				for _, tuple := range parameterTuples(t, group) {
+					if len(tuple) > 0 {
+						if id, ok := integerValue(tuple[0]); ok {
 							used[id] = true
 						}
 					}
 				}
-			case "mode_info_set":
-				if len(group) > 2 {
-					for _, raw := range asSlice(group[2]) {
-						info, ok := raw.(map[string]any)
-						if !ok {
-							continue
-						}
-						for _, key := range []string{"attr_id", "attr_id_lm"} {
-							if id, ok := integerValue(info[key]); ok {
+			case "grid_line":
+				for _, tuple := range parameterTuples(t, group) {
+					for _, item := range cellsOf(t, tuple) {
+						if len(item) > 1 {
+							if id, ok := integerValue(item[1]); ok {
 								used[id] = true
+							}
+						}
+					}
+				}
+			case "mode_info_set":
+				for _, tuple := range parameterTuples(t, group) {
+					if len(tuple) > 1 {
+						for _, raw := range asSlice(tuple[1]) {
+							info, ok := raw.(map[string]any)
+							if !ok {
+								continue
+							}
+							for _, key := range []string{"attr_id", "attr_id_lm"} {
+								if id, ok := integerValue(info[key]); ok {
+									used[id] = true
+								}
 							}
 						}
 					}
@@ -316,26 +322,40 @@ func remapHighlightIDs(t *testing.T, batches []redrawBatch, seed int64) []redraw
 			name, _ := group[0].(string)
 			switch name {
 			case "hl_attr_define":
-				if len(group) > 1 {
-					group[1] = mapID(group[1], mapping)
-				}
+				mapIDsInParameterTuples(group, func(tuple []any) {
+					if len(tuple) > 0 {
+						tuple[0] = mapID(tuple[0], mapping)
+					}
+				})
 			case "grid_line":
-				if len(group) > 4 {
-					cells := asSlice(group[4])
+				mapIDsInParameterTuples(group, func(tuple []any) {
+					if len(tuple) < 4 {
+						return
+					}
+					cells := asSlice(tuple[3])
 					for index, raw := range cells {
-						cell := deepCopyAny(raw).([]any)
+						cell, ok := deepCopyAny(raw).([]any)
+						if !ok {
+							continue
+						}
 						if len(cell) > 1 {
 							cell[1] = mapID(cell[1], mapping)
 						}
 						cells[index] = cell
 					}
-					group[4] = cells
-				}
+					tuple[3] = cells
+				})
 			case "mode_info_set":
-				if len(group) > 2 {
-					infos := asSlice(group[2])
+				mapIDsInParameterTuples(group, func(tuple []any) {
+					if len(tuple) < 2 {
+						return
+					}
+					infos := asSlice(tuple[1])
 					for index, raw := range infos {
-						info := deepCopyAny(raw).(map[string]any)
+						info, ok := deepCopyAny(raw).(map[string]any)
+						if !ok {
+							continue
+						}
 						for _, key := range []string{"attr_id", "attr_id_lm"} {
 							if value, exists := info[key]; exists {
 								info[key] = mapID(value, mapping)
@@ -343,8 +363,8 @@ func remapHighlightIDs(t *testing.T, batches []redrawBatch, seed int64) []redraw
 						}
 						infos[index] = info
 					}
-					group[2] = infos
-				}
+					tuple[1] = infos
+				})
 			}
 			groups = append(groups, group)
 		}
@@ -369,13 +389,39 @@ func eventGroups(t *testing.T, args []any) [][]any {
 	return groups
 }
 
-func cellsOf(t *testing.T, group []any) [][]any {
+func parameterTuples(t *testing.T, group []any) [][]any {
 	t.Helper()
-	if len(group) < 5 {
+	if len(group) < 2 {
+		t.Fatalf("event %v has no parameter tuple", group)
+	}
+	tuples := make([][]any, 0, len(group)-1)
+	for _, raw := range group[1:] {
+		tuple, ok := raw.([]any)
+		if !ok {
+			t.Fatalf("event %v parameter tuple %T is not an array", group[0], raw)
+		}
+		tuples = append(tuples, tuple)
+	}
+	return tuples
+}
+
+func mapIDsInParameterTuples(group []any, mapTuple func([]any)) {
+	for index := 1; index < len(group); index++ {
+		tuple, ok := group[index].([]any)
+		if !ok {
+			continue
+		}
+		mapTuple(tuple)
+	}
+}
+
+func cellsOf(t *testing.T, tuple []any) [][]any {
+	t.Helper()
+	if len(tuple) < 4 {
 		return nil
 	}
 	var cells [][]any
-	for _, raw := range asSlice(group[4]) {
+	for _, raw := range asSlice(tuple[3]) {
 		cell, ok := raw.([]any)
 		if !ok {
 			t.Fatalf("grid_line cell %T is not an array", raw)

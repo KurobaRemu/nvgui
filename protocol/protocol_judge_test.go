@@ -44,9 +44,9 @@ var requiredEventExamples = map[string][]any{
 	"default_colors_set": {"default_colors_set", []any{int64(0), int64(0), int64(0), int64(0), int64(0)}},
 	"mode_info_set":      {"mode_info_set", []any{true, []any{}}},
 	"mode_change":        {"mode_change", []any{"normal", int64(0)}},
-	"win_pos":            {"win_pos", []any{int64(1), int64(1000), int64(0), int64(0), int64(80), int64(24)}},
-	"win_float_pos":      {"win_float_pos", []any{int64(2), int64(1001), "NW", int64(1), float64(0), float64(0), false, int64(50), int64(1), int64(0), int64(0)}},
-	"win_external_pos":   {"win_external_pos", []any{int64(2), int64(1001)}},
+	"win_pos":            {"win_pos", []any{int64(1), protocol.Handle{Kind: 2, ID: 1000}, int64(0), int64(0), int64(80), int64(24)}},
+	"win_float_pos":      {"win_float_pos", []any{int64(2), protocol.Handle{Kind: 2, ID: 1001}, "NW", int64(1), float64(0), float64(0), false, int64(50), int64(1), int64(17), int64(23)}},
+	"win_external_pos":   {"win_external_pos", []any{int64(2), protocol.Handle{Kind: 2, ID: 1001}}},
 	"win_hide":           {"win_hide", []any{int64(1)}},
 	"win_close":          {"win_close", []any{int64(1)}},
 	"msg_set_pos":        {"msg_set_pos", []any{int64(3), int64(22), false, "", int64(200), int64(2)}},
@@ -93,7 +93,7 @@ func TestGoldenMessagesAndRedraws(t *testing.T) {
 				if err != nil {
 					t.Fatalf("DecodeRedraw for redraw %d: %v", redrawCount, err)
 				}
-				otherGroupCounts := map[string]int{}
+				otherParameterCounts := map[string]int{}
 				for _, rawGroup := range message.Args {
 					group, ok := rawGroup.([]any)
 					if !ok || len(group) == 0 {
@@ -107,7 +107,12 @@ func TestGoldenMessagesAndRedraws(t *testing.T) {
 						continue
 					}
 					allOtherEventNames[name] = true
-					otherGroupCounts[name]++
+					otherParameterCounts[name] += len(group) - 1
+					for _, rawTuple := range group[1:] {
+						if _, ok := rawTuple.([]any); !ok {
+							t.Fatalf("redraw %d %s parameter tuple is %T, want array", redrawCount, name, rawTuple)
+						}
+					}
 				}
 				unknownCounts := map[string]int{}
 				for _, event := range events {
@@ -126,13 +131,10 @@ func TestGoldenMessagesAndRedraws(t *testing.T) {
 					}
 					unknownCounts[unknown.Name]++
 					allUnknownEventNames[unknown.Name] = true
-					if len(unknown.Args) == 0 {
-						t.Fatalf("Unknown %q lost its parameters: %#v", unknown.Name, unknown.Args)
-					}
 				}
-				for name, groupCount := range otherGroupCounts {
-					if unknownCounts[name] < groupCount {
-						t.Fatalf("non-required event %q was dropped in %s redraw %d: got %d Unknown, want at least %d", name, golden.Name, redrawCount, unknownCounts[name], groupCount)
+				for name, tupleCount := range otherParameterCounts {
+					if unknownCounts[name] < tupleCount {
+						t.Fatalf("non-required event %q was dropped in %s redraw %d: got %d Unknown, want at least %d", name, golden.Name, redrawCount, unknownCounts[name], tupleCount)
 					}
 				}
 			}
@@ -157,6 +159,27 @@ func TestGoldenMessagesAndRedraws(t *testing.T) {
 	}
 }
 
+func TestWinFloatPosScreenCoordinates(t *testing.T) {
+	group := []any{"win_float_pos", []any{
+		int64(5), protocol.Handle{Kind: 2, ID: 1002}, "NW", int64(1),
+		float64(6), float64(16), true, int64(60), int64(1), int64(6), int64(16),
+	}}
+	events, err := protocol.DecodeRedraw([]any{group})
+	if err != nil {
+		t.Fatalf("DecodeRedraw: %v", err)
+	}
+	if len(events) != 1 {
+		t.Fatalf("event count = %d, want 1", len(events))
+	}
+	position, ok := events[0].(protocol.WinFloatPos)
+	if !ok {
+		t.Fatalf("event type = %T, want protocol.WinFloatPos", events[0])
+	}
+	if position.ScreenRow != 6 || position.ScreenCol != 16 {
+		t.Fatalf("ScreenRow/ScreenCol = %d/%d, want 6/16", position.ScreenRow, position.ScreenCol)
+	}
+}
+
 func TestDecodeRedrawForwardCompatibility(t *testing.T) {
 	golden := firstGolden(t)
 	messages, err := protocol.ReadMessages(golden.Inbound)
@@ -174,23 +197,49 @@ func TestDecodeRedrawForwardCompatibility(t *testing.T) {
 		extended := append([]any(nil), message.Args...)
 		for eventIndex := range extended {
 			group, ok := extended[eventIndex].([]any)
-			if !ok || len(group) == 0 {
+			if !ok || len(group) < 2 {
 				continue
 			}
-			augmented := append([]any(nil), group...)
-			augmented = append(augmented, int64(0x5eed))
-			extended[eventIndex] = augmented
+			for tupleIndex := 1; tupleIndex < len(group); tupleIndex++ {
+				tuple, ok := group[tupleIndex].([]any)
+				if !ok {
+					t.Fatalf("redraw %d %v parameter tuple %d is %T, want array", messageIndex, group[0], tupleIndex-1, group[tupleIndex])
+				}
+				group[tupleIndex] = append(append([]any(nil), tuple...), int64(0x5eed))
+			}
 		}
 		got, err := protocol.DecodeRedraw(extended)
 		if err != nil {
 			t.Fatalf("DecodeRedraw with appended future parameters message %d: %v", messageIndex, err)
 		}
-		if !reflect.DeepEqual(got, baseline) {
-			t.Fatalf("decode changed with appended parameters at message %d:\n got %#v\nwant %#v", messageIndex, got, baseline)
+		if len(got) != len(baseline) {
+			t.Fatalf("decode produced %d events, want %d", len(got), len(baseline))
+		}
+		for eventIndex, event := range got {
+			known, isUnknown := event.(protocol.Unknown)
+			want, wantIsUnknown := baseline[eventIndex].(protocol.Unknown)
+			if isUnknown != wantIsUnknown {
+				t.Fatalf("event %d type changed with future parameters: got %T, want %T", eventIndex, event, baseline[eventIndex])
+			}
+			if isUnknown {
+				if known.Name != want.Name {
+					t.Fatalf("Unknown event %d name = %q, want %q", eventIndex, known.Name, want.Name)
+				}
+				if len(known.Args) != len(want.Args)+1 || !reflect.DeepEqual(known.Args[len(want.Args)], int64(0x5eed)) {
+					t.Fatalf("Unknown event %d did not preserve appended future parameter: %#v", eventIndex, known.Args)
+				}
+				if len(want.Args) > 0 && !reflect.DeepEqual(known.Args[:len(want.Args)], want.Args) {
+					t.Fatalf("Unknown event %d original parameters changed: got %#v, want %#v", eventIndex, known.Args[:len(want.Args)], want.Args)
+				}
+				continue
+			}
+			if !reflect.DeepEqual(event, baseline[eventIndex]) {
+				t.Fatalf("known event %d changed with future parameters:\n got %#v\nwant %#v", eventIndex, event, baseline[eventIndex])
+			}
 		}
 	}
 
-	unknown, err := protocol.DecodeRedraw([]any{[]any{"future_ui_event", int64(7), "extra"}})
+	unknown, err := protocol.DecodeRedraw([]any{[]any{"future_ui_event", []any{int64(7), "extra"}}})
 	if err != nil {
 		t.Fatalf("DecodeRedraw unknown name: %v", err)
 	}
@@ -207,16 +256,17 @@ func TestDecodeRedrawForwardCompatibility(t *testing.T) {
 
 func TestDecodeRedrawMalformedEvents(t *testing.T) {
 	malformed := [][]any{
-		{[]any{"grid_resize", int64(1)}},
-		{[]any{"grid_line", int64(1), int64(0), int64(0), "not-cells", false}},
-		{[]any{"grid_line", int64(1), int64(0), int64(0), []any{[]any{}}, false}},
-		{[]any{"hl_attr_define", int64(1), "not-a-map"}},
-		{[]any{"default_colors_set", "not-an-int"}},
-		{[]any{"mode_info_set", int64(1)}},
-		{[]any{"mode_change", int64(1), int64(0)}},
-		{[]any{"win_float_pos", int64(1), int64(1000), "NW", int64(1), int64(0), int64(0), true}},
-		{[]any{"msg_set_pos", int64(3), int64(22), false}},
-		{[]any{int64(123), int64(1)}},
+		{[]any{"grid_resize", []any{int64(1)}}},
+		{[]any{"grid_line", []any{int64(1), int64(0), int64(0), "not-cells", false}}},
+		{[]any{"grid_line", []any{int64(1), int64(0), int64(0), []any{[]any{}}, false}}},
+		{[]any{"hl_attr_define", []any{int64(1), "not-a-map"}}},
+		{[]any{"default_colors_set", []any{"not-an-int"}}},
+		{[]any{"mode_info_set", []any{int64(1)}}},
+		{[]any{"mode_change", []any{int64(1), int64(0)}}},
+		{[]any{"win_float_pos", []any{int64(1), int64(1000), "NW", int64(1), int64(0), int64(0), true}}},
+		{[]any{"msg_set_pos", []any{int64(3), int64(22), false}}},
+		{[]any{int64(123), []any{int64(1)}}},
+		{[]any{"grid_resize", int64(1), int64(80), int64(24)}},
 	}
 	for index, args := range malformed {
 		args := args
@@ -256,14 +306,16 @@ func TestDecodeRedrawRandomTruncations(t *testing.T) {
 func TestGridLineExplicitHighlight(t *testing.T) {
 	args := []any{
 		[]any{
-			"grid_line", int64(1), int64(3), int64(2),
-			[]any{
-				[]any{"a", int64(7), int64(2)},
-				[]any{"b"},
-				[]any{"", int64(9)},
-				[]any{"c"},
+			"grid_line", []any{
+				int64(1), int64(3), int64(2),
+				[]any{
+					[]any{"a", int64(7), int64(2)},
+					[]any{"b"},
+					[]any{"", int64(9)},
+					[]any{"c"},
+				},
+				false,
 			},
-			false,
 		},
 	}
 	events, err := protocol.DecodeRedraw(args)
