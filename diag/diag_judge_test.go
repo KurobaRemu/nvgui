@@ -327,6 +327,8 @@ func TestRecorderExcludesHalfWrittenMessage(t *testing.T) {
 }
 
 func TestWatchdogStallAndFlushRearm(t *testing.T) {
+	const watchdogTimeout = 2 * time.Second
+	const messageInterval = time.Millisecond
 	for _, golden := range oracle.List() {
 		golden := golden
 		t.Run(golden.Name, func(t *testing.T) {
@@ -335,7 +337,7 @@ func TestWatchdogStallAndFlushRearm(t *testing.T) {
 			}
 			clock := &fakeClock{now: time.Unix(0, 0)}
 			stalls := []int{}
-			watchdog := diag.NewWatchdog(2*time.Second, clock, func(pendingEvents int) {
+			watchdog := diag.NewWatchdog(watchdogTimeout, clock, func(pendingEvents int) {
 				stalls = append(stalls, pendingEvents)
 			})
 			messages, err := protocol.ReadMessages(golden.Inbound)
@@ -344,59 +346,87 @@ func TestWatchdogStallAndFlushRearm(t *testing.T) {
 			}
 			if golden.Name == "s10-bulk-delete" {
 				pendingEvents := 0
+				stallWindowStart := clock.Now()
+				longestWithoutFlush := time.Duration(0)
 				for _, message := range messages {
-					if message.Type != 2 || message.Method != "redraw" {
-						continue
-					}
-					events, err := protocol.DecodeRedraw(message.Args)
-					if err != nil {
-						t.Fatalf("DecodeRedraw: %v", err)
-					}
-					withoutFlush := make([]protocol.Event, 0, len(events))
-					for _, event := range events {
-						if _, isFlush := event.(protocol.Flush); isFlush {
-							continue
+					clock.Advance(messageInterval)
+					if message.Type == 2 && message.Method == "redraw" {
+						events, err := protocol.DecodeRedraw(message.Args)
+						if err != nil {
+							t.Fatalf("DecodeRedraw: %v", err)
 						}
-						withoutFlush = append(withoutFlush, event)
+						withoutFlush := make([]protocol.Event, 0, len(events))
+						for _, event := range events {
+							if _, isFlush := event.(protocol.Flush); isFlush {
+								continue
+							}
+							withoutFlush = append(withoutFlush, event)
+						}
+						if len(withoutFlush) > 0 {
+							pendingEvents += len(withoutFlush)
+							watchdog.Observe(withoutFlush)
+						}
+						watchdog.Tick()
 					}
-					if len(withoutFlush) > 0 {
-						pendingEvents += len(withoutFlush)
-						watchdog.Observe(withoutFlush)
+					if elapsed := clock.Now().Sub(stallWindowStart); elapsed > longestWithoutFlush {
+						longestWithoutFlush = elapsed
 					}
 				}
 				if pendingEvents == 0 {
 					t.Fatal("s10-bulk-delete has no redraw events before flush")
 				}
-				clock.Advance(3 * time.Second)
+				if longestWithoutFlush >= watchdogTimeout {
+					t.Fatalf("s10-bulk-delete simulated elapsed without Flush = %s, want < %s", longestWithoutFlush, watchdogTimeout)
+				}
+				if len(stalls) != 0 {
+					t.Fatalf("s10-bulk-delete stalled before injected timeout: %v", stalls)
+				}
+				clock.Advance(watchdogTimeout)
 				watchdog.Tick()
-				clock.Advance(10 * time.Second)
+				if len(stalls) != 1 || stalls[0] != pendingEvents {
+					t.Fatalf("s10-bulk-delete stalls = %v, want one stall with %d pending events", stalls, pendingEvents)
+				}
+				watchdog.Observe([]protocol.Event{protocol.GridResize{Grid: 1, Width: 80, Height: 24}})
+				clock.Advance(watchdogTimeout)
 				watchdog.Tick()
 				if len(stalls) != 1 || stalls[0] != pendingEvents {
 					t.Fatalf("s10-bulk-delete stalls = %v, want one stall with %d pending events", stalls, pendingEvents)
 				}
 				return
 			}
+			lastFlushAt := clock.Now()
+			longestWithoutFlush := time.Duration(0)
 			for _, message := range messages {
+				clock.Advance(messageInterval)
 				if message.Type != 2 || message.Method != "redraw" {
+					if sinceFlush := clock.Now().Sub(lastFlushAt); sinceFlush > longestWithoutFlush {
+						longestWithoutFlush = sinceFlush
+					}
 					continue
 				}
 				events, err := protocol.DecodeRedraw(message.Args)
 				if err != nil {
 					t.Fatalf("DecodeRedraw: %v", err)
 				}
-				firstPending := true
+				hasFlush := false
 				for _, event := range events {
 					if _, isFlush := event.(protocol.Flush); isFlush {
-						watchdog.Observe([]protocol.Event{event})
-						continue
-					}
-					if firstPending {
-						watchdog.Observe([]protocol.Event{event})
-						firstPending = false
+						hasFlush = true
 					}
 				}
-				clock.Advance(time.Second)
+				watchdog.Observe(events)
+				if hasFlush {
+					lastFlushAt = clock.Now()
+				} else if sinceFlush := clock.Now().Sub(lastFlushAt); sinceFlush > longestWithoutFlush {
+					longestWithoutFlush = sinceFlush
+				}
 				watchdog.Tick()
+				if len(stalls) != 0 {
+					t.Fatalf("normal golden triggered %d watchdog stalls after %s: %v", len(stalls), clock.Now().Sub(time.Unix(0, 0)), stalls)
+				}
+			}
+			if longestWithoutFlush >= watchdogTimeout {
+				t.Fatalf("normal golden longest interval without Flush = %s, want < %s", longestWithoutFlush, watchdogTimeout)
 			}
 			if len(stalls) != 0 {
 				t.Fatalf("normal golden triggered %d watchdog stalls: %v", len(stalls), stalls)
@@ -406,24 +436,32 @@ func TestWatchdogStallAndFlushRearm(t *testing.T) {
 
 	clock := &fakeClock{now: time.Unix(0, 0)}
 	stalls := []int{}
-	watchdog := diag.NewWatchdog(2*time.Second, clock, func(pendingEvents int) {
+	watchdog := diag.NewWatchdog(watchdogTimeout, clock, func(pendingEvents int) {
 		stalls = append(stalls, pendingEvents)
 	})
 	redrawOnly := []protocol.Event{protocol.GridResize{Grid: 1, Width: 80, Height: 24}}
 	watchdog.Observe(redrawOnly)
-	clock.Advance(3 * time.Second)
+	clock.Advance(watchdogTimeout)
 	watchdog.Tick()
-	clock.Advance(10 * time.Second)
+	clock.Advance(watchdogTimeout)
 	watchdog.Tick()
 	if len(stalls) != 1 || stalls[0] != 1 {
 		t.Fatalf("stalls = %v, want one pending event", stalls)
 	}
 	watchdog.Observe([]protocol.Event{protocol.Flush{}})
+	if len(stalls) != 1 {
+		t.Fatalf("stalls after Flush = %v, want one pending event", stalls)
+	}
 	watchdog.Observe(redrawOnly)
-	clock.Advance(3 * time.Second)
+	clock.Advance(watchdogTimeout)
 	watchdog.Tick()
 	if len(stalls) != 2 || stalls[1] != 1 {
 		t.Fatalf("stalls after Flush rearm = %v, want two pending-event stalls", stalls)
+	}
+	clock.Advance(watchdogTimeout)
+	watchdog.Tick()
+	if len(stalls) != 2 {
+		t.Fatalf("stalls after second timeout = %v, want two pending-event stalls", stalls)
 	}
 }
 
