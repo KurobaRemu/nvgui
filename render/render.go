@@ -140,6 +140,15 @@ func (p *Planner) planItem(layer drawlist.Layer, item drawlist.Item, cell text.C
 		command.Op = "fill"
 	case "cursor":
 		command.Op = "cursor"
+		if item.Text != "" {
+			command.Text = item.Text
+			font := p.resolver.FontFor(item.Text, hasAttr(item.Attrs, "bold"), hasAttr(item.Attrs, "italic"))
+			command.Family = font.Family
+			command.Size = font.Size
+			command.Weight = font.Weight
+			command.Italic = font.Italic
+			command.Features = font.Features
+		}
 	case "box":
 		if item.Rune == "" {
 			return renderlist.Command{}, false, fmt.Errorf("box item has no rune")
@@ -593,7 +602,7 @@ func drawFrame(p *ui.Painter, frame renderlist.Frame, cache *rowCache, metas []r
 			case "box":
 				drawBoxRune(p, command, color(command.FG))
 			case "cursor":
-				drawCursor(p, command)
+				drawCursor(p, command, cache, meta)
 			}
 		}
 		if meta.clip.W > 0 && meta.clip.H > 0 {
@@ -683,14 +692,32 @@ func drawWave(p *ui.Painter, x, y, width, thick float32, paintColor ui.Color) {
 	p.StrokePath(&path, thick, paintColor)
 }
 
-func drawCursor(p *ui.Painter, command renderlist.Command) {
+func drawCursor(p *ui.Painter, command renderlist.Command, cache *rowCache, meta rowMeta) {
 	rect := commandRect(command)
-	if command.FG == 0 && command.BG == 0 {
-		p.Fill(rect, ui.Color{R: 235, G: 235, B: 235, A: 180}, 0)
+	if rect.W <= 0 || rect.H <= 0 {
 		return
 	}
-	p.Fill(rect, color(command.BG), 0)
-	p.Line(rect.X, rect.Y+rect.H-1, rect.X+rect.W, rect.Y+rect.H-1, 1, color(command.FG))
+	fillColor := color(command.BG)
+	if command.FG == 0 && command.BG == 0 {
+		fillColor = ui.Color{R: 128, G: 128, B: 128, A: 200}
+	}
+	attrs := splitAttrs(meta.attrs)
+	switch {
+	case hasAttr(attrs, "cursor_beam"):
+		beamWidth := min(rect.W, max(float32(2), min(float32(3), rect.W*0.25)))
+		p.Fill(ui.Rect{X: rect.X, Y: rect.Y, W: beamWidth, H: rect.H}, fillColor, 0)
+		return
+	case hasAttr(attrs, "cursor_underline"):
+		barHeight := min(rect.H, max(float32(2), rect.H*0.2))
+		p.Fill(ui.Rect{X: rect.X, Y: rect.Y + rect.H - barHeight, W: rect.W, H: barHeight}, fillColor, 0)
+		return
+	}
+	p.Fill(rect, fillColor, 0)
+	if command.Text != "" && command.Family != "" && command.Size > 0 {
+		drawGlyphs(p, command, cache, meta)
+	} else if command.Rune != "" {
+		drawBoxRune(p, command, color(command.FG))
+	}
 }
 
 func hasAttr(attrs []string, wanted string) bool {

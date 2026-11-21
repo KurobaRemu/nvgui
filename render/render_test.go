@@ -14,6 +14,7 @@ import (
 
 	"nvgui/drawlist"
 	"nvgui/renderlist"
+	"nvgui/screen"
 	"nvgui/text"
 )
 
@@ -523,6 +524,109 @@ func TestDrawnBoxRanges(t *testing.T) {
 		if drawnBoxRune(character) {
 			t.Errorf("rune %q was self-drawn unexpectedly", character)
 		}
+	}
+}
+
+func TestWideCursorLightThemeAndInsertBeamRender(t *testing.T) {
+	resolver := mustTestResolver(t)
+	cell := resolver.Cell()
+	planner := NewPlanner(resolver)
+
+	makeState := func(mode string) *screen.State {
+		return &screen.State{
+			Seq: 101,
+			Grids: map[int]*screen.Grid{
+				1: {
+					Width:  4,
+					Height: 1,
+					Cells: [][]screen.Cell{{
+						{Text: "本", HL: 0},
+						{Text: "", HL: 0},
+						{Text: "A", HL: 0},
+						{Text: " ", HL: 0},
+					}},
+				},
+			},
+			Attrs:         map[int]screen.Attr{0: {}},
+			DefaultColors: screen.Colors{FG: 0x24292f, BG: 0xffffff, SP: 0xff0000},
+			Placements:    map[int]screen.Placement{},
+			Cursor:        screen.Cursor{Grid: 1, Row: 0, Col: 0},
+			Mode:          mode,
+		}
+	}
+
+	normalList, err := drawlist.Build(makeState("normal"))
+	if err != nil {
+		t.Fatalf("drawlist.Build(normal): %v", err)
+	}
+	normalFrame, err := planner.Plan(normalList)
+	if err != nil {
+		t.Fatalf("Plan(normal): %v", err)
+	}
+	var cursorCmd renderlist.Command
+	foundCursor := false
+	for _, cmd := range normalFrame.Commands {
+		if cmd.Op == "cursor" {
+			cursorCmd = cmd
+			foundCursor = true
+		}
+	}
+	if !foundCursor {
+		t.Fatal("missing cursor command in normal frame")
+	}
+	if cursorCmd.W != 2*cell.Width || cursorCmd.Text != "本" || cursorCmd.Family == "" || cursorCmd.Size <= 0 {
+		t.Fatalf("wide cursor command = %+v, want width %.1f text \"本\" with resolved font", cursorCmd, 2*cell.Width)
+	}
+	if cursorCmd.BG != 0x24292f || cursorCmd.FG != 0xffffff {
+		t.Fatalf("wide cursor colors = (fg=%#x, bg=%#x), want (0xffffff, 0x24292f)", cursorCmd.FG, cursorCmd.BG)
+	}
+
+	width := int(4 * cell.Width)
+	height := int(cell.Height)
+	normalImg := renderImageWithView(normalFrame, width, height)
+	darkCursor := imagecolor.RGBA{R: 0x24, G: 0x29, B: 0x2f, A: 0xff}
+	lightGlyph := imagecolor.RGBA{R: 0xff, G: 0xff, B: 0xff, A: 0xff}
+	cellW := int(cell.Width)
+
+	leftHasDark, rightHasDark := false, false
+	cursorHasLightGlyph := false
+	for y := 0; y < height; y++ {
+		for x := 0; x < 2*cellW && x < width; x++ {
+			px := normalImg.RGBAAt(x, y)
+			if nearColor(px, darkCursor) {
+				if x < cellW {
+					leftHasDark = true
+				} else {
+					rightHasDark = true
+				}
+			}
+			if px.R > 200 && px.G > 200 && px.B > 200 {
+				cursorHasLightGlyph = true
+			}
+		}
+	}
+	if !leftHasDark || !rightHasDark {
+		t.Fatalf("wide cursor block did not cover both cells on light background (left=%v, right=%v)", leftHasDark, rightHasDark)
+	}
+	if !cursorHasLightGlyph {
+		t.Fatal("wide cursor block did not redraw \"本\" in high-contrast reversed foreground color")
+	}
+
+	insertList, err := drawlist.Build(makeState("insert"))
+	if err != nil {
+		t.Fatalf("drawlist.Build(insert): %v", err)
+	}
+	insertFrame, err := planner.Plan(insertList)
+	if err != nil {
+		t.Fatalf("Plan(insert): %v", err)
+	}
+	insertImg := renderImageWithView(insertFrame, width, height)
+	if got := pixelAt(insertImg, 0, height/2); !nearColor(got, darkCursor) {
+		t.Fatalf("insert beam left-edge pixel = %+v, want dark cursor %+v", got, darkCursor)
+	}
+	// Right edge of second cell of "本" must remain light background (beam does not black out the whole block).
+	if got := pixelAt(insertImg, 2*cellW-1, 0); !nearColor(got, lightGlyph) {
+		t.Fatalf("insert beam unexpectedly filled whole block at (%d,0): %+v", 2*cellW-1, got)
 	}
 }
 

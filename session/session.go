@@ -119,11 +119,11 @@ func (s *Session) run() {
 			}
 			s.watchdog.Observe(events)
 			committed, err := s.reducer.Apply(events)
-			if err != nil {
-				continue
-			}
 			for _, state := range committed {
 				s.recorder.Keyframe(state)
+			}
+			if err != nil {
+				continue
 			}
 		case <-s.done:
 			return

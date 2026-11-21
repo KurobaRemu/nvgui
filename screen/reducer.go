@@ -145,9 +145,6 @@ func applyEvent(state *State, event protocol.Event) error {
 	case protocol.GridClear:
 		return applyGridClear(state, event)
 	case protocol.GridDestroy:
-		if _, err := gridAt(state, event.Grid); err != nil {
-			return err
-		}
 		delete(state.Grids, event.Grid)
 		delete(state.Placements, event.Grid)
 		return nil

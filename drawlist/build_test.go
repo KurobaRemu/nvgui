@@ -691,3 +691,138 @@ func TestDrawListJSONKeepsUTF8AndHTMLCharacters(test *testing.T) {
 		}
 	}
 }
+
+func TestBuildCursorWideCharHighContrastAndModes(test *testing.T) {
+	row := makeTestRow(
+		makeTestCell("本", 0), makeTestCell("", 0),
+		makeTestCell("x", 1),
+		makeTestCell("╭", 0),
+		makeTestCell(" ", 0),
+	)
+	makeState := func(defFG, defBG int64, mode string, col int) *screen.State {
+		grid := &screen.Grid{Width: len(row), Height: 1, Cells: [][]screen.Cell{append([]screen.Cell(nil), row...)}}
+		return &screen.State{
+			Seq:   1,
+			Grids: map[int]*screen.Grid{1: grid},
+			Attrs: map[int]screen.Attr{
+				0: {"bold": true},
+				1: {"foreground": int64(0xd8d8d8)}, // low contrast on light theme
+			},
+			DefaultColors: screen.Colors{FG: defFG, BG: defBG, SP: 0xff0000},
+			Placements:    map[int]screen.Placement{},
+			Cursor:        screen.Cursor{Grid: 1, Row: 0, Col: col},
+			Mode:          mode,
+		}
+	}
+
+	test.Run("light theme wide CJK block cursor", func(t *testing.T) {
+		list, err := Build(makeState(0x24292f, 0xffffff, "normal", 0))
+		if err != nil {
+			t.Fatalf("Build: %v", err)
+		}
+		cursor, found := findItem(list.Layers[0].Items, "cursor", 0, 0)
+		if !found {
+			t.Fatal("missing cursor item")
+		}
+		if cursor.Width != 2 || cursor.Height != 1 {
+			t.Fatalf("cursor size = %dx%d, want 2x1", cursor.Width, cursor.Height)
+		}
+		if cursor.Text != "本" || cursor.Rune != "" {
+			t.Fatalf("cursor glyph = (text=%q, rune=%q), want text=\"本\"", cursor.Text, cursor.Rune)
+		}
+		if cursor.BG != 0x24292f || cursor.FG != 0xffffff {
+			t.Fatalf("cursor colors = (fg=%#x, bg=%#x), want (0xffffff, 0x24292f)", cursor.FG, cursor.BG)
+		}
+		if !reflect.DeepEqual(cursor.Attrs, []string{"bold"}) {
+			t.Fatalf("cursor Attrs = %v, want [bold]", cursor.Attrs)
+		}
+	})
+
+	test.Run("dark theme wide CJK block cursor", func(t *testing.T) {
+		list, err := Build(makeState(0xcdd6f4, 0x1e1e2e, "normal", 0))
+		if err != nil {
+			t.Fatalf("Build: %v", err)
+		}
+		cursor, found := findItem(list.Layers[0].Items, "cursor", 0, 0)
+		if !found {
+			t.Fatal("missing cursor item")
+		}
+		if cursor.Width != 2 || cursor.Text != "本" || cursor.BG != 0xcdd6f4 || cursor.FG != 0x1e1e2e {
+			t.Fatalf("dark wide cursor = %+v", cursor)
+		}
+	})
+
+	test.Run("light theme low-contrast cell boosts cursor contrast", func(t *testing.T) {
+		list, err := Build(makeState(0x24292f, 0xffffff, "normal", 2))
+		if err != nil {
+			t.Fatalf("Build: %v", err)
+		}
+		cursor, found := findItem(list.Layers[0].Items, "cursor", 0, 2)
+		if !found {
+			t.Fatal("missing cursor item")
+		}
+		if cursor.Width != 1 || cursor.Text != "x" {
+			t.Fatalf("cursor = %+v, want width 1 text \"x\"", cursor)
+		}
+		if cursor.BG != 0x24292f || cursor.FG != 0xffffff {
+			t.Fatalf("boosted cursor colors = (fg=%#x, bg=%#x), want (0xffffff, 0x24292f)", cursor.FG, cursor.BG)
+		}
+	})
+
+	test.Run("unset default colors never produce zero-zero cursor", func(t *testing.T) {
+		list, err := Build(makeState(-1, -1, "normal", 4))
+		if err != nil {
+			t.Fatalf("Build: %v", err)
+		}
+		cursor, found := findItem(list.Layers[0].Items, "cursor", 0, 4)
+		if !found {
+			t.Fatal("missing cursor item")
+		}
+		if cursor.FG == 0 && cursor.BG == 0 {
+			t.Fatalf("cursor colors both zero: %+v", cursor)
+		}
+		if absInt64(relativeLuma(cursor.BG)-relativeLuma(cursor.FG)) < 100 {
+			t.Fatalf("cursor contrast too low: fg=%#x bg=%#x", cursor.FG, cursor.BG)
+		}
+	})
+
+	test.Run("box rune under block cursor uses Rune field", func(t *testing.T) {
+		list, err := Build(makeState(0x24292f, 0xffffff, "normal", 3))
+		if err != nil {
+			t.Fatalf("Build: %v", err)
+		}
+		cursor, found := findItem(list.Layers[0].Items, "cursor", 0, 3)
+		if !found {
+			t.Fatal("missing cursor item")
+		}
+		if cursor.Width != 1 || cursor.Rune != "╭" || cursor.Text != "" {
+			t.Fatalf("box cursor = %+v, want Rune=\"╭\"", cursor)
+		}
+	})
+
+	test.Run("insert and replace modes tag cursor shape without covering text", func(t *testing.T) {
+		insertList, err := Build(makeState(0x24292f, 0xffffff, "insert", 0))
+		if err != nil {
+			t.Fatalf("Build insert: %v", err)
+		}
+		insertCursor, found := findItem(insertList.Layers[0].Items, "cursor", 0, 0)
+		if !found {
+			t.Fatal("missing insert cursor")
+		}
+		if insertCursor.Width != 2 || insertCursor.Text != "" || insertCursor.Rune != "" || !reflect.DeepEqual(insertCursor.Attrs, []string{"cursor_beam"}) {
+			t.Fatalf("insert cursor = %+v, want width 2 beam without text", insertCursor)
+		}
+
+		replaceList, err := Build(makeState(0x24292f, 0xffffff, "replace", 0))
+		if err != nil {
+			t.Fatalf("Build replace: %v", err)
+		}
+		replaceCursor, found := findItem(replaceList.Layers[0].Items, "cursor", 0, 0)
+		if !found {
+			t.Fatal("missing replace cursor")
+		}
+		if replaceCursor.Width != 2 || replaceCursor.Text != "" || !reflect.DeepEqual(replaceCursor.Attrs, []string{"cursor_underline"}) {
+			t.Fatalf("replace cursor = %+v, want width 2 underline without text", replaceCursor)
+		}
+	})
+}

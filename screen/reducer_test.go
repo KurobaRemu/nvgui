@@ -175,19 +175,82 @@ func TestGridScrollRejectsInvalidRegion(t *testing.T) {
 	}
 }
 
-func TestGridDestroyMissingGridKeepsCommittedState(t *testing.T) {
+func TestGridDestroyMissingGridIsIdempotent(t *testing.T) {
 	reducer := reducerWithGrid(t, 2)
 	baseline := flushState(t, reducer, protocol.GridLine{
 		Grid: 2, Row: 0, ColStart: 0,
 		Cells: []protocol.LineCell{{Text: "a", HL: 5, Repeat: 2}},
 	})
-	if _, err := reducer.Apply([]protocol.Event{
-		protocol.HlAttrDefine{ID: 6, RGB: map[string]any{"foreground": int64(6)}},
+	states, err := reducer.Apply([]protocol.Event{
+		protocol.WinClose{Grid: 99},
 		protocol.GridDestroy{Grid: 99},
-	}); err == nil {
-		t.Fatal("Apply accepted destroying a missing grid")
+		protocol.Flush{},
+	})
+	if err != nil {
+		t.Fatalf("Apply rejected destroying a missing grid: %v", err)
 	}
-	assertStateUnchanged(t, reducer, baseline)
+	state := committedState(t, states, 1)
+	if state.Seq != baseline.Seq+1 {
+		t.Fatalf("Seq = %d, want %d", state.Seq, baseline.Seq+1)
+	}
+	if _, exists := state.Grids[2]; !exists {
+		t.Fatal("existing grid 2 was removed")
+	}
+}
+
+// Regression test using the exact wire batch captured from Neovim + blink.cmp
+// when an auxiliary floating window (grid 38) is opened and closed before its
+// first grid_resize is flushed, in the same redraw batch that closes the
+// visible blink-cmp-menu (grid 35) and scrollbar (grid 36) floats.
+func TestBlinkCmpCloseBatchWithUncreatedGridDoesNotLeakFloat(t *testing.T) {
+	reducer := NewReducer()
+	_, err := reducer.Apply([]protocol.Event{
+		protocol.GridResize{Grid: 1, Width: 100, Height: 35},
+		protocol.GridResize{Grid: 2, Width: 100, Height: 32},
+		protocol.WinPos{Grid: 2, Win: 1000, StartRow: 1, StartCol: 0, Width: 100, Height: 32},
+		protocol.GridResize{Grid: 35, Width: 20, Height: 12},
+		protocol.WinFloatPos{Grid: 35, Win: 1032, Anchor: "NW", AnchorGrid: 2, AnchorRow: 15, AnchorCol: 3, MouseEnabled: true, ZIndex: 1001, CompIndex: 2, ScreenRow: 16, ScreenCol: 3},
+		protocol.GridResize{Grid: 36, Width: 1, Height: 8},
+		protocol.WinFloatPos{Grid: 36, Win: 1033, Anchor: "NW", AnchorGrid: 35, AnchorRow: 1, AnchorCol: 19, MouseEnabled: false, ZIndex: 1003, CompIndex: 3, ScreenRow: 17, ScreenCol: 22},
+		protocol.Flush{},
+	})
+	if err != nil {
+		t.Fatalf("open blink.cmp floats: %v", err)
+	}
+	if layers := Layers(reducer.Latest()); len(layers) != 4 {
+		t.Fatalf("open Layers = %+v, want 4 layers (grids 1, 2, 35, 36)", layers)
+	}
+
+	// Exact closing batch captured from real Neovim + blink.cmp (grid 38 never received grid_resize).
+	states, err := reducer.Apply([]protocol.Event{
+		protocol.WinClose{Grid: 38},
+		protocol.GridDestroy{Grid: 38},
+		protocol.WinClose{Grid: 35},
+		protocol.GridDestroy{Grid: 35},
+		protocol.WinClose{Grid: 36},
+		protocol.GridDestroy{Grid: 36},
+		protocol.WinPos{Grid: 2, Win: 1000, StartRow: 1, StartCol: 0, Width: 100, Height: 32},
+		protocol.Flush{},
+	})
+	if err != nil {
+		t.Fatalf("close blink.cmp floats failed: %v", err)
+	}
+	closed := committedState(t, states, 1)
+	for _, gridID := range []int{35, 36, 38} {
+		if _, exists := closed.Grids[gridID]; exists {
+			t.Errorf("closed grid %d still present in State.Grids", gridID)
+		}
+		if _, exists := closed.Placements[gridID]; exists {
+			t.Errorf("closed grid %d still present in State.Placements", gridID)
+		}
+	}
+	wantLayers := []Layer{
+		{Grid: 1},
+		{Grid: 2, ScreenRow: 1, ScreenCol: 0},
+	}
+	if got := Layers(closed); !reflect.DeepEqual(got, wantLayers) {
+		t.Fatalf("Layers after close = %+v, want %+v", got, wantLayers)
+	}
 }
 
 func TestApplyRollsBackToMostRecentFlush(t *testing.T) {
@@ -203,10 +266,10 @@ func TestApplyRollsBackToMostRecentFlush(t *testing.T) {
 			Grid: 2, Row: 0, ColStart: 0,
 			Cells: []protocol.LineCell{{Text: "z", HL: 6, Repeat: 2}},
 		},
-		protocol.GridDestroy{Grid: 99},
+		protocol.GridClear{Grid: 99},
 	})
 	if err == nil {
-		t.Fatal("Apply accepted destroying a missing grid")
+		t.Fatal("Apply accepted clearing a missing grid")
 	}
 	if len(states) != 1 {
 		t.Fatalf("Apply returned %d committed states, want 1", len(states))
@@ -236,9 +299,9 @@ func TestApplyRollsBackToPreFlushState(t *testing.T) {
 			Cells: []protocol.LineCell{{Text: "a", HL: 5, Repeat: 2}},
 		},
 		protocol.Flush{},
-		protocol.GridDestroy{Grid: 99},
+		protocol.GridClear{Grid: 99},
 	}); err == nil {
-		t.Fatal("Apply accepted destroying a missing grid")
+		t.Fatal("Apply accepted clearing a missing grid")
 	}
 	state := reducer.Latest()
 	if state == nil {
@@ -259,9 +322,9 @@ func TestApplyRollsBackBeforeFirstFlush(t *testing.T) {
 			Grid: 2, Row: 0, ColStart: 0,
 			Cells: []protocol.LineCell{{Text: "a", HL: 5, Repeat: 2}},
 		},
-		protocol.GridDestroy{Grid: 99},
+		protocol.GridClear{Grid: 99},
 	}); err == nil {
-		t.Fatal("Apply accepted destroying a missing grid")
+		t.Fatal("Apply accepted clearing a missing grid")
 	}
 	if state := reducer.Latest(); state != nil {
 		t.Fatalf("Latest = %#v, want nil before first commit", state)
@@ -294,9 +357,9 @@ func TestApplyRollsBackToStateBeforeBatch(t *testing.T) {
 			Grid: 2, Row: 0, ColStart: 0,
 			Cells: []protocol.LineCell{{Text: "z", HL: 6, Repeat: 2}},
 		},
-		protocol.GridDestroy{Grid: 99},
+		protocol.GridClear{Grid: 99},
 	}); err == nil {
-		t.Fatal("Apply accepted destroying a missing grid")
+		t.Fatal("Apply accepted clearing a missing grid")
 	}
 	if reducer.Latest() != nil {
 		t.Fatal("Latest is not nil before first commit")

@@ -54,13 +54,7 @@ func Build(state *screen.State) (*List, error) {
 			return nil, err
 		}
 		if layer.Grid == state.Cursor.Grid {
-			items = append(items, Item{
-				Kind:   "cursor",
-				Row:    state.Cursor.Row,
-				Col:    state.Cursor.Col,
-				Width:  1,
-				Height: 1,
-			})
+			items = append(items, buildCursorItem(state, grid, styles))
 		}
 		clip, err := visibleRect(layer.ScreenRow, layer.ScreenCol, grid.Width, grid.Height, root.Width, root.Height)
 		if err != nil {
@@ -300,4 +294,119 @@ func boxRune(text string) bool {
 		return true
 	}
 	return false
+}
+
+func buildCursorItem(state *screen.State, grid *screen.Grid, styles map[int]resolvedStyle) Item {
+	row, col := state.Cursor.Row, state.Cursor.Col
+	width := 1
+	style := resolvedStyle{
+		FG: state.DefaultColors.FG,
+		BG: state.DefaultColors.BG,
+		SP: state.DefaultColors.SP,
+	}
+	var cell screen.Cell
+	inBounds := row >= 0 && row < grid.Height && row < len(grid.Cells) &&
+		col >= 0 && col < grid.Width && col < len(grid.Cells[row])
+	if inBounds {
+		cell = grid.Cells[row][col]
+		if resolved, err := resolveStyle(state, cell.HL, styles); err == nil {
+			style = resolved
+		}
+		if cell.Text != "" && cell.Text != " " &&
+			col+1 < grid.Width && col+1 < len(grid.Cells[row]) && grid.Cells[row][col+1].Text == "" {
+			width = 2
+		}
+	}
+
+	fg, bg := cursorColors(state, style)
+	item := Item{
+		Kind:   "cursor",
+		Row:    row,
+		Col:    col,
+		Width:  width,
+		Height: 1,
+		FG:     fg,
+		BG:     bg,
+		SP:     style.SP,
+	}
+
+	if shape := cursorShapeAttr(state.Mode); shape != "" {
+		item.Attrs = []string{shape}
+		return item
+	}
+
+	if inBounds && cell.Text != "" && cell.Text != " " {
+		if boxRune(cell.Text) {
+			item.Rune = cell.Text
+		} else {
+			item.Text = cell.Text
+		}
+		if len(style.Attrs) > 0 {
+			item.Attrs = append([]string(nil), style.Attrs...)
+		}
+	}
+	return item
+}
+
+func cursorShapeAttr(mode string) string {
+	switch mode {
+	case "insert", "cmdline_insert", "visual_select":
+		return "cursor_beam"
+	case "replace", "cmdline_replace", "operator":
+		return "cursor_underline"
+	default:
+		return ""
+	}
+}
+
+func cursorColors(state *screen.State, style resolvedStyle) (fg, bg int64) {
+	defaultBG := normalizeRGB(state.DefaultColors.BG, 0x000000)
+	defaultFG := normalizeRGB(state.DefaultColors.FG, 0xffffff)
+	cellBG := normalizeRGB(style.BG, defaultBG)
+	cellFG := normalizeRGB(style.FG, defaultFG)
+
+	bg = cellFG
+	fg = cellBG
+
+	cellBGLuma := relativeLuma(cellBG)
+	if absInt64(relativeLuma(bg)-cellBGLuma) < 80 {
+		if absInt64(relativeLuma(defaultFG)-cellBGLuma) >= 80 {
+			bg = defaultFG
+		} else if cellBGLuma >= 128 {
+			bg = 0x181818
+		} else {
+			bg = 0xf0f0f0
+		}
+	}
+
+	bgLuma := relativeLuma(bg)
+	if absInt64(relativeLuma(fg)-bgLuma) < 100 {
+		if bgLuma >= 128 {
+			fg = 0x101010
+		} else {
+			fg = 0xffffff
+		}
+	}
+	return fg, bg
+}
+
+func normalizeRGB(color, fallback int64) int64 {
+	if color >= 0 {
+		return color & 0xffffff
+	}
+	return fallback
+}
+
+func relativeLuma(rgb int64) int64 {
+	r := (rgb >> 16) & 0xff
+	g := (rgb >> 8) & 0xff
+	b := rgb & 0xff
+	return (299*r + 587*g + 114*b) / 1000
+}
+
+func absInt64(value int64) int64 {
+	if value < 0 {
+		return -value
+	}
+	return value
 }
