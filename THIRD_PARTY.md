@@ -8,5 +8,7 @@
 | `refs/neovim/go-client@7088209f9f86aaeab1c226118859f218488b5e53` | `nvim/nvim.go:695` `decodeExt` | Apache-2.0 | `protocol/protocol.go`（M0.3 照抄 MsgPack ext 解码规则） |
 | `refs/neovim/go-client@7088209f9f86aaeab1c226118859f218488b5e53` | `nvim/nvim.go:213-260` `NewChildProcess` 管道接法 | Apache-2.0 | `connection/connection.go`（M0.3 照抄 stdin/stdout 管道接法） |
 | `refs/egoist/mygo@400ba3b17c3ec60ef9b0604e26aa4cdcf2a2ff2d` | `LICENSE`、公开 `mygo` / `mygo/ui` API | MIT | `go.mod` 固定 `github.com/egoist/mygo v0.10.1-0.20261118142248-400ba3b17c3e`（M1 渲染、字体、输入与应用壳） |
+| `refs/egoist/mygo@400ba3b17c3ec60ef9b0604e26aa4cdcf2a2ff2d` | `plugins/terminal/box.go` | MIT | `render/box.go`（框线、Block、Sextant 与 Powerline 自绘逻辑） |
+| `refs/ghostty-org/ghostty@befcdfd2c3a1cb24d9ec886e93c95b2b5daa7028`（经 mygo `box.go` 继承） | box-arm / quadrant 映射表 | MIT | `render/box.go`（`boxArms` 与 `blockQuadrants` 查表） |
 
 `neovim v0.12.6` 的 test 树按 Apache-2.0 登记，已由 M0.2 用 `git archive` 原样引入。`v0.12.6` 的 annotated tag object 是 `022946c802832f938398dfae34b3f277ca9509d4`，解引用后的 commit 是 `779c36969e31080503be2dfccbcc3f999e289606`；本表采用 commit hash。`test/functional/ui/screen.lua` sha256 为 `1e187bfcccf623eb31b8cef2e990e5a4df4f89ca52b7d2024669bbd02af76f74`。
