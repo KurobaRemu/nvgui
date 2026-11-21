@@ -33,12 +33,11 @@ type queueImpl struct {
 	done    bool
 	ctx     context.Context
 
-	pending      *ui.InputEvent
-	swallowKey   ui.Key
-	swallowAlt   bool
-	composing    bool
-	composeEpoch uint64
-	eventEpochs  [queueCapacity]uint64
+	pending    *ui.InputEvent
+	swallowKey ui.Key
+	swallowAlt bool
+	composing  bool
+	resetAfter [queueCapacity]bool
 }
 
 func newQueue(sender Sender, recorder *TraceRecorder) *Queue {
@@ -52,7 +51,7 @@ func newQueue(sender Sender, recorder *TraceRecorder) *Queue {
 	return &Queue{impl: impl}
 }
 
-func (impl *queueImpl) keys(ev ui.InputEvent, epoch uint64) string {
+func (impl *queueImpl) keys(ev ui.InputEvent) string {
 	switch ev.Kind {
 	case ui.InputText:
 		impl.composing = false
@@ -81,7 +80,7 @@ func (impl *queueImpl) keys(ev ui.InputEvent, epoch uint64) string {
 		impl.swallowAlt = false
 		if ev.Canceled || ev.Text == "" {
 			impl.composing = false
-		} else if epoch == impl.composeEpoch {
+		} else {
 			impl.composing = true
 		}
 		return ""
@@ -146,37 +145,37 @@ func (impl *queueImpl) finish(err error) {
 	close(impl.stopped)
 }
 
-func (impl *queueImpl) pop() (ui.InputEvent, uint64, bool) {
+func (impl *queueImpl) pop() (ui.InputEvent, bool, bool) {
 	if impl.length == 0 {
-		return ui.InputEvent{}, 0, false
+		return ui.InputEvent{}, false, false
 	}
 	slot := impl.head
 	ev := impl.events[impl.head]
-	epoch := impl.eventEpochs[slot]
+	resetAfter := impl.resetAfter[slot]
 	impl.events[impl.head] = ui.InputEvent{}
-	impl.eventEpochs[slot] = 0
+	impl.resetAfter[slot] = false
 	impl.head = (impl.head + 1) % queueCapacity
 	impl.length--
 	impl.wakeup.Broadcast()
-	return ev, epoch, true
+	return ev, true, resetAfter
 }
 
-func (impl *queueImpl) deliver(ev ui.InputEvent, epoch uint64) error {
-	impl.mu.Lock()
-	keys := impl.keys(ev, epoch)
+func (impl *queueImpl) prepareDelivery() (string, bool, error) {
+	ev, ok, resetAfter := impl.pop()
+	if !ok {
+		return "", false, nil
+	}
+	keys := impl.keys(ev)
+	if resetAfter {
+		impl.composing = false
+	}
 	if keys != "" {
 		if impl.sender == nil {
-			impl.mu.Unlock()
-			return errQueueNilSender
+			return "", false, errQueueNilSender
 		}
 		impl.sent = append(impl.sent, keys)
 	}
-	impl.mu.Unlock()
-	if keys == "" {
-		return nil
-	}
-	_, err := impl.sender.Input(keys)
-	return err
+	return keys, true, nil
 }
 
 func (queue *Queue) resetComposition() {
@@ -186,8 +185,12 @@ func (queue *Queue) resetComposition() {
 	impl := queue.impl
 	impl.mu.Lock()
 	defer impl.mu.Unlock()
-	impl.composeEpoch++
-	impl.composing = false
+	if impl.length == 0 {
+		impl.composing = false
+		return
+	}
+	lastSlot := (impl.head + impl.length - 1) % queueCapacity
+	impl.resetAfter[lastSlot] = true
 }
 
 func queueRun(queue *Queue, ctx context.Context) error {
@@ -251,14 +254,21 @@ func queueRun(queue *Queue, ctx context.Context) error {
 			impl.mu.Unlock()
 			return err
 		}
-		ev, epoch, ok := impl.pop()
+		keys, ok, err := impl.prepareDelivery()
+		if err != nil {
+			impl.finish(err)
+			impl.mu.Unlock()
+			return err
+		}
 		if ok {
 			impl.mu.Unlock()
-			if err := impl.deliver(ev, epoch); err != nil {
-				impl.mu.Lock()
-				impl.finish(err)
-				impl.mu.Unlock()
-				return err
+			if keys != "" {
+				if _, err := impl.sender.Input(keys); err != nil {
+					impl.mu.Lock()
+					impl.finish(err)
+					impl.mu.Unlock()
+					return err
+				}
 			}
 			continue
 		}
@@ -290,16 +300,24 @@ func queueClose(queue *Queue) error {
 		impl.mu.Unlock()
 		for {
 			impl.mu.Lock()
-			ev, epoch, ok := impl.pop()
+			keys, ok, err := impl.prepareDelivery()
 			impl.mu.Unlock()
-			if !ok {
-				break
-			}
-			if err := impl.deliver(ev, epoch); err != nil {
+			if err != nil {
 				impl.mu.Lock()
 				impl.finish(err)
 				impl.mu.Unlock()
 				return err
+			}
+			if !ok {
+				break
+			}
+			if keys != "" {
+				if _, err := impl.sender.Input(keys); err != nil {
+					impl.mu.Lock()
+					impl.finish(err)
+					impl.mu.Unlock()
+					return err
+				}
 			}
 		}
 		impl.mu.Lock()
@@ -341,7 +359,7 @@ func queueEnqueue(queue *Queue, ev ui.InputEvent) error {
 	}
 	slot := (impl.head + impl.length) % queueCapacity
 	impl.events[slot] = ev
-	impl.eventEpochs[slot] = impl.composeEpoch
+	impl.resetAfter[slot] = false
 	impl.length++
 	impl.wakeup.Broadcast()
 	if impl.recorder != nil {

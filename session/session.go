@@ -189,6 +189,13 @@ func (s *Session) ExportDiag(dir string) error {
 	return s.recorder.Export(dir, meta)
 }
 
+func (s *Session) RecordInput(ev diag.TraceEvent) {
+	if s == nil || s.recorder == nil {
+		return
+	}
+	s.recorder.RecordInput(ev)
+}
+
 func (s *Session) syncReducer() {
 	barrier := make(chan struct{})
 	select {

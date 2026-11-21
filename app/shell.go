@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"math"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -38,13 +39,15 @@ type shellImpl struct {
 	view      *render.View
 	window    *mygo.Window
 
-	mu          sync.Mutex
-	services    ui.Services
-	closed      bool
-	closeErr    error
-	lastSeq     uint64
-	lastColumns int
-	lastRows    int
+	mu                sync.Mutex
+	inputSyncMu       sync.Mutex
+	services          ui.Services
+	closed            bool
+	closeErr          error
+	lastSeq           uint64
+	lastColumns       int
+	lastRows          int
+	forwardedInputSeq uint64
 
 	closeOnce sync.Once
 	quitOnce  sync.Once
@@ -101,7 +104,34 @@ func shellExportDiag(shell *Shell, dir string) error {
 	if err := shell.impl.checkOpen(); err != nil {
 		return err
 	}
+	shell.impl.syncInputTrace()
 	return shell.impl.session.ExportDiag(dir)
+}
+
+func (impl *shellImpl) syncInputTrace() {
+	if impl == nil || impl.recorder == nil || impl.session == nil {
+		return
+	}
+	impl.inputSyncMu.Lock()
+	defer impl.inputSyncMu.Unlock()
+	pending := []diag.TraceEvent{}
+	latest := impl.forwardedInputSeq
+	for _, event := range impl.recorder.Events() {
+		if event.Seq <= impl.forwardedInputSeq {
+			continue
+		}
+		pending = append(pending, event)
+		if event.Seq > latest {
+			latest = event.Seq
+		}
+	}
+	sort.Slice(pending, func(left, right int) bool {
+		return pending[left].Seq < pending[right].Seq
+	})
+	for _, event := range pending {
+		impl.session.RecordInput(event)
+	}
+	impl.forwardedInputSeq = latest
 }
 
 func shellClose(shell *Shell) error {
@@ -160,7 +190,9 @@ func (s *Shell) AttachInput(c *ui.Context) ui.Element {
 	}
 	impl := s.impl
 	inputBox := ui.Box(c).Fill().Focusable().AutoFocus().Label("nvgui-input").HandleInput(func(ev ui.InputEvent) bool {
-		return s.HandleEditCommand(c, ev) || impl.handler.Handle(ev)
+		handled := s.HandleEditCommand(c, ev) || impl.handler.Handle(ev)
+		impl.syncInputTrace()
+		return handled
 	}).TextCaret(impl.caret()).InputMethod(impl.handler.IMEAllowed())
 	inputBox.Children(func() {
 		impl.view.Draw(c).IgnoreInput(true)

@@ -82,6 +82,37 @@ func imeWaitSignal(test *testing.T, signal <-chan struct{}, label string) {
 	}
 }
 
+func imeWaitQueueState(test *testing.T, queue *Queue, label string, ready func(*queueImpl) bool) {
+	test.Helper()
+	impl := queue.impl
+	done := make(chan struct{})
+	stop := make(chan struct{})
+	go func() {
+		for {
+			select {
+			case <-stop:
+				return
+			default:
+			}
+			impl.mu.Lock()
+			ok := ready(impl)
+			impl.mu.Unlock()
+			if ok {
+				close(done)
+				return
+			}
+			runtime.Gosched()
+		}
+	}()
+	select {
+	case <-done:
+		close(stop)
+	case <-time.After(3 * time.Second):
+		close(stop)
+		test.Fatalf("timed out waiting for %s", label)
+	}
+}
+
 func imeHandle(test *testing.T, handler *Handler, event ui.InputEvent) {
 	test.Helper()
 	if !handler.Handle(event) {
@@ -309,6 +340,67 @@ func TestIMESetModeClearsCompositionAndEpoch(test *testing.T) {
 	stop()
 	imeAssertTrace(test, recorder, events)
 	imeAssertSent(test, sender, []string{"a", "j", "k", "<CR>"})
+}
+
+func TestIMEResetCompositionAfterEmptyQueueDeliversNormalKeys(test *testing.T) {
+	sender := &imeTestSender{}
+	queue, stop := imeStartQueue(test, sender, nil)
+	defer stop()
+	handler := NewHandler(queue)
+	handler.SetMode("insert")
+
+	imeHandle(test, handler, ui.InputEvent{Kind: ui.InputCompose, Text: "ni", Caret: 2})
+	imeWaitQueueState(test, queue, "compose consumed with empty queue", func(impl *queueImpl) bool {
+		return impl.composing && impl.length == 0
+	})
+
+	handler.SetMode("normal")
+	for _, key := range []ui.Key{ui.KeyEnter, ui.KeyBackspace, ui.KeyLeft} {
+		imeHandle(test, handler, ui.InputEvent{Kind: ui.InputKeyDown, Key: key})
+		imeHandle(test, handler, ui.InputEvent{Kind: ui.InputKeyUp, Key: key})
+	}
+
+	stop()
+	imeAssertSent(test, sender, []string{"<CR>", "<BS>", "<Left>"})
+}
+
+func TestIMEResetCompositionKeepsQueuedNormalKeys(test *testing.T) {
+	sender := &imeTestSender{started: make(chan struct{}), release: make(chan struct{})}
+	queue, stop := imeStartQueue(test, sender, nil)
+	defer func() {
+		sender.unblock()
+		stop()
+	}()
+	handler := NewHandler(queue)
+	handler.SetMode("normal")
+
+	imeHandle(test, handler, ui.InputEvent{Kind: ui.InputKeyDown, Key: ui.KeyEnter})
+	imeWaitSignal(test, sender.started, "blocking sender delivery")
+
+	backlog := []ui.InputEvent{
+		{Kind: ui.InputKeyDown, Key: ui.KeyEnter},
+		{Kind: ui.InputKeyUp, Key: ui.KeyEnter},
+		{Kind: ui.InputKeyDown, Key: ui.KeyBackspace},
+		{Kind: ui.InputKeyUp, Key: ui.KeyBackspace},
+		{Kind: ui.InputKeyDown, Key: ui.KeyD, Mods: ui.Ctrl},
+		{Kind: ui.InputKeyUp, Key: ui.KeyD, Mods: ui.Ctrl},
+		{Kind: ui.InputKeyDown, Key: ui.KeyJ},
+		{Kind: ui.InputKeyUp, Key: ui.KeyJ},
+	}
+	for _, event := range backlog {
+		imeHandle(test, handler, event)
+	}
+	queue.impl.mu.Lock()
+	queued := queue.impl.length
+	queue.impl.mu.Unlock()
+	if queued != len(backlog) {
+		test.Fatalf("queued events = %d, want %d", queued, len(backlog))
+	}
+
+	handler.SetMode("normal")
+	sender.unblock()
+	stop()
+	imeAssertSent(test, sender, []string{"<CR>", "<CR>", "<BS>", "<C-d>", "j"})
 }
 
 func TestIMEAllowedModeMatrix(test *testing.T) {
@@ -583,5 +675,47 @@ func TestIMEStateReadersRespondDuringEnqueueBackpressure(test *testing.T) {
 	imeAssertTrace(test, recorder, events)
 	if got := len(sender.snapshot()); got != queueCapacity+2 {
 		test.Fatalf("sender calls = %d, want %d", got, queueCapacity+2)
+	}
+}
+
+func TestIMERapidCancelThenRecomposePreservesCommits(test *testing.T) {
+	sender := &imeTestSender{}
+	recorder := NewTraceRecorder()
+	queue, stop := imeStartQueue(test, sender, recorder)
+	defer stop()
+	handler := NewHandler(queue)
+
+	var want strings.Builder
+	base := time.Unix(1_700_000_000, 0).UTC()
+	for round := 0; round < 24; round++ {
+		handler.SetMode("insert")
+		handler.Handle(ui.InputEvent{Kind: ui.InputCompose, Text: "pinyin", Caret: 6, Time: base})
+		handler.Handle(ui.InputEvent{Kind: ui.InputKeyDown, Key: ui.KeyBackspace, Time: base})
+		handler.Handle(ui.InputEvent{Kind: ui.InputCompose, Text: "pinyi", Caret: 5, Time: base})
+		switch round % 3 {
+		case 0:
+			handler.Handle(ui.InputEvent{Kind: ui.InputKeyDown, Key: ui.KeyEscape, Time: base})
+			handler.SetMode("normal")
+			want.WriteString("<Esc>")
+		case 1:
+			handler.Handle(ui.InputEvent{Kind: ui.InputCompose, Text: "", Canceled: true, Time: base})
+			handler.Handle(ui.InputEvent{Kind: ui.InputText, Text: "汉", Time: base})
+			want.WriteString("汉")
+		case 2:
+			handler.Handle(ui.InputEvent{Kind: ui.InputCompose, Text: "", Time: base})
+			handler.Handle(ui.InputEvent{Kind: ui.InputText, Text: "字", Time: base})
+			want.WriteString("字")
+		}
+	}
+	stop()
+	if got := handler.Preedit(); got != "" {
+		test.Fatalf("residual Preedit = %q", got)
+	}
+	joined := strings.Join(sender.snapshot(), "")
+	if strings.Contains(joined, "pinyin") || strings.Contains(joined, "pinyi") {
+		test.Fatalf("preedit leaked: %q", joined)
+	}
+	if joined != want.String() {
+		test.Fatalf("sent = %q, want %q", joined, want.String())
 	}
 }

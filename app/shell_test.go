@@ -2,6 +2,7 @@ package app
 
 import (
 	"context"
+	"encoding/json"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -13,6 +14,7 @@ import (
 
 	"github.com/egoist/mygo/ui"
 
+	"nvgui/diag"
 	"nvgui/input"
 	"nvgui/renderlist"
 )
@@ -602,4 +604,118 @@ func TestCloseDoneWaitsForSessionTeardown(test *testing.T) {
 	case <-time.After(5 * time.Second):
 		test.Fatal("Close did not wait for shell goroutines")
 	}
+}
+
+func TestSyncInputTraceIsOrderedAndDeduplicated(test *testing.T) {
+	test.Run("unstarted shell does not advance cursor", func(test *testing.T) {
+		recorder := input.NewTraceRecorder()
+		recorder.Observe(ui.InputEvent{Kind: ui.InputText, Text: "x"})
+		impl := &shellImpl{recorder: recorder}
+		impl.syncInputTrace()
+		if impl.forwardedInputSeq != 0 {
+			test.Fatalf("forwardedInputSeq = %d, want 0", impl.forwardedInputSeq)
+		}
+	})
+
+	test.Run("real shell exports exact ordered events", func(test *testing.T) {
+		const events = 64
+		shell := startTestShell(test, &testClipboard{})
+		tester := ui.NewTester(shell.View, 800, 480)
+		waitUntil(test, 5*time.Second, "initial committed frame", func() bool {
+			tester.Frame()
+			return shell.impl.session.Latest() != nil
+		})
+		recorder := shell.impl.recorder
+		baseTime := time.Unix(1_700_000_000, 0).UTC()
+		for index := 0; index < events; index++ {
+			recorder.Observe(ui.InputEvent{
+				Kind: ui.InputText,
+				Text: "x",
+				Time: baseTime.Add(time.Duration(index) * time.Millisecond),
+			})
+		}
+
+		const workers = 8
+		start := make(chan struct{})
+		errors := make(chan error, workers)
+		var wait sync.WaitGroup
+		for worker := 0; worker < workers; worker++ {
+			wait.Add(1)
+			go func(worker int) {
+				defer wait.Done()
+				<-start
+				for range 20 {
+					if worker == 0 {
+						dir := filepath.Join(test.TempDir(), "concurrent")
+						if err := shell.ExportDiag(dir); err != nil {
+							errors <- err
+							return
+						}
+						if _, err := diag.ReadBundle(dir); err != nil {
+							errors <- err
+							return
+						}
+						continue
+					}
+					shell.impl.syncInputTrace()
+				}
+			}(worker)
+		}
+		close(start)
+		wait.Wait()
+		close(errors)
+		for err := range errors {
+			if err != nil {
+				test.Fatalf("concurrent ExportDiag: %v", err)
+			}
+		}
+
+		shell.impl.inputSyncMu.Lock()
+		forwarded := shell.impl.forwardedInputSeq
+		shell.impl.inputSyncMu.Unlock()
+		if forwarded != events {
+			test.Fatalf("forwardedInputSeq = %d, want %d", forwarded, events)
+		}
+
+		dir := filepath.Join(test.TempDir(), "bundle")
+		if err := shell.ExportDiag(dir); err != nil {
+			test.Fatalf("ExportDiag: %v", err)
+		}
+		data, err := os.ReadFile(filepath.Join(dir, "input-trace.jsonl"))
+		if err != nil {
+			test.Fatalf("read input-trace.jsonl: %v", err)
+		}
+		lines := strings.Split(strings.TrimSpace(string(data)), "\n")
+		if len(lines) != events {
+			test.Fatalf("input-trace.jsonl lines = %d, want %d", len(lines), events)
+		}
+		seen := make(map[uint64]bool, events)
+		for index, line := range lines {
+			var event diag.TraceEvent
+			if err := json.Unmarshal([]byte(line), &event); err != nil {
+				test.Fatalf("decode input-trace.jsonl line %d: %v", index+1, err)
+			}
+			if want := uint64(index + 1); event.Seq != want {
+				test.Fatalf("input-trace.jsonl line %d Seq = %d, want %d", index+1, event.Seq, want)
+			}
+			if seen[event.Seq] {
+				test.Fatalf("input-trace.jsonl duplicate Seq %d", event.Seq)
+			}
+			seen[event.Seq] = true
+		}
+		bundle, err := diag.ReadBundle(dir)
+		if err != nil {
+			test.Fatalf("diag.ReadBundle: %v", err)
+		}
+		if len(bundle.InputEvents) != events {
+			test.Fatalf("InputEvents len = %d, want %d", len(bundle.InputEvents), events)
+		}
+		var previous uint64
+		for index, event := range bundle.InputEvents {
+			if event.Seq != uint64(index+1) || event.Seq <= previous {
+				test.Fatalf("InputEvents[%d].Seq = %d, want %d strictly increasing after %d", index, event.Seq, index+1, previous)
+			}
+			previous = event.Seq
+		}
+	})
 }
