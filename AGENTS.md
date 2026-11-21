@@ -20,3 +20,9 @@
 - `connection` / `protocol` / `screen` / `diag` / `session` / `drawlist` / `renderlist` / `oracle` 及其测试依赖均不得包含 mygo。
 - 生产依赖只能向下：`app`、`cmd/nvgui` 可引用所有下层；`render` 可引用 `drawlist` / `renderlist` / `text` / `screen` / `protocol`；`input` 可引用 `screen` / `diag` / `protocol`；`diag` 可引用 `drawlist` / `renderlist` / `screen` / `protocol`（禁止引用 `input` 与 `mygo`；`TraceKind`/`TraceEvent` 定义在 `diag`，由 `input` 通过类型别名复用）；`session` 可引用 `connection` / `diag` / `protocol` / `screen`；`drawlist` 与 `text` 只引用 `screen` / `protocol`；下层不得引用上层。
 - `tools/check.sh` 控制生产依赖方向、mygo 白名单与包循环；测试依赖不参与分层方向判定。
+
+## Commit 规范
+
+提交消息遵循 Conventional Commits：`<type>(<scope>): <summary>`。
+- `type` 取 `feat`、`fix`、`refactor`、`perf`、`test`、`docs`、`chore`、`build`、`ci`；`scope` 为受影响的包或子系统（如 `protocol`、`screen`、`drawlist`、`text`、`render`、`input`、`app`、`diag`、`session`、`oracle`、`cmd/nvgui`）。
+- `summary` 面向外部读者描述可观测的代码变更；内部票号与里程碑进度记在控制面文档，放在提交消息之外。
