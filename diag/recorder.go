@@ -14,6 +14,7 @@ import (
 
 	"github.com/neovim/go-client/msgpack"
 
+	"nvgui/drawlist"
 	"nvgui/protocol"
 	"nvgui/screen"
 )
@@ -30,6 +31,13 @@ type recordedMessage struct {
 	sequence int
 }
 
+type recordedInput struct {
+	event TraceEvent
+	at    time.Time
+}
+
+const maxRecordedInputs = 65536
+
 type keyframeRecord struct {
 	state *screen.State
 	at    time.Time
@@ -43,8 +51,10 @@ type Recorder struct {
 	pending []byte
 	nextSeq int
 
-	messages  []recordedMessage
-	keyframes []keyframeRecord
+	messages     []recordedMessage
+	keyframes    []keyframeRecord
+	inputs       []recordedInput
+	lastInputSeq uint64
 }
 
 func NewRecorder(window time.Duration, clock Clock) *Recorder {
@@ -153,6 +163,7 @@ func (reader *countingReader) Read(buffer []byte) (int, error) {
 }
 
 func (r *Recorder) trim(now time.Time) {
+	r.trimInputs(now)
 	if len(r.keyframes) == 0 {
 		return
 	}
@@ -182,6 +193,24 @@ func (r *Recorder) trim(now time.Time) {
 	}
 }
 
+func (r *Recorder) trimInputs(now time.Time) {
+	cutoff := now.Add(-r.window)
+	retained := 0
+	for retained < len(r.inputs) && r.inputs[retained].at.Before(cutoff) {
+		retained++
+	}
+	if excess := len(r.inputs) - retained - maxRecordedInputs; excess > 0 {
+		retained += excess
+	}
+	if retained <= 0 {
+		return
+	}
+	kept := len(r.inputs) - retained
+	inputs := make([]recordedInput, kept)
+	copy(inputs, r.inputs[retained:])
+	r.inputs = inputs
+}
+
 func (r *Recorder) Keyframe(s *screen.State) {
 	if s == nil {
 		return
@@ -208,8 +237,9 @@ type Meta struct {
 
 type exportMeta struct {
 	Meta
-	ExportedAt time.Time `json:"exported_at"`
-	WindowMS   int64     `json:"window_ms"`
+	BundleVersion int       `json:"bundle_version"`
+	ExportedAt    time.Time `json:"exported_at"`
+	WindowMS      int64     `json:"window_ms"`
 }
 
 type timingRecord struct {
@@ -226,6 +256,22 @@ type recorderSnapshot struct {
 	inbound      []byte
 	timing       []timingRecord
 	windowMillis int64
+	inputs       []TraceEvent
+	drawData     []byte
+	inputData    []byte
+	drawIndex    []byte
+	inputIndex   []byte
+}
+
+type bundleReplay struct {
+	keyframeGob []byte
+	inbound     []byte
+	replayFrom  []byte
+}
+
+type exportFile struct {
+	name string
+	data []byte
 }
 
 func (r *Recorder) Export(dir string, meta Meta) error {
@@ -236,21 +282,64 @@ func (r *Recorder) Export(dir string, meta Meta) error {
 	if err != nil {
 		return err
 	}
-	if err := requireEmptyDirectory(dir); err != nil {
+	if err := validateInputEvents(snapshot.inputs); err != nil {
+		return fmt.Errorf("diag: recorded input trace: %w", err)
+	}
+	replayData := bundleReplay{
+		inbound:    append([]byte(nil), snapshot.inbound...),
+		replayFrom: encodeInt(snapshot.replayFrom),
+	}
+	var gobBuffer bytes.Buffer
+	if err := gob.NewEncoder(&gobBuffer).Encode(normalizeState(snapshot.keyframe)); err != nil {
+		return fmt.Errorf("diag: encode keyframe.gob: %w", err)
+	}
+	replayData.keyframeGob = gobBuffer.Bytes()
+	states, err := replayStates(replayData)
+	if err != nil {
 		return err
 	}
-	if err := os.MkdirAll(dir, 0o755); err != nil {
-		return fmt.Errorf("diag: create export directory: %w", err)
+	committed, err := committedStates(states)
+	if err != nil {
+		return err
 	}
-	for _, name := range []string{"draw-list", "input-trace"} {
-		if err := os.MkdirAll(filepath.Join(dir, name), 0o755); err != nil {
-			return fmt.Errorf("diag: create %s: %w", name, err)
+	drawLists, err := buildDrawLists(committed)
+	if err != nil {
+		return err
+	}
+	if err := alignFrames(committed, drawLists); err != nil {
+		return err
+	}
+	drawLines := make([][]byte, 0, len(drawLists))
+	for index, list := range drawLists {
+		encoded, err := drawlist.JSON(list)
+		if err != nil {
+			return fmt.Errorf("diag: encode draw-list.jsonl line %d: %w", index+1, err)
 		}
+		drawLines = append(drawLines, encoded)
+	}
+	inputLines := make([][]byte, 0, len(snapshot.inputs))
+	for index := range snapshot.inputs {
+		encoded, err := json.Marshal(snapshot.inputs[index])
+		if err != nil {
+			return fmt.Errorf("diag: encode input-trace.jsonl line %d: %w", index+1, err)
+		}
+		inputLines = append(inputLines, encoded)
+	}
+	snapshot.drawData = jsonlBytes(drawLines)
+	snapshot.inputData = jsonlBytes(inputLines)
+	snapshot.drawIndex, err = bundleIndexBytes("draw-list", "draw-list", drawLines)
+	if err != nil {
+		return err
+	}
+	snapshot.inputIndex, err = bundleIndexBytes("input-trace", "input-trace", inputLines)
+	if err != nil {
+		return err
 	}
 	metaData, err := json.Marshal(exportMeta{
-		Meta:       snapshot.meta,
-		ExportedAt: snapshot.exportedAt,
-		WindowMS:   snapshot.windowMillis,
+		Meta:          snapshot.meta,
+		BundleVersion: bundleVersion,
+		ExportedAt:    snapshot.exportedAt,
+		WindowMS:      snapshot.windowMillis,
 	})
 	if err != nil {
 		return fmt.Errorf("diag: encode meta.json: %w", err)
@@ -259,38 +348,86 @@ func (r *Recorder) Export(dir string, meta Meta) error {
 	if err != nil {
 		return fmt.Errorf("diag: encode keyframe.json: %w", err)
 	}
-	if err := writeFile(filepath.Join(dir, "meta.json"), append(metaData, '\n')); err != nil {
+	if err := requireEmptyDirectory(dir); err != nil {
 		return err
 	}
-	if err := writeFile(filepath.Join(dir, "keyframe.json"), append(canonical, '\n')); err != nil {
-		return err
-	}
-	if err := writeGob(filepath.Join(dir, "keyframe.gob"), snapshot.keyframe); err != nil {
-		return err
-	}
-	if err := writeFile(filepath.Join(dir, "inbound.mpack"), snapshot.inbound); err != nil {
-		return err
-	}
-	if err := writeFile(filepath.Join(dir, "replay-from.gob"), encodeInt(snapshot.replayFrom)); err != nil {
-		return err
-	}
+	_, statErr := os.Stat(dir)
+	createdRoot := errors.Is(statErr, os.ErrNotExist)
 	var timing bytes.Buffer
-	encoder := json.NewEncoder(&timing)
+	timingEncoder := json.NewEncoder(&timing)
 	for _, record := range snapshot.timing {
-		if err := encoder.Encode(record); err != nil {
+		if err := timingEncoder.Encode(record); err != nil {
 			return fmt.Errorf("diag: encode timing.jsonl: %w", err)
 		}
 	}
-	if err := writeFile(filepath.Join(dir, "timing.jsonl"), timing.Bytes()); err != nil {
+	files := []exportFile{
+		{name: "meta.json", data: append(metaData, '\n')},
+		{name: "keyframe.json", data: append(canonical, '\n')},
+		{name: "keyframe.gob", data: replayData.keyframeGob},
+		{name: "inbound.mpack", data: snapshot.inbound},
+		{name: "replay-from.gob", data: replayData.replayFrom},
+		{name: "timing.jsonl", data: timing.Bytes()},
+		{name: "draw-list.jsonl", data: snapshot.drawData},
+		{name: "input-trace.jsonl", data: snapshot.inputData},
+		{name: filepath.Join("draw-list", "index.json"), data: snapshot.drawIndex},
+		{name: filepath.Join("input-trace", "index.json"), data: snapshot.inputIndex},
+	}
+	if err := writeExportFiles(dir, createdRoot, files); err != nil {
 		return err
 	}
 	return nil
+}
+
+func writeExportFiles(dir string, createdRoot bool, files []exportFile) (err error) {
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		return fmt.Errorf("diag: create export directory: %w", err)
+	}
+	defer func() {
+		if err == nil {
+			return
+		}
+		if cleanupErr := cleanupExportFiles(dir, createdRoot, files); cleanupErr != nil {
+			err = fmt.Errorf("%w; cleanup: %v", err, cleanupErr)
+		}
+	}()
+	for _, name := range []string{"draw-list", "input-trace"} {
+		if err := os.MkdirAll(filepath.Join(dir, name), 0o755); err != nil {
+			return fmt.Errorf("diag: create %s: %w", name, err)
+		}
+	}
+	for _, file := range files {
+		if err := writeFile(filepath.Join(dir, file.name), file.data); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func cleanupExportFiles(dir string, createdRoot bool, files []exportFile) error {
+	var failures []error
+	remove := func(path string) {
+		removeErr := os.Remove(path)
+		if removeErr != nil && !errors.Is(removeErr, os.ErrNotExist) {
+			failures = append(failures, fmt.Errorf("remove %s: %w", path, removeErr))
+		}
+	}
+	for _, file := range files {
+		remove(filepath.Join(dir, file.name))
+	}
+	for _, name := range []string{"draw-list", "input-trace"} {
+		remove(filepath.Join(dir, name))
+	}
+	if createdRoot {
+		remove(dir)
+	}
+	return errors.Join(failures...)
 }
 
 func (r *Recorder) snapshot(meta Meta) (recorderSnapshot, error) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	exportedAt := r.clock.Now()
+	r.trimInputs(exportedAt)
 
 	keyframe := &screen.State{
 		Grids:      map[int]*screen.Grid{},
@@ -348,6 +485,7 @@ func (r *Recorder) snapshot(meta Meta) (recorderSnapshot, error) {
 		inbound:      inbound,
 		timing:       timing,
 		windowMillis: r.window.Milliseconds(),
+		inputs:       cloneInputEvents(r.inputs),
 	}, nil
 }
 
@@ -396,31 +534,41 @@ func writeFile(path string, data []byte) error {
 	return nil
 }
 
-func writeGob(path string, state *screen.State) error {
-	var buffer bytes.Buffer
-	encoder := gob.NewEncoder(&buffer)
-	if err := encoder.Encode(normalizeState(state)); err != nil {
-		return fmt.Errorf("diag: encode keyframe.gob: %w", err)
-	}
-	return writeFile(path, buffer.Bytes())
-}
-
 func Replay(dir string) ([]*screen.State, error) {
-	state, err := readGob(filepath.Join(dir, "keyframe.gob"))
+	keyframeGob, err := os.ReadFile(filepath.Join(dir, "keyframe.gob"))
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("diag: read keyframe.gob: %w", err)
 	}
 	inbound, err := os.ReadFile(filepath.Join(dir, "inbound.mpack"))
 	if err != nil {
 		return nil, fmt.Errorf("diag: read inbound.mpack: %w", err)
 	}
-	messages, err := protocol.ReadMessages(inbound)
+	replayFrom, err := os.ReadFile(filepath.Join(dir, "replay-from.gob"))
+	if err != nil {
+		return nil, fmt.Errorf("diag: read replay-from.gob: %w", err)
+	}
+	return replayStates(bundleReplay{
+		keyframeGob: keyframeGob,
+		inbound:     inbound,
+		replayFrom:  replayFrom,
+	})
+}
+
+func replayStates(data bundleReplay) ([]*screen.State, error) {
+	var state screen.State
+	if err := gob.NewDecoder(bytes.NewReader(data.keyframeGob)).Decode(&state); err != nil {
+		return nil, fmt.Errorf("diag: decode keyframe.gob: %w", err)
+	}
+	messages, err := protocol.ReadMessages(data.inbound)
 	if err != nil {
 		return nil, fmt.Errorf("diag: decode inbound.mpack: %w", err)
 	}
-	reducer := screen.NewReducerFrom(state)
-	states := []*screen.State{cloneState(state)}
-	skipMessages := readInt(filepath.Join(dir, "replay-from.gob"))
+	skipMessages, err := decodeReplayFrom(data.replayFrom)
+	if err != nil {
+		return nil, err
+	}
+	reducer := screen.NewReducerFrom(&state)
+	states := []*screen.State{cloneState(&state)}
 	for _, message := range messages {
 		if skipMessages > 0 {
 			skipMessages--
@@ -450,16 +598,15 @@ func encodeInt(value int) []byte {
 	return buffer.Bytes()
 }
 
-func readInt(path string) int {
-	data, err := os.ReadFile(path)
-	if err != nil {
-		return 0
-	}
+func decodeReplayFrom(data []byte) (int, error) {
 	var value int
 	if err := gob.NewDecoder(bytes.NewReader(data)).Decode(&value); err != nil {
-		return 0
+		return 0, fmt.Errorf("diag: decode replay-from.gob: %w", err)
 	}
-	return value
+	if value < 0 {
+		return 0, fmt.Errorf("diag: replay-from.gob = %d, want non-negative", value)
+	}
+	return value, nil
 }
 
 func readGob(path string) (*screen.State, error) {
