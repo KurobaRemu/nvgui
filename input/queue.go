@@ -33,9 +33,12 @@ type queueImpl struct {
 	done    bool
 	ctx     context.Context
 
-	pending    *ui.InputEvent
-	swallowKey ui.Key
-	swallowAlt bool
+	pending      *ui.InputEvent
+	swallowKey   ui.Key
+	swallowAlt   bool
+	composing    bool
+	composeEpoch uint64
+	eventEpochs  [queueCapacity]uint64
 }
 
 func newQueue(sender Sender, recorder *TraceRecorder) *Queue {
@@ -49,9 +52,10 @@ func newQueue(sender Sender, recorder *TraceRecorder) *Queue {
 	return &Queue{impl: impl}
 }
 
-func (impl *queueImpl) keys(ev ui.InputEvent) string {
+func (impl *queueImpl) keys(ev ui.InputEvent, epoch uint64) string {
 	switch ev.Kind {
 	case ui.InputText:
+		impl.composing = false
 		if impl.pending != nil {
 			impl.pending = nil
 			impl.swallowKey = 0
@@ -75,11 +79,23 @@ func (impl *queueImpl) keys(ev ui.InputEvent) string {
 		impl.pending = nil
 		impl.swallowKey = 0
 		impl.swallowAlt = false
+		if ev.Canceled || ev.Text == "" {
+			impl.composing = false
+		} else if epoch == impl.composeEpoch {
+			impl.composing = true
+		}
 		return ""
 	case ui.InputKeyDown:
 		impl.pending = nil
 		impl.swallowKey = 0
 		impl.swallowAlt = false
+		if impl.composing {
+			if endsComposition(ev) {
+				impl.composing = false
+			} else if ev.Mods&(ui.Ctrl|ui.Super) == 0 {
+				return ""
+			}
+		}
 		if ev.Mods&ui.Super != 0 {
 			return ""
 		}
@@ -98,6 +114,12 @@ func (impl *queueImpl) keys(ev ui.InputEvent) string {
 		}
 		return notation
 	case ui.InputKeyUp:
+		if impl.composing {
+			impl.pending = nil
+			impl.swallowKey = 0
+			impl.swallowAlt = false
+			return ""
+		}
 		if impl.pending != nil && impl.pending.Key == ev.Key {
 			down := *impl.pending
 			impl.pending = nil
@@ -124,31 +146,48 @@ func (impl *queueImpl) finish(err error) {
 	close(impl.stopped)
 }
 
-func (impl *queueImpl) pop() (ui.InputEvent, bool) {
+func (impl *queueImpl) pop() (ui.InputEvent, uint64, bool) {
 	if impl.length == 0 {
-		return ui.InputEvent{}, false
+		return ui.InputEvent{}, 0, false
 	}
+	slot := impl.head
 	ev := impl.events[impl.head]
+	epoch := impl.eventEpochs[slot]
 	impl.events[impl.head] = ui.InputEvent{}
+	impl.eventEpochs[slot] = 0
 	impl.head = (impl.head + 1) % queueCapacity
 	impl.length--
 	impl.wakeup.Broadcast()
-	return ev, true
+	return ev, epoch, true
 }
 
-func (impl *queueImpl) deliver(ev ui.InputEvent) error {
-	keys := impl.keys(ev)
+func (impl *queueImpl) deliver(ev ui.InputEvent, epoch uint64) error {
+	impl.mu.Lock()
+	keys := impl.keys(ev, epoch)
+	if keys != "" {
+		if impl.sender == nil {
+			impl.mu.Unlock()
+			return errQueueNilSender
+		}
+		impl.sent = append(impl.sent, keys)
+	}
+	impl.mu.Unlock()
 	if keys == "" {
 		return nil
 	}
-	if impl.sender == nil {
-		return errQueueNilSender
-	}
-	impl.mu.Lock()
-	impl.sent = append(impl.sent, keys)
-	impl.mu.Unlock()
 	_, err := impl.sender.Input(keys)
 	return err
+}
+
+func (queue *Queue) resetComposition() {
+	if queue == nil || queue.impl == nil {
+		return
+	}
+	impl := queue.impl
+	impl.mu.Lock()
+	defer impl.mu.Unlock()
+	impl.composeEpoch++
+	impl.composing = false
 }
 
 func queueRun(queue *Queue, ctx context.Context) error {
@@ -212,10 +251,10 @@ func queueRun(queue *Queue, ctx context.Context) error {
 			impl.mu.Unlock()
 			return err
 		}
-		ev, ok := impl.pop()
+		ev, epoch, ok := impl.pop()
 		if ok {
 			impl.mu.Unlock()
-			if err := impl.deliver(ev); err != nil {
+			if err := impl.deliver(ev, epoch); err != nil {
 				impl.mu.Lock()
 				impl.finish(err)
 				impl.mu.Unlock()
@@ -251,12 +290,12 @@ func queueClose(queue *Queue) error {
 		impl.mu.Unlock()
 		for {
 			impl.mu.Lock()
-			ev, ok := impl.pop()
+			ev, epoch, ok := impl.pop()
 			impl.mu.Unlock()
 			if !ok {
 				break
 			}
-			if err := impl.deliver(ev); err != nil {
+			if err := impl.deliver(ev, epoch); err != nil {
 				impl.mu.Lock()
 				impl.finish(err)
 				impl.mu.Unlock()
@@ -300,7 +339,9 @@ func queueEnqueue(queue *Queue, ev ui.InputEvent) error {
 		impl.mu.Unlock()
 		return errQueueClosed
 	}
-	impl.events[(impl.head+impl.length)%queueCapacity] = ev
+	slot := (impl.head + impl.length) % queueCapacity
+	impl.events[slot] = ev
+	impl.eventEpochs[slot] = impl.composeEpoch
 	impl.length++
 	impl.wakeup.Broadcast()
 	if impl.recorder != nil {
@@ -325,37 +366,4 @@ func queueSent(queue *Queue) []string {
 	impl.mu.Lock()
 	defer impl.mu.Unlock()
 	return append([]string(nil), impl.sent...)
-}
-
-type handlerImpl struct{ queue *Queue }
-
-func newHandler(queue *Queue) *Handler {
-	return &Handler{impl: &handlerImpl{queue: queue}}
-}
-
-func handlerHandle(handler *Handler, ev ui.InputEvent) bool {
-	if handler == nil || handler.impl == nil || handler.impl.queue == nil {
-		return false
-	}
-	switch ev.Kind {
-	case ui.InputKeyDown, ui.InputKeyUp:
-		if ev.Mods&ui.Super != 0 {
-			return false
-		}
-		if _, ok := Notation(ev); !ok {
-			return false
-		}
-	case ui.InputText, ui.InputCompose, ui.InputCommand:
-	default:
-		return false
-	}
-	if err := handler.impl.queue.Enqueue(ev); err != nil {
-		return false
-	}
-	switch ev.Kind {
-	case ui.InputKeyDown, ui.InputKeyUp, ui.InputText:
-		return true
-	default:
-		return false
-	}
 }
