@@ -628,6 +628,18 @@ func TestWideCursorLightThemeAndInsertBeamRender(t *testing.T) {
 	if got := pixelAt(insertImg, 2*cellW-1, 0); !nearColor(got, lightGlyph) {
 		t.Fatalf("insert beam unexpectedly filled whole block at (%d,0): %+v", 2*cellW-1, got)
 	}
+	// Beam stays crisp (1.5 DIP) so x=2 at top border remains light background, not a chunky 3px bar.
+	if got := pixelAt(insertImg, 2, 0); !nearColor(got, lightGlyph) {
+		t.Fatalf("insert beam too wide at (2,0): %+v, want light background %+v", got, lightGlyph)
+	}
+	// Wide glyph "本" is horizontally centered in its 2-cell block (non-zero positive center offset when narrower than 2 cells).
+	wideFont := commandFont(cursorCmd)
+	wideGlyphs := ui.Shape("本", wideFont)
+	if len(wideGlyphs) > 0 && wideGlyphs[0].Advance < cursorCmd.W-0.5 {
+		if off := glyphCenterOffset(wideGlyphs, cursorCmd.W); off <= 0 {
+			t.Fatalf("glyphCenterOffset(wide \"本\", %.2f) = %.2f, want > 0", cursorCmd.W, off)
+		}
+	}
 }
 
 func renderImage(frame renderlist.Frame, width, height int) *image.RGBA {

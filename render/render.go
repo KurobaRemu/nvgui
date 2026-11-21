@@ -624,8 +624,33 @@ func drawGlyphs(p *ui.Painter, command renderlist.Command, cache *rowCache, meta
 	glyphs := cache.glyphs(command, meta)
 	font := commandFont(command)
 	baseline := command.Y + font.Metrics().Ascent
-	p.Glyphs(glyphs, command.X, baseline, color(command.FG))
+	offsetX := glyphCenterOffset(glyphs, command.W)
+	p.Glyphs(glyphs, command.X+offsetX, baseline, color(command.FG))
 	drawDecorations(p, command, meta)
+}
+
+func glyphCenterOffset(glyphs []ui.Glyph, room float32) float32 {
+	if len(glyphs) == 0 || room <= 0 {
+		return 0
+	}
+	firstCluster := glyphs[0].Cluster
+	x0, x1 := glyphs[0].X, glyphs[0].X+glyphs[0].Advance
+	for _, glyph := range glyphs[1:] {
+		if glyph.Cluster != firstCluster {
+			return 0
+		}
+		x0 = min(x0, glyph.X)
+		x1 = max(x1, glyph.X+glyph.Advance)
+	}
+	span := x1 - x0
+	if span <= 0 || span >= room {
+		return 0
+	}
+	offset := (room-span)/2 - x0
+	if math.Abs(float64(offset)) < 0.25 {
+		return 0
+	}
+	return offset
 }
 
 func shapeGlyphs(command renderlist.Command) []ui.Glyph {
@@ -704,11 +729,11 @@ func drawCursor(p *ui.Painter, command renderlist.Command, cache *rowCache, meta
 	attrs := splitAttrs(meta.attrs)
 	switch {
 	case hasAttr(attrs, "cursor_beam"):
-		beamWidth := min(rect.W, max(float32(2), min(float32(3), rect.W*0.25)))
+		beamWidth := min(rect.W, float32(1.5))
 		p.Fill(ui.Rect{X: rect.X, Y: rect.Y, W: beamWidth, H: rect.H}, fillColor, 0)
 		return
 	case hasAttr(attrs, "cursor_underline"):
-		barHeight := min(rect.H, max(float32(2), rect.H*0.2))
+		barHeight := min(rect.H, float32(1.5))
 		p.Fill(ui.Rect{X: rect.X, Y: rect.Y + rect.H - barHeight, W: rect.W, H: barHeight}, fillColor, 0)
 		return
 	}
