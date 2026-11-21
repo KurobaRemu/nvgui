@@ -203,12 +203,12 @@ func TestMetadataHashRejectsFalseMatches(t *testing.T) {
 	}
 	firstSeq := uint64(9)
 	otherSeq := uint64(10)
-	storeMetadata(renderlist.Frame{Seq: firstSeq, Commands: commands}, []rowMeta{{grid: 1}, {attrs: "underline"}})
-	storeMetadata(renderlist.Frame{Seq: otherSeq, Commands: commands}, []rowMeta{{grid: 2}, {attrs: "bold"}})
-	if got := metadataFor(renderlist.Frame{Seq: firstSeq, Commands: commands}); got[0].grid != 1 || got[1].attrs != "underline" {
+	storeMetadata(renderlist.Frame{Seq: firstSeq, Commands: commands}, []rowMeta{{grid: 1}, {attrMask: attrUnderline}})
+	storeMetadata(renderlist.Frame{Seq: otherSeq, Commands: commands}, []rowMeta{{grid: 2}, {attrMask: attrBold}})
+	if got := metadataFor(renderlist.Frame{Seq: firstSeq, Commands: commands}); got[0].grid != 1 || got[1].attrMask != attrUnderline {
 		t.Fatalf("metadata for seq %d = %+v, want first frame metadata", firstSeq, got)
 	}
-	if got := metadataFor(renderlist.Frame{Seq: otherSeq, Commands: commands}); got[0].grid != 2 || got[1].attrs != "bold" {
+	if got := metadataFor(renderlist.Frame{Seq: otherSeq, Commands: commands}); got[0].grid != 2 || got[1].attrMask != attrBold {
 		t.Fatalf("metadata for seq %d = %+v, want second frame metadata", otherSeq, got)
 	}
 	changed := append([]renderlist.Command(nil), commands...)
@@ -284,11 +284,11 @@ func TestCaretClearsOnFrameWithoutCursor(t *testing.T) {
 func TestRowCacheKeyIgnoresFrameSeq(t *testing.T) {
 	cache := newRowCache()
 	command := renderlist.Command{Op: "glyphs", X: 3, Y: 36, W: 90, H: 18, Text: "same row", Family: "Menlo", Size: 14, FG: 0xffffff, BG: 0x101010}
-	first := cache.glyphs(command, rowMeta{grid: 4, attrs: "bold"})
+	first := cache.glyphs(command, rowMeta{grid: 4, attrMask: attrBold})
 	if len(first) == 0 {
 		t.Fatal("shaping returned no glyphs")
 	}
-	second := cache.glyphs(command, rowMeta{grid: 4, attrs: "bold"})
+	second := cache.glyphs(command, rowMeta{grid: 4, attrMask: attrBold})
 	if got := cache.shapedRows(); got != 1 {
 		t.Fatalf("ShapedRows after repeated row = %d, want 1", got)
 	}
@@ -297,11 +297,11 @@ func TestRowCacheKeyIgnoresFrameSeq(t *testing.T) {
 	}
 	edited := command
 	edited.Text = "changed row"
-	_ = cache.glyphs(edited, rowMeta{grid: 4, attrs: "bold"})
+	_ = cache.glyphs(edited, rowMeta{grid: 4, attrMask: attrBold})
 	if got := cache.shapedRows(); got != 2 {
 		t.Fatalf("ShapedRows after row edit = %d, want 2", got)
 	}
-	_ = cache.glyphs(command, rowMeta{grid: 4, attrs: "italic"})
+	_ = cache.glyphs(command, rowMeta{grid: 4, attrMask: attrItalic})
 	if got := cache.shapedRows(); got != 3 {
 		t.Fatalf("ShapedRows after attrs edit = %d, want 3", got)
 	}
@@ -375,7 +375,7 @@ func TestDecorationsRender(t *testing.T) {
 			}}
 			view := NewView()
 			view.SetFrame(frame)
-			view.impl.metas = []rowMeta{{attrs: attr}, {attrs: attr}}
+			view.impl.metas = []rowMeta{{attrMask: attrsMask([]string{attr})}, {attrMask: attrsMask([]string{attr})}}
 			image := renderView(view, 120, 30)
 			if !hasColorNear(image, imagecolor.RGBA{R: 255, A: 255}) {
 				t.Errorf("%s did not paint its SP color", attr)
@@ -484,7 +484,7 @@ func TestDecorationColorFallsBackWhenSPZero(t *testing.T) {
 	}}
 	view := NewView()
 	view.SetFrame(frame)
-	view.impl.metas = []rowMeta{{attrs: "underline"}, {attrs: "underline"}}
+	view.impl.metas = []rowMeta{{attrMask: attrUnderline}, {attrMask: attrUnderline}}
 	if image := renderView(view, 120, 30); !hasGreenForeground(image) {
 		t.Error("decoration did not use FG when SP was zero")
 	}
@@ -713,4 +713,432 @@ func hasGreenForeground(rendered *image.RGBA) bool {
 		}
 	}
 	return false
+}
+
+func TestPlannerPreservesFallbackChainsInOneFrame(t *testing.T) {
+	resolver := mustTestResolver(t)
+	planner := NewPlanner(resolver)
+	cases := []struct {
+		text     string
+		contains []string
+		excludes []string
+	}{
+		{text: "render", contains: []string{"menlo"}, excludes: []string{"pingfang", "emoji", "nerd"}},
+		{text: "世", contains: []string{"menlo", "pingfang"}, excludes: []string{"emoji", "nerd"}},
+		{text: "🌍", contains: []string{"menlo", "emoji"}, excludes: []string{"pingfang", "nerd"}},
+		{text: "\uE0B0", contains: []string{"menlo"}, excludes: []string{"pingfang", "emoji"}},
+	}
+	items := make([]drawlist.Item, 0, len(cases))
+	for index, testCase := range cases {
+		items = append(items, drawlist.Item{
+			Kind: "text", Row: 0, Col: index, Width: 1, Height: 1,
+			Text: testCase.text, FG: 0xffffff, BG: 0x101010,
+		})
+	}
+	frame, err := planner.Plan(&drawlist.List{Version: 1, Seq: 300, Layers: []drawlist.Layer{{
+		Grid: 1, Items: items,
+	}}})
+	if err != nil {
+		t.Fatalf("Plan: %v", err)
+	}
+	if len(frame.Commands) != len(cases) {
+		t.Fatalf("commands = %d, want %d: %+v", len(frame.Commands), len(cases), frame.Commands)
+	}
+	for index, testCase := range cases {
+		want := resolver.FontFor(testCase.text, false, false)
+		got := frame.Commands[index]
+		if got.Text != testCase.text || got.Family != want.Family || got.Size != want.Size ||
+			got.Weight != want.Weight || got.Italic != want.Italic || got.Features != want.Features {
+			t.Errorf("command %d = %+v, want text %q and font %+v", index, got, testCase.text, want)
+		}
+		if testCase.text == "\uE0B0" && strings.Contains(strings.ToLower(want.Family), "nerd") {
+			testCase.contains = append(testCase.contains, "nerd")
+		}
+		family := strings.ToLower(got.Family)
+		for _, contains := range testCase.contains {
+			if !strings.Contains(family, contains) {
+				t.Errorf("%q family %q lacks fallback %q", testCase.text, got.Family, contains)
+			}
+		}
+		for _, excludes := range testCase.excludes {
+			if strings.Contains(family, excludes) {
+				t.Errorf("%q family %q unexpectedly contains %q", testCase.text, got.Family, excludes)
+			}
+		}
+	}
+}
+
+func TestPlannerASCIIFontCacheTracksResolverConfig(t *testing.T) {
+	beforeResolver := mustTestResolver(t)
+	afterResolver, err := text.NewResolver(text.Config{GUIFont: "Menlo:h22", Scale: 1})
+	if err != nil {
+		t.Fatalf("NewResolver(h22): %v", err)
+	}
+	planner := NewPlanner(beforeResolver)
+	list := &drawlist.List{Version: 1, Seq: 301, Layers: []drawlist.Layer{{Items: []drawlist.Item{
+		{Kind: "text", Width: 1, Height: 1, Text: "A", FG: 0xffffff},
+	}}}}
+	before, err := planner.Plan(list)
+	if err != nil {
+		t.Fatalf("Plan before config change: %v", err)
+	}
+	if len(before.Commands) != 1 || before.Commands[0].Size == 0 {
+		t.Fatalf("before commands = %+v, want one resolved font", before.Commands)
+	}
+
+	planner.mu.Lock()
+	planner.resolver = afterResolver
+	planner.mu.Unlock()
+	if planner.resolver.Config().GUIFont != "Menlo:h22" {
+		t.Fatal("planner resolver config did not change")
+	}
+
+	after, err := planner.Plan(list)
+	if err != nil {
+		t.Fatalf("Plan after config change: %v", err)
+	}
+	want := afterResolver.FontFor("A", false, false)
+	if len(after.Commands) != 1 || after.Commands[0].Size != want.Size || after.Commands[0].Family != want.Family {
+		t.Fatalf("after commands = %+v, want fresh font %+v", after.Commands, want)
+	}
+	if before.Commands[0].Size == after.Commands[0].Size {
+		t.Fatalf("font cache did not invalidate: size stayed %v", before.Commands[0].Size)
+	}
+}
+
+func TestPlannerOtherFontCacheIsBoundedAndTracksConfig(t *testing.T) {
+	beforeResolver := mustTestResolver(t)
+	oldConfig := beforeResolver.Config()
+	planner := NewPlanner(beforeResolver)
+	planner.mu.Lock()
+	planner.otherFonts = map[otherFontQuery]text.Font{
+		{text: "世"}: {Family: "stale", Size: 14},
+	}
+	planner.config = oldConfig
+	planner.ready = true
+	planner.mu.Unlock()
+	items := make([]drawlist.Item, 0, otherFontCacheCapacity+2)
+	for index := 0; index < otherFontCacheCapacity+2; index++ {
+		character := rune(0x100 + index)
+		items = append(items, drawlist.Item{
+			Kind: "text", Row: 0, Col: index, Width: 1, Height: 1,
+			Text: string(character), FG: 0xffffff,
+		})
+	}
+	list := &drawlist.List{Version: 1, Seq: 307, Layers: []drawlist.Layer{{Grid: 1, Items: items}}}
+	before, err := planner.Plan(list)
+	if err != nil {
+		t.Fatalf("Plan before config change: %v", err)
+	}
+	if len(before.Commands) != len(items) {
+		t.Fatalf("commands = %d, want %d standalone non-ASCII glyphs", len(before.Commands), len(items))
+	}
+	planner.mu.Lock()
+	count := len(planner.otherFonts)
+	planner.mu.Unlock()
+	if count > otherFontCacheCapacity {
+		t.Fatalf("otherFonts size = %d, want <= %d", count, otherFontCacheCapacity)
+	}
+	planner.mu.Lock()
+	_, stale := planner.otherFonts[otherFontQuery{text: "世"}]
+	planner.mu.Unlock()
+	if stale {
+		t.Fatal("capacity clearing kept a preexisting non-ASCII font")
+	}
+
+	afterResolver, err := text.NewResolver(text.Config{GUIFont: "Menlo:h22", Scale: 1})
+	if err != nil {
+		t.Fatalf("NewResolver(h22): %v", err)
+	}
+	planner.mu.Lock()
+	planner.resolver = afterResolver
+	planner.mu.Unlock()
+	probe := "世"
+	probeList := &drawlist.List{Version: 1, Seq: 308, Layers: []drawlist.Layer{{Grid: 1, Items: []drawlist.Item{
+		{Kind: "text", Width: 1, Height: 1, Text: probe, FG: 0xffffff},
+	}}}}
+	want := afterResolver.FontFor(probe, false, false)
+	oldFont := beforeResolver.FontFor(probe, false, false)
+	for attempt := 0; attempt < 2; attempt++ {
+		frame, err := planner.Plan(probeList)
+		if err != nil {
+			t.Fatalf("Plan after config change (attempt %d): %v", attempt, err)
+		}
+		if len(frame.Commands) != 1 {
+			t.Fatalf("commands = %d, want one non-ASCII glyph: %+v", len(frame.Commands), frame.Commands)
+		}
+		got := frame.Commands[0]
+		if got.Text != probe || got.Family != want.Family || got.Size != want.Size ||
+			got.Weight != want.Weight || got.Italic != want.Italic || got.Features != want.Features {
+			t.Fatalf("command = %+v, want fresh non-ASCII font %+v", got, want)
+		}
+	}
+	if oldFont.Size == want.Size {
+		t.Fatalf("config change did not alter font size: both %v", want.Size)
+	}
+	planner.mu.Lock()
+	cached, ok := planner.otherFonts[otherFontQuery{text: probe}]
+	delete(planner.otherFonts, otherFontQuery{text: probe})
+	planner.resolver = beforeResolver
+	planner.mu.Unlock()
+	if !ok || cached != want {
+		t.Fatalf("new-config non-ASCII cache = %+v (present %v), want %+v", cached, ok, want)
+	}
+	staleFont := planner.fontFor(drawlist.Item{Kind: "text", Text: probe}, [4]text.Font{}, oldConfig)
+	planner.mu.Lock()
+	planner.resolver = afterResolver
+	_, polluted := planner.otherFonts[otherFontQuery{text: probe}]
+	planner.mu.Unlock()
+	if staleFont != oldFont {
+		t.Fatalf("stale-config call returned %+v, want old font %+v", staleFont, oldFont)
+	}
+	if polluted {
+		t.Fatal("stale config writeback polluted the new non-ASCII font cache")
+	}
+}
+
+func TestPlannerKeepsFillCrossingTopOfLayerClip(t *testing.T) {
+	resolver := mustTestResolver(t)
+	cell := resolver.Cell()
+	planner := NewPlanner(resolver)
+	list := &drawlist.List{Version: 1, Seq: 302, Width: 6, Height: 4, Layers: []drawlist.Layer{{
+		Grid: 2, ScreenRow: 0, ScreenCol: 0, Width: 6, Height: 3,
+		Clip: drawlist.Rect{X: 1, Y: 2, W: 3, H: 2},
+		Items: []drawlist.Item{{
+			Kind: "fill", Row: 0, Col: 0, Width: 6, Height: 3, BG: 0x123456,
+		}},
+	}}}
+	frame, err := planner.Plan(list)
+	if err != nil {
+		t.Fatalf("Plan: %v", err)
+	}
+	if len(frame.Commands) != 1 {
+		t.Fatalf("commands = %d, want clipped multi-row fill: %+v", len(frame.Commands), frame.Commands)
+	}
+	fill := frame.Commands[0]
+	want := renderlist.Command{
+		Op: "fill", X: cell.Width, Y: 2 * cell.Height,
+		W: 3 * cell.Width, H: cell.Height, BG: 0x123456,
+	}
+	if fill != want {
+		t.Fatalf("clipped fill = %+v, want %+v", fill, want)
+	}
+}
+
+func TestPlannerMergesOnlyVisibleColumnsInsideClip(t *testing.T) {
+	resolver := mustTestResolver(t)
+	cell := resolver.Cell()
+	planner := NewPlanner(resolver)
+	const text = "ABCDEFGHIJKL"
+	items := make([]drawlist.Item, 0, len(text))
+	for index, character := range []byte(text) {
+		items = append(items, drawlist.Item{
+			Kind: "text", Row: 1, Col: index, Width: 1, Height: 1,
+			Text: string(character), FG: 0xffffff, BG: 0x101010,
+		})
+	}
+	list := &drawlist.List{Version: 1, Seq: 303, Width: 12, Height: 3, Layers: []drawlist.Layer{{
+		Grid: 3, ScreenRow: 0, ScreenCol: 0, Width: 12, Height: 3,
+		Clip: drawlist.Rect{X: 3, Y: 0, W: 6, H: 3}, Items: items,
+	}}}
+	frame, err := planner.Plan(list)
+	if err != nil {
+		t.Fatalf("Plan: %v", err)
+	}
+	if len(frame.Commands) != 1 {
+		t.Fatalf("commands = %d, want one visible run: %+v", len(frame.Commands), frame.Commands)
+	}
+	got := frame.Commands[0]
+	if got.Text != text[3:9] || got.X != 3*cell.Width || got.W != 6*cell.Width {
+		t.Fatalf("visible run = %+v, want Text=%q X=%v W=%v", got, text[3:9], 3*cell.Width, 6*cell.Width)
+	}
+	metas := metadataFor(frame)
+	if len(metas) != 1 || metas[0].clip != (ui.Rect{X: 3 * cell.Width, W: 6 * cell.Width, H: 3 * cell.Height}) {
+		t.Fatalf("run metadata = %+v, want layer clip", metas)
+	}
+}
+
+func TestLongMergedUnderdashedRunUsesCellSizedDashes(t *testing.T) {
+	resolver := mustTestResolver(t)
+	cell := resolver.Cell()
+	planner := NewPlanner(resolver)
+	items := make([]drawlist.Item, 0, 24)
+	for column := 0; column < 24; column++ {
+		items = append(items, drawlist.Item{
+			Kind: "text", Row: 0, Col: column, Width: 1, Height: 1,
+			Text: "x", FG: 0xffffff, BG: 0x101010, Attrs: []string{"underdashed"},
+		})
+	}
+	frame, err := planner.Plan(&drawlist.List{Version: 1, Seq: 304, Layers: []drawlist.Layer{{
+		Grid: 4, Items: items,
+	}}})
+	if err != nil {
+		t.Fatalf("Plan: %v", err)
+	}
+	if len(frame.Commands) != 1 || frame.Commands[0].Text != strings.Repeat("x", 24) {
+		t.Fatalf("commands = %+v, want one 24-column run", frame.Commands)
+	}
+	command := frame.Commands[0]
+	command.SP = 0xff0000
+	view := NewView()
+	view.SetFrame(renderlist.Frame{Version: 1, Seq: 304, Commands: []renderlist.Command{command}})
+	view.impl.metas = []rowMeta{{attrMask: attrUnderdashed}}
+	image := renderView(view, int(24*cell.Width), int(cell.Height))
+	segments := 0
+	inSegment := false
+	for x := 0; x < int(24*cell.Width); x++ {
+		colored := false
+		for y := 0; y < int(cell.Height); y++ {
+			if nearColor(pixelAt(image, x, y), imagecolor.RGBA{R: 255, A: 255}) {
+				colored = true
+				break
+			}
+		}
+		if colored && !inSegment {
+			segments++
+		}
+		inSegment = colored
+	}
+	if segments < 6 {
+		t.Fatalf("24-cell underdashed run painted %d segments, want >= 6 cell-sized dashes", segments)
+	}
+}
+
+func TestDrawFrameGroupsClipAndKeepsAcrossLayerOrder(t *testing.T) {
+	resolver := mustTestResolver(t)
+	cell := resolver.Cell()
+	planner := NewPlanner(resolver)
+	clip := drawlist.Rect{X: 2, Y: 1, W: 6, H: 2}
+	floatItems := []drawlist.Item{
+		{Kind: "fill", Row: 0, Col: 0, Width: 12, Height: 3, BG: 0x005500},
+	}
+	for column := 0; column < 12; column++ {
+		floatItems = append(floatItems, drawlist.Item{
+			Kind: "text", Row: 1, Col: column, Width: 1, Height: 1,
+			Text: "Z", FG: 0x00ff00, BG: 0x005500,
+		})
+	}
+	floatItems = append(floatItems,
+		drawlist.Item{Kind: "box", Row: 1, Col: 3, Width: 1, Height: 1, Rune: "│", FG: 0x00ff00, BG: 0x005500},
+		drawlist.Item{Kind: "cursor", Row: 1, Col: 4, Width: 1, Height: 1, FG: 0x005500, BG: 0x00ff00},
+	)
+	list := &drawlist.List{Version: 1, Seq: 305, Width: 12, Height: 4, Layers: []drawlist.Layer{
+		{
+			Grid: 1, Width: 12, Height: 4, Clip: drawlist.Rect{X: 0, Y: 0, W: 12, H: 4},
+			Items: []drawlist.Item{{Kind: "fill", Row: 0, Col: 0, Width: 12, Height: 4, BG: 0x000010}},
+		},
+		{
+			Grid: 2, ScreenRow: 1, ScreenCol: 2, Width: 12, Height: 3, Clip: clip, Items: floatItems,
+		},
+		{
+			Grid: 1, Width: 12, Height: 4, Clip: drawlist.Rect{X: 0, Y: 0, W: 12, H: 4},
+			Items: []drawlist.Item{{Kind: "fill", Row: 3, Col: 0, Width: 12, Height: 1, BG: 0x222222}},
+		},
+	}}
+	frame, err := planner.Plan(list)
+	if err != nil {
+		t.Fatalf("Plan: %v", err)
+	}
+	metas := metadataFor(frame)
+	if len(metas) != len(frame.Commands) {
+		t.Fatalf("metadata entries = %d, commands = %d", len(metas), len(frame.Commands))
+	}
+	clipRect := ui.Rect{X: 2 * cell.Width, Y: cell.Height, W: 6 * cell.Width, H: 2 * cell.Height}
+	grouped := 0
+	clipOps := 0
+	clipGrids := map[int]bool{}
+	for index, command := range frame.Commands {
+		if command.Op == "fill" && metas[index].clip != (ui.Rect{}) {
+			t.Errorf("fill %d retained GPU clip: %+v", index, metas[index].clip)
+		}
+		if metas[index].clip == clipRect {
+			grouped++
+			clipOps++
+			clipGrids[metas[index].grid] = true
+		}
+	}
+	if grouped < 3 {
+		t.Fatalf("clip group has %d commands, want glyphs, box and cursor grouped", grouped)
+	}
+	if len(clipGrids) != 1 {
+		t.Errorf("clip group merged %d grids, want one layer", len(clipGrids))
+	}
+
+	view := NewView()
+	view.SetFrame(frame)
+	image := renderView(view, int(12*cell.Width), int(4*cell.Height))
+	root := imagecolor.RGBA{B: 0x10, A: 255}
+	floatBG := imagecolor.RGBA{G: 0x55, A: 255}
+	lateBG := imagecolor.RGBA{R: 0x22, G: 0x22, B: 0x22, A: 255}
+	if got := pixelAt(image, int(3*cell.Width), int(2*cell.Height)); !nearColor(got, floatBG) && got.G <= got.B {
+		t.Errorf("float fill did not cover root background: %+v", got)
+	}
+	if got := pixelAt(image, int(3*cell.Width), int(3.5*cell.Height)); !nearColor(got, lateBG) {
+		t.Errorf("late root layer did not paint over lower float: %+v", got)
+	}
+	for _, point := range []struct {
+		x, y float32
+		want imagecolor.RGBA
+	}{
+		{x: 1.5, y: 1.5, want: root},
+		{x: 8.5, y: 1.5, want: root},
+		{x: 1.5, y: 3.5, want: lateBG},
+	} {
+		if got := pixelAt(image, int(point.x*cell.Width), int(point.y*cell.Height)); !nearColor(got, point.want) {
+			t.Errorf("clip leaked at (%v,%v): got %+v, want %+v", point.x, point.y, got, point.want)
+		}
+	}
+	if !hasColorNear(image, imagecolor.RGBA{G: 255, A: 255}) {
+		t.Error("clipped float glyphs were not painted")
+	}
+
+	commandCount := len(frame.Commands)
+	clipCalls := 0
+	for index := 0; index < commandCount; {
+		meta := metas[index]
+		end := index + 1
+		if meta.clip.W > 0 && meta.clip.H > 0 && frame.Commands[index].Op != "fill" {
+			for end < commandCount && end < len(metas) && frame.Commands[end].Op != "fill" &&
+				metas[end].clip == meta.clip && metas[end].grid == meta.grid {
+				end++
+			}
+		}
+		if meta.clip.W > 0 && meta.clip.H > 0 {
+			clipCalls++
+		}
+		index = end
+	}
+	if clipCalls > 2 {
+		t.Errorf("frame needs %d GPU clips, want at most two clip groups", clipCalls)
+	}
+}
+
+func TestUnknownAttrsPreventMergingAcrossDifferentValues(t *testing.T) {
+	resolver := mustTestResolver(t)
+	cell := resolver.Cell()
+	planner := NewPlanner(resolver)
+	list := &drawlist.List{Version: 1, Seq: 306, Layers: []drawlist.Layer{{Items: []drawlist.Item{
+		{Kind: "text", Row: 0, Col: 0, Width: 1, Height: 1, Text: "A", FG: 0xffffff, Attrs: []string{"altfont"}},
+		{Kind: "text", Row: 0, Col: 1, Width: 1, Height: 1, Text: "B", FG: 0xffffff, Attrs: []string{"nocombine"}},
+		{Kind: "text", Row: 0, Col: 2, Width: 1, Height: 1, Text: "C", FG: 0xffffff, Attrs: []string{"altfont"}},
+	}}}}
+	frame, err := planner.Plan(list)
+	if err != nil {
+		t.Fatalf("Plan: %v", err)
+	}
+	if len(frame.Commands) != 3 {
+		t.Fatalf("commands = %d, want 3 unmergeable unknown-attr items: %+v", len(frame.Commands), frame.Commands)
+	}
+	for index, want := range []string{"A", "B", "C"} {
+		got := frame.Commands[index]
+		if got.Text != want || got.X != float32(index)*cell.Width || got.W != cell.Width {
+			t.Errorf("command %d = %+v, want single %q cell", index, got, want)
+		}
+	}
+	metas := metadataFor(frame)
+	for index, meta := range metas {
+		if meta.attrMask&attrOther == 0 {
+			t.Errorf("metadata %d lost unknown attr marker: %+v", index, meta)
+		}
+	}
 }

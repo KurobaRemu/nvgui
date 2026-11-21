@@ -6,7 +6,6 @@ import (
 	"hash/maphash"
 	"math"
 	"slices"
-	"strings"
 	"sync"
 	"unicode/utf8"
 
@@ -18,8 +17,21 @@ import (
 )
 
 type Planner struct {
-	resolver *text.Resolver
+	mu         sync.Mutex
+	resolver   *text.Resolver
+	config     text.Config
+	fonts      [4]text.Font
+	otherFonts map[otherFontQuery]text.Font
+	ready      bool
 }
+
+type otherFontQuery struct {
+	text   string
+	bold   bool
+	italic bool
+}
+
+const otherFontCacheCapacity = 512
 
 func NewPlanner(resolver *text.Resolver) *Planner {
 	return &Planner{resolver: resolver}
@@ -37,8 +49,19 @@ func (p *Planner) Plan(list *drawlist.List) (renderlist.Frame, error) {
 		return renderlist.Frame{}, fmt.Errorf("render: invalid cell size %+v", cell)
 	}
 
+	fonts, config := p.refreshCache()
 	frame := renderlist.Frame{Version: 1, Seq: list.Seq}
-	metas := make([]rowMeta, 0)
+	itemCount := 0
+	for _, layer := range list.Layers {
+		itemCount += len(layer.Items)
+	}
+	capHint := itemCount
+	if capHint > 256 {
+		capHint = max(256, itemCount/4)
+	}
+	frame.Commands = make([]renderlist.Command, 0, capHint)
+	metas := make([]rowMeta, 0, capHint)
+	runBuf := make([]byte, 0, 256)
 	for layerIndex, layer := range list.Layers {
 		if layer.Clip.W < 0 || layer.Clip.H < 0 {
 			return renderlist.Frame{}, fmt.Errorf("render: layer %d has negative clip %+v", layerIndex, layer.Clip)
@@ -47,30 +70,161 @@ func (p *Planner) Plan(list *drawlist.List) (renderlist.Frame, error) {
 		if clipping && (layer.Clip.W == 0 || layer.Clip.H == 0) {
 			continue
 		}
-		for itemIndex, item := range layer.Items {
-			command, ok, err := p.planItem(layer, item, cell)
+		clip := commandClip(layer.Clip, cell, clipping, true)
+		for itemIndex := 0; itemIndex < len(layer.Items); {
+			item := layer.Items[itemIndex]
+			command, ok, err := p.planItem(layer, item, cell, fonts, config)
 			if err != nil {
 				return renderlist.Frame{}, fmt.Errorf("render: layer %d item %d: %w", layerIndex, itemIndex, err)
 			}
 			if !ok {
+				itemIndex++
 				continue
 			}
+			attrMask := attrsMask(item.Attrs)
 			if clipping {
 				command, ok = clipCommand(command, layer.Clip, cell)
 				if !ok {
+					itemIndex++
 					continue
 				}
 			}
+			nextIndex := itemIndex + 1
+			if command.Op == "glyphs" && mergeCandidate(item, clipping) && mergeVisible(layer, item, clipping) {
+				current := item
+				endCol := item.Col + item.Width
+				merged := false
+				for nextIndex < len(layer.Items) {
+					next := layer.Items[nextIndex]
+					if !mergeCompatible(current, next, attrMask, clipping) || !mergeVisible(layer, next, clipping) || endCol != next.Col {
+						break
+					}
+					if !merged {
+						runBuf = append(runBuf[:0], command.Text[0])
+						merged = true
+					}
+					runBuf = append(runBuf, next.Text[0])
+					endCol += next.Width
+					current = next
+					nextIndex++
+				}
+				if merged {
+					command.W = float32(endCol-item.Col) * cell.Width
+					command.Text = string(runBuf)
+				}
+			}
+			commandClipValue := clip
+			if command.Op == "fill" {
+				commandClipValue = ui.Rect{}
+			}
 			frame.Commands = append(frame.Commands, command)
 			metas = append(metas, rowMeta{
-				grid:  layer.Grid,
-				attrs: joinAttrs(item.Attrs),
-				clip:  commandClip(layer.Clip, cell, clipping, command.Op != "fill"),
+				grid:      layer.Grid,
+				attrMask:  attrMask,
+				clip:      commandClipValue,
+				cellWidth: cell.Width,
 			})
+			itemIndex = nextIndex
 		}
 	}
 	storeMetadata(frame, metas)
 	return frame, nil
+}
+
+func mergeCandidate(item drawlist.Item, clipping bool) bool {
+	if item.Kind != "text" || item.Height != 1 || item.Width != 1 || !printableASCII(item.Text) {
+		return false
+	}
+	return true
+}
+
+func mergeVisible(layer drawlist.Layer, item drawlist.Item, clipping bool) bool {
+	if !clipping {
+		return true
+	}
+	screenCol := layer.ScreenCol + item.Col
+	return screenCol >= layer.Clip.X && screenCol+item.Width <= layer.Clip.X+layer.Clip.W &&
+		layer.ScreenRow+item.Row >= layer.Clip.Y && layer.ScreenRow+item.Row+item.Height <= layer.Clip.Y+layer.Clip.H
+}
+
+func mergeCompatible(first, next drawlist.Item, mask uint16, clipping bool) bool {
+	if !mergeCandidate(next, clipping) || next.Row != first.Row || next.FG != first.FG ||
+		next.BG != first.BG || next.SP != first.SP || attrsMask(next.Attrs) != mask {
+		return false
+	}
+	if mask&attrOther != 0 && !slices.Equal(first.Attrs, next.Attrs) {
+		return false
+	}
+	return true
+}
+
+func printableASCII(value string) bool {
+	if len(value) != 1 {
+		return false
+	}
+	return value[0] >= 0x21 && value[0] <= 0x7e
+}
+
+func (p *Planner) refreshCache() ([4]text.Font, text.Config) {
+	config := p.resolver.Config()
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if !p.ready || p.config != config {
+		for bold := 0; bold < 2; bold++ {
+			for italic := 0; italic < 2; italic++ {
+				p.fonts[bold*2+italic] = p.resolver.FontFor("A", bold == 1, italic == 1)
+			}
+		}
+		p.otherFonts = make(map[otherFontQuery]text.Font)
+		p.config = config
+		p.ready = true
+	}
+	return p.fonts, p.config
+}
+
+func (p *Planner) fontFor(item drawlist.Item, fonts [4]text.Font, config text.Config) text.Font {
+	bold := hasAttr(item.Attrs, "bold")
+	italic := hasAttr(item.Attrs, "italic")
+	if allASCIIBytes(item.Text) {
+		index := 0
+		if bold {
+			index += 2
+		}
+		if italic {
+			index++
+		}
+		return fonts[index]
+	}
+	key := otherFontQuery{text: item.Text, bold: bold, italic: italic}
+	p.mu.Lock()
+	font, ok := p.otherFonts[key]
+	if ok {
+		p.mu.Unlock()
+		return font
+	}
+	p.mu.Unlock()
+	font = p.resolver.FontFor(item.Text, bold, italic)
+	p.mu.Lock()
+	if p.ready && p.config == config {
+		if p.otherFonts == nil {
+			p.otherFonts = make(map[otherFontQuery]text.Font)
+		}
+		if len(p.otherFonts) >= otherFontCacheCapacity {
+			clear(p.otherFonts)
+		}
+		p.otherFonts[key] = font
+	}
+	p.mu.Unlock()
+	return font
+}
+
+func allASCIIBytes(value string) bool {
+	for index := 0; index < len(value); index++ {
+		if value[index] >= 0x80 {
+			return false
+		}
+	}
+	return true
 }
 
 func clipCommand(command renderlist.Command, clip drawlist.Rect, cell text.CellSize) (renderlist.Command, bool) {
@@ -121,7 +275,7 @@ func intersectCellRect(left, right drawlist.Rect) drawlist.Rect {
 	return drawlist.Rect{X: x0, Y: y0, W: x1 - x0, H: y1 - y0}
 }
 
-func (p *Planner) planItem(layer drawlist.Layer, item drawlist.Item, cell text.CellSize) (renderlist.Command, bool, error) {
+func (p *Planner) planItem(layer drawlist.Layer, item drawlist.Item, cell text.CellSize, fonts [4]text.Font, config text.Config) (renderlist.Command, bool, error) {
 	if item.Width < 0 || item.Height < 0 {
 		return renderlist.Command{}, false, fmt.Errorf("negative item size %dx%d", item.Width, item.Height)
 	}
@@ -142,7 +296,7 @@ func (p *Planner) planItem(layer drawlist.Layer, item drawlist.Item, cell text.C
 		command.Op = "cursor"
 		if item.Text != "" {
 			command.Text = item.Text
-			font := p.resolver.FontFor(item.Text, hasAttr(item.Attrs, "bold"), hasAttr(item.Attrs, "italic"))
+			font := p.fontFor(item, fonts, config)
 			command.Family = font.Family
 			command.Size = font.Size
 			command.Weight = font.Weight
@@ -160,7 +314,7 @@ func (p *Planner) planItem(layer drawlist.Layer, item drawlist.Item, cell text.C
 		}
 		command.Op = "glyphs"
 		command.Text = item.Text
-		font := p.resolver.FontFor(item.Text, hasAttr(item.Attrs, "bold"), hasAttr(item.Attrs, "italic"))
+		font := p.fontFor(item, fonts, config)
 		command.Family = font.Family
 		command.Size = font.Size
 		command.Weight = font.Weight
@@ -173,9 +327,10 @@ func (p *Planner) planItem(layer drawlist.Layer, item drawlist.Item, cell text.C
 }
 
 type rowMeta struct {
-	grid  int
-	attrs string
-	clip  ui.Rect
+	grid      int
+	attrMask  uint16
+	clip      ui.Rect
+	cellWidth float32
 }
 
 type metadataEntry struct {
@@ -319,15 +474,56 @@ func writeCommand(hash *maphash.Hash, command renderlist.Command, scratch *[8]by
 	writeText(hash, command.Rune, scratch)
 }
 
-func joinAttrs(attrs []string) string {
-	return strings.Join(attrs, "\x00")
+const (
+	attrBold uint16 = 1 << iota
+	attrItalic
+	attrUnderline
+	attrUndercurl
+	attrUnderdouble
+	attrUnderdotted
+	attrUnderdashed
+	attrStrikethrough
+	attrOverline
+	attrCursorBeam
+	attrCursorUnderline
+	attrOther
+)
+
+func attrsMask(attrs []string) uint16 {
+	var mask uint16
+	for _, attr := range attrs {
+		switch attr {
+		case "bold":
+			mask |= attrBold
+		case "italic":
+			mask |= attrItalic
+		case "underline":
+			mask |= attrUnderline
+		case "undercurl":
+			mask |= attrUndercurl
+		case "underdouble":
+			mask |= attrUnderdouble
+		case "underdotted":
+			mask |= attrUnderdotted
+		case "underdashed":
+			mask |= attrUnderdashed
+		case "strikethrough":
+			mask |= attrStrikethrough
+		case "overline":
+			mask |= attrOverline
+		case "cursor_beam":
+			mask |= attrCursorBeam
+		case "cursor_underline":
+			mask |= attrCursorUnderline
+		default:
+			mask |= attrOther
+		}
+	}
+	return mask
 }
 
-func splitAttrs(value string) []string {
-	if value == "" {
-		return nil
-	}
-	return strings.Split(value, "\x00")
+func attrSet(mask uint16, wanted uint16) bool {
+	return mask&wanted != 0
 }
 
 type viewImpl struct {
@@ -379,7 +575,7 @@ type rowKey struct {
 	grid     int
 	row      int
 	text     string
-	attrs    string
+	attrMask uint16
 	fg       uint32
 	bg       uint32
 	family   string
@@ -390,10 +586,12 @@ type rowKey struct {
 }
 
 const rowCacheCapacity = 4096
+const ascentCacheCapacity = 256
 
 type rowCacheEntry struct {
 	key    rowKey
 	glyphs []ui.Glyph
+	ascent float32
 }
 
 type rowCache struct {
@@ -413,27 +611,26 @@ func newRowCache() *rowCache {
 }
 
 func (cache *rowCache) glyphs(command renderlist.Command, meta rowMeta) []ui.Glyph {
-	key := rowKey{
-		grid:     meta.grid,
-		row:      int(math.Round(float64(command.Y / positiveHeight(command.H)))),
-		text:     command.Text,
-		attrs:    meta.attrs,
-		fg:       command.FG,
-		bg:       command.BG,
-		family:   command.Family,
-		size:     command.Size,
-		weight:   command.Weight,
-		italic:   command.Italic,
-		features: command.Features,
-	}
+	glyphs, _ := cache.glyphRun(command, meta)
+	return glyphs
+}
+
+func (cache *rowCache) glyphRun(command renderlist.Command, meta rowMeta) ([]ui.Glyph, float32) {
+	key := rowCacheKey(command, meta)
 	cache.mu.Lock()
 	defer cache.mu.Unlock()
 	if element, ok := cache.rows[key]; ok {
 		cache.order.MoveToFront(element)
-		return append([]ui.Glyph(nil), element.Value.(*rowCacheEntry).glyphs...)
+		entry := element.Value.(*rowCacheEntry)
+		return entry.glyphs, entry.ascent
 	}
-	glyphs := shapeGlyphs(command)
-	element := cache.order.PushFront(&rowCacheEntry{key: key, glyphs: glyphs})
+	entry := &rowCacheEntry{
+		key: key,
+	}
+	font := commandFont(command)
+	entry.glyphs = ui.Shape(command.Text, font)
+	entry.ascent = cachedAscent(font)
+	element := cache.order.PushFront(entry)
 	cache.rows[key] = element
 	cache.shaped++
 	for len(cache.rows) > cache.capacity {
@@ -444,7 +641,23 @@ func (cache *rowCache) glyphs(command renderlist.Command, meta rowMeta) []ui.Gly
 		cache.order.Remove(oldest)
 		delete(cache.rows, oldest.Value.(*rowCacheEntry).key)
 	}
-	return append([]ui.Glyph(nil), glyphs...)
+	return entry.glyphs, entry.ascent
+}
+
+func rowCacheKey(command renderlist.Command, meta rowMeta) rowKey {
+	return rowKey{
+		grid:     meta.grid,
+		row:      int(math.Round(float64(command.Y / positiveHeight(command.H)))),
+		text:     command.Text,
+		attrMask: meta.attrMask,
+		fg:       command.FG,
+		bg:       command.BG,
+		family:   command.Family,
+		size:     command.Size,
+		weight:   command.Weight,
+		italic:   command.Italic,
+		features: command.Features,
+	}
 }
 
 func (cache *rowCache) shapedRows() int {
@@ -484,9 +697,9 @@ func viewDraw(view *View, c *ui.Context) ui.Element {
 	}
 	view.impl.mu.Lock()
 	snapshot := viewSnapshot{
-		frame: cloneFrame(view.impl.frame),
+		frame: view.impl.frame,
 		caret: view.impl.caret,
-		metas: append([]rowMeta(nil), view.impl.metas...),
+		metas: view.impl.metas,
 		cache: view.impl.cache,
 	}
 	view.impl.mu.Unlock()
@@ -587,28 +800,44 @@ func drawFrame(p *ui.Painter, frame renderlist.Frame, cache *rowCache, metas []r
 	if cache == nil {
 		cache = globalCache
 	}
-	for index, command := range frame.Commands {
+	for index := 0; index < len(frame.Commands); {
 		meta := rowMeta{}
 		if index < len(metas) {
 			meta = metas[index]
 		}
-		paint := func() {
-			switch command.Op {
-			case "fill":
-				p.Fill(commandRect(command), color(command.BG), 0)
-				drawDecorations(p, command, meta)
-			case "glyphs":
-				drawGlyphs(p, command, cache, meta)
-			case "box":
-				drawBoxRune(p, command, color(command.FG))
-			case "cursor":
-				drawCursor(p, command, cache, meta)
+		end := index + 1
+		if meta.clip.W > 0 && meta.clip.H > 0 && frame.Commands[index].Op != "fill" {
+			for end < len(frame.Commands) && end < len(metas) && frame.Commands[end].Op != "fill" &&
+				metas[end].clip == meta.clip && metas[end].grid == meta.grid {
+				end++
 			}
 		}
 		if meta.clip.W > 0 && meta.clip.H > 0 {
-			p.Clip(meta.clip, 0, paint)
+			p.Clip(meta.clip, 0, func() { drawCommandRange(p, frame, cache, metas, index, end) })
 		} else {
-			paint()
+			drawCommandRange(p, frame, cache, metas, index, end)
+		}
+		index = end
+	}
+}
+
+func drawCommandRange(p *ui.Painter, frame renderlist.Frame, cache *rowCache, metas []rowMeta, start, end int) {
+	for index := start; index < end; index++ {
+		meta := rowMeta{}
+		if index < len(metas) {
+			meta = metas[index]
+		}
+		command := frame.Commands[index]
+		switch command.Op {
+		case "fill":
+			p.Fill(commandRect(command), color(command.BG), 0)
+			drawDecorations(p, command, meta, meta.cellWidth)
+		case "glyphs":
+			drawGlyphs(p, command, cache, meta, meta.cellWidth)
+		case "box":
+			drawBoxRune(p, command, color(command.FG))
+		case "cursor":
+			drawCursor(p, command, cache, meta)
 		}
 	}
 }
@@ -617,16 +846,34 @@ func commandRect(command renderlist.Command) ui.Rect {
 	return ui.Rect{X: command.X, Y: command.Y, W: command.W, H: command.H}
 }
 
-func drawGlyphs(p *ui.Painter, command renderlist.Command, cache *rowCache, meta rowMeta) {
+func drawGlyphs(p *ui.Painter, command renderlist.Command, cache *rowCache, meta rowMeta, cellWidth float32) {
 	if command.Text == "" || command.W <= 0 || command.H <= 0 {
 		return
 	}
-	glyphs := cache.glyphs(command, meta)
-	font := commandFont(command)
-	baseline := command.Y + font.Metrics().Ascent
+	glyphs, ascent := cache.glyphRun(command, meta)
+	baseline := command.Y + ascent
 	offsetX := glyphCenterOffset(glyphs, command.W)
 	p.Glyphs(glyphs, command.X+offsetX, baseline, color(command.FG))
-	drawDecorations(p, command, meta)
+	drawDecorations(p, command, meta, cellWidth)
+}
+
+var (
+	ascentCacheMu sync.Mutex
+	ascentCache   = make(map[ui.Font]float32)
+)
+
+func cachedAscent(font ui.Font) float32 {
+	ascentCacheMu.Lock()
+	defer ascentCacheMu.Unlock()
+	if ascent, ok := ascentCache[font]; ok {
+		return ascent
+	}
+	ascent := font.Metrics().Ascent
+	if len(ascentCache) >= ascentCacheCapacity {
+		clear(ascentCache)
+	}
+	ascentCache[font] = ascent
+	return ascent
 }
 
 func glyphCenterOffset(glyphs []ui.Glyph, room float32) float32 {
@@ -653,10 +900,6 @@ func glyphCenterOffset(glyphs []ui.Glyph, room float32) float32 {
 	return offset
 }
 
-func shapeGlyphs(command renderlist.Command) []ui.Glyph {
-	return ui.Shape(command.Text, commandFont(command))
-}
-
 func commandFont(command renderlist.Command) ui.Font {
 	return text.Font{
 		Family:   command.Family,
@@ -667,9 +910,8 @@ func commandFont(command renderlist.Command) ui.Font {
 	}.MyGo()
 }
 
-func drawDecorations(p *ui.Painter, command renderlist.Command, meta rowMeta) {
-	attrs := splitAttrs(meta.attrs)
-	if len(attrs) == 0 || command.W <= 0 || command.H <= 0 {
+func drawDecorations(p *ui.Painter, command renderlist.Command, meta rowMeta, cellWidth float32) {
+	if meta.attrMask == 0 || command.W <= 0 || command.H <= 0 {
 		return
 	}
 	decorationColor := color(command.FG)
@@ -678,29 +920,37 @@ func drawDecorations(p *ui.Painter, command renderlist.Command, meta rowMeta) {
 	}
 	thick := max(1, command.Size/10)
 	underlineY := command.Y + command.H - max(1, command.Size/10)
-	for _, attr := range attrs {
-		switch attr {
-		case "underline":
-			p.Fill(ui.Rect{X: command.X, Y: underlineY, W: command.W, H: thick}, decorationColor, 0)
-		case "underdouble":
-			p.Fill(ui.Rect{X: command.X, Y: underlineY - 2*thick, W: command.W, H: thick}, decorationColor, 0)
-			p.Fill(ui.Rect{X: command.X, Y: underlineY + thick, W: command.W, H: thick}, decorationColor, 0)
-		case "undercurl":
-			drawWave(p, command.X, underlineY, command.W, thick, decorationColor)
-		case "underdotted", "underdashed":
-			step, dash := 2*thick, thick
-			if attr == "underdashed" {
-				step = max(command.W/2, 2*thick)
-				dash = max(command.W/4, thick)
-			}
-			for x := command.X; x < command.X+command.W; x += step {
-				p.Fill(ui.Rect{X: x, Y: underlineY, W: min(dash, command.X+command.W-x), H: thick}, decorationColor, 0)
-			}
-		case "strikethrough":
-			p.Fill(ui.Rect{X: command.X, Y: command.Y + command.H/2 - thick/2, W: command.W, H: thick}, decorationColor, 0)
-		case "overline":
-			p.Fill(ui.Rect{X: command.X, Y: command.Y, W: command.W, H: thick}, decorationColor, 0)
+	if attrSet(meta.attrMask, attrUnderline) {
+		p.Fill(ui.Rect{X: command.X, Y: underlineY, W: command.W, H: thick}, decorationColor, 0)
+	}
+	if attrSet(meta.attrMask, attrUnderdouble) {
+		p.Fill(ui.Rect{X: command.X, Y: underlineY - 2*thick, W: command.W, H: thick}, decorationColor, 0)
+		p.Fill(ui.Rect{X: command.X, Y: underlineY + thick, W: command.W, H: thick}, decorationColor, 0)
+	}
+	if attrSet(meta.attrMask, attrUndercurl) {
+		drawWave(p, command.X, underlineY, command.W, thick, decorationColor)
+	}
+	if attrSet(meta.attrMask, attrUnderdotted) {
+		drawDashes(p, command.X, underlineY, command.W, thick, 2*thick, thick, decorationColor)
+	}
+	if attrSet(meta.attrMask, attrUnderdashed) {
+		step := max(4*thick, command.H/4)
+		if cellWidth > 0 {
+			step = cellWidth
 		}
+		drawDashes(p, command.X, underlineY, command.W, thick, step, step/2, decorationColor)
+	}
+	if attrSet(meta.attrMask, attrStrikethrough) {
+		p.Fill(ui.Rect{X: command.X, Y: command.Y + command.H/2 - thick/2, W: command.W, H: thick}, decorationColor, 0)
+	}
+	if attrSet(meta.attrMask, attrOverline) {
+		p.Fill(ui.Rect{X: command.X, Y: command.Y, W: command.W, H: thick}, decorationColor, 0)
+	}
+}
+
+func drawDashes(p *ui.Painter, x, y, width, thick, step, dash float32, paintColor ui.Color) {
+	for position := x; position < x+width; position += step {
+		p.Fill(ui.Rect{X: position, Y: y, W: min(dash, x+width-position), H: thick}, paintColor, 0)
 	}
 }
 
@@ -726,20 +976,19 @@ func drawCursor(p *ui.Painter, command renderlist.Command, cache *rowCache, meta
 	if command.FG == 0 && command.BG == 0 {
 		fillColor = ui.Color{R: 128, G: 128, B: 128, A: 200}
 	}
-	attrs := splitAttrs(meta.attrs)
 	switch {
-	case hasAttr(attrs, "cursor_beam"):
+	case attrSet(meta.attrMask, attrCursorBeam):
 		beamWidth := min(rect.W, float32(1.5))
 		p.Fill(ui.Rect{X: rect.X, Y: rect.Y, W: beamWidth, H: rect.H}, fillColor, 0)
 		return
-	case hasAttr(attrs, "cursor_underline"):
+	case attrSet(meta.attrMask, attrCursorUnderline):
 		barHeight := min(rect.H, float32(1.5))
 		p.Fill(ui.Rect{X: rect.X, Y: rect.Y + rect.H - barHeight, W: rect.W, H: barHeight}, fillColor, 0)
 		return
 	}
 	p.Fill(rect, fillColor, 0)
 	if command.Text != "" && command.Family != "" && command.Size > 0 {
-		drawGlyphs(p, command, cache, meta)
+		drawGlyphs(p, command, cache, meta, meta.cellWidth)
 	} else if command.Rune != "" {
 		drawBoxRune(p, command, color(command.FG))
 	}
