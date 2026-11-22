@@ -243,7 +243,7 @@ func TestM4Scroll_FloatMarginsBorderStableAndInnerClip(t *testing.T) {
 			putRunes(flt.Cells[r], 0, "│", 2)
 			putRunes(flt.Cells[r], 23, "│", 2)
 			// Inner content: HL 3 (vivid green 0x00ff00).
-			putRunes(flt.Cells[r], 2, fmt.Sprintf("%s_row_%02d_text", innerPrefix, r), 3)
+			putRunes(flt.Cells[r], 1, fmt.Sprintf("%s_row_%02d_text", innerPrefix, r), 3)
 		}
 		putRunes(flt.Cells[7], 0, "└──────────────────────┘", 2)
 		putRunes(flt.Cells[7], 2, "FOOT", 2)
@@ -314,6 +314,7 @@ func TestM4Scroll_FloatMarginsBorderStableAndInnerClip(t *testing.T) {
 	tester := ui.NewTester(func(c *ui.Context) { view.Draw(c) }, imgW, imgH)
 
 	sawInnerShift := false
+	converged := false
 	for step := 0; step < 120; step++ {
 		clock.Advance(16 * time.Millisecond)
 		frame, still, err := anim.Step()
@@ -394,8 +395,15 @@ func TestM4Scroll_FloatMarginsBorderStableAndInnerClip(t *testing.T) {
 			}
 		}
 		if !still {
+			if !reflect.DeepEqual(frame, staticFrame) {
+				t.Fatalf("step %d: settled float scroll frame differs from disabled-animation frame", step)
+			}
+			converged = true
 			break
 		}
+	}
+	if !converged {
+		t.Fatal("float scroll animation did not converge within 120 steps")
 	}
 	if !sawInnerShift {
 		t.Fatal("inner float text never shifted during smooth scroll animation")
