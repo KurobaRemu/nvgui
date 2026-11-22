@@ -327,10 +327,12 @@ func (p *Planner) planItem(layer drawlist.Layer, item drawlist.Item, cell text.C
 }
 
 type rowMeta struct {
-	grid      int
-	attrMask  uint16
-	clip      ui.Rect
-	cellWidth float32
+	grid          int
+	attrMask      uint16
+	clip          ui.Rect
+	cellWidth     float32
+	hasCursorQuad bool
+	cursorQuad    [4]ui.Point
 }
 
 type metadataEntry struct {
@@ -975,6 +977,17 @@ func drawCursor(p *ui.Painter, command renderlist.Command, cache *rowCache, meta
 	fillColor := color(command.BG)
 	if command.FG == 0 && command.BG == 0 {
 		fillColor = ui.Color{R: 128, G: 128, B: 128, A: 200}
+	}
+	if meta.hasCursorQuad {
+		quad := meta.cursorQuad
+		var path ui.Path
+		path.MoveTo(quad[0].X, quad[0].Y).
+			LineTo(quad[1].X, quad[1].Y).
+			LineTo(quad[2].X, quad[2].Y).
+			LineTo(quad[3].X, quad[3].Y).
+			Close()
+		p.FillPath(&path, fillColor)
+		return
 	}
 	switch {
 	case attrSet(meta.attrMask, attrCursorBeam):

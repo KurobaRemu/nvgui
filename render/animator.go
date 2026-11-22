@@ -24,9 +24,12 @@ type animatorImpl struct {
 	active       bool
 	cursorSpring Spring
 	scrollSpring Spring
+	cursor       *cursorAnimation
 	settledFrame renderlist.Frame
 	settledMetas []rowMeta
 	initialized  bool
+	latestFrame  renderlist.Frame
+	latestMetas  []rowMeta
 }
 
 func newAnimator(planner *Planner, cfg AnimationConfig, clock Clock) *Animator {
@@ -40,6 +43,7 @@ func newAnimator(planner *Planner, cfg AnimationConfig, clock Clock) *Animator {
 		planner:  planner,
 		cfg:      cfg,
 		clock:    clock,
+		cursor:   newCursorAnimation(),
 		lastTime: clock.Now(),
 	}}
 }
@@ -60,13 +64,20 @@ func animatorSetConfig(a *Animator, cfg AnimationConfig) {
 	if impl.planner != nil {
 		impl.planner.SetLigaturesEnabled(cfg.LigaturesEnabled)
 	}
-	if !cfg.CursorEnabled {
+	cursorDisabled := !cfg.CursorEnabled || cfg.CursorAnimationLength <= 0
+	if cursorDisabled {
 		impl.cursorSpring.Reset()
+		if impl.cursor != nil {
+			if impl.cursor.hasTarget && !impl.cursor.suppressed {
+				impl.cursor.snap()
+			}
+			impl.cursor.active = false
+		}
 	}
 	if !cfg.ScrollEnabled {
 		impl.scrollSpring.Reset()
 	}
-	if !cfg.CursorEnabled && !cfg.ScrollEnabled {
+	if !impl.scrollSpring.Active() && (cursorDisabled || impl.cursor == nil || !impl.cursor.active) {
 		impl.active = false
 	}
 	if impl.initialized && impl.planner != nil && impl.lastList != nil {
@@ -75,6 +86,10 @@ func animatorSetConfig(a *Animator, cfg AnimationConfig) {
 			impl.settledFrame = cloneFrame(settledFrame)
 			impl.settledMetas = metadataFor(impl.settledFrame)
 			storeMetadata(impl.settledFrame, impl.settledMetas)
+			frame, frameMetas := cursorAnimationFrame(impl.cursor, impl.settledFrame, impl.settledMetas)
+			storeMetadata(frame, frameMetas)
+			impl.latestFrame = cloneFrame(frame)
+			impl.latestMetas = append([]rowMeta(nil), frameMetas...)
 		}
 	}
 	impl.lastTime = impl.clock.Now()
@@ -102,8 +117,6 @@ func cloneDrawList(source *drawlist.List) *drawlist.List {
 }
 
 func animatorSubmit(a *Animator, state *screen.State, meta *screen.FrameMeta, list *drawlist.List) (renderlist.Frame, bool, error) {
-	_ = state
-	_ = meta
 	if a == nil || a.impl == nil || a.impl.planner == nil {
 		return renderlist.Frame{}, false, fmt.Errorf("render: nil Animator or Planner")
 	}
@@ -124,14 +137,48 @@ func animatorSubmit(a *Animator, state *screen.State, meta *screen.FrameMeta, li
 	if !impl.active {
 		impl.lastTime = now
 	}
-	if !impl.cfg.CursorEnabled && !impl.cfg.ScrollEnabled {
+	cell := impl.planner.resolver.Cell()
+	input := cursorInput{state: state, meta: meta, list: cachedList, frame: impl.settledFrame, metas: impl.settledMetas, cfg: impl.cfg, cell: cell}
+	busy := meta != nil && meta.Busy
+	index := cursorCommandIndex(impl.settledFrame)
+	if busy || index < 0 {
+		impl.cursor.active = false
+		impl.cursor.suppressed = true
+		impl.cursor.visible = false
 		impl.active = false
-		storeMetadata(impl.settledFrame, impl.settledMetas)
-		return cloneFrame(impl.settledFrame), false, nil
+		if busy {
+			impl.cursor.prevBusy = true
+			impl.cursor.hasPrev = true
+		}
+	} else {
+		previousTarget := impl.cursor.targetState()
+		wasSuppressed := impl.cursor.suppressed || !impl.cursor.visible
+		impl.cursor.suppressed = false
+		impl.cursor.setShapeFromInput(input, index)
+		if !impl.cursor.setTarget(impl.settledFrame, index) {
+			impl.cursor.active = false
+			impl.cursor.suppressed = true
+			impl.cursor.visible = false
+			impl.active = false
+		} else {
+			immediate := impl.cursor.immediate(input, index, wasSuppressed)
+			jumped := impl.cursor.targetChanged(previousTarget)
+			switch {
+			case immediate:
+				impl.cursor.snap()
+			case jumped:
+				impl.cursor.jump(impl.cfg)
+				impl.cursor.active = true
+			}
+			impl.cursor.remember(input, index, false)
+			impl.active = impl.cursor.active
+		}
 	}
-	impl.active = false
-	storeMetadata(impl.settledFrame, impl.settledMetas)
-	return cloneFrame(impl.settledFrame), false, nil
+	frame, frameMetas := cursorAnimationFrame(impl.cursor, impl.settledFrame, impl.settledMetas)
+	storeMetadata(frame, frameMetas)
+	impl.latestFrame = cloneFrame(frame)
+	impl.latestMetas = append([]rowMeta(nil), frameMetas...)
+	return cloneFrame(frame), impl.active, nil
 }
 
 func animatorStep(a *Animator) (renderlist.Frame, bool, error) {
@@ -144,21 +191,32 @@ func animatorStep(a *Animator) (renderlist.Frame, bool, error) {
 	if !impl.initialized {
 		return renderlist.Frame{}, false, nil
 	}
-	if !impl.active {
+	if !impl.active && !impl.cursor.active {
 		impl.lastTime = now
-		storeMetadata(impl.settledFrame, impl.settledMetas)
-		return cloneFrame(impl.settledFrame), false, nil
+		frame, frameMetas := cursorAnimationFrame(impl.cursor, impl.settledFrame, impl.settledMetas)
+		storeMetadata(frame, frameMetas)
+		impl.latestFrame = cloneFrame(frame)
+		impl.latestMetas = append([]rowMeta(nil), frameMetas...)
+		impl.active = false
+		return cloneFrame(frame), false, nil
 	}
 	if dt <= 0 {
-		storeMetadata(impl.settledFrame, impl.settledMetas)
-		return cloneFrame(impl.settledFrame), true, nil
+		frame := impl.latestFrame
+		frameMetas := impl.latestMetas
+		if len(frame.Commands) == 0 {
+			frame, frameMetas = cursorAnimationFrame(impl.cursor, impl.settledFrame, impl.settledMetas)
+		}
+		storeMetadata(frame, frameMetas)
+		return cloneFrame(frame), true, nil
 	}
 	impl.lastTime = now
-	impl.cursorSpring.Reset()
-	impl.scrollSpring.Reset()
-	impl.active = false
-	storeMetadata(impl.settledFrame, impl.settledMetas)
-	return cloneFrame(impl.settledFrame), false, nil
+	impl.cursor.update(float32(dt.Seconds()))
+	impl.active = impl.cursor.active
+	frame, frameMetas := cursorAnimationFrame(impl.cursor, impl.settledFrame, impl.settledMetas)
+	storeMetadata(frame, frameMetas)
+	impl.latestFrame = cloneFrame(frame)
+	impl.latestMetas = append([]rowMeta(nil), frameMetas...)
+	return cloneFrame(frame), impl.active, nil
 }
 
 func animatorActive(a *Animator) bool {
@@ -166,6 +224,9 @@ func animatorActive(a *Animator) bool {
 }
 
 func animatorCursorQuad(a *Animator) ([4]ui.Point, bool) {
+	if a != nil && a.impl != nil && a.impl.cursor != nil {
+		return a.impl.cursor.quad()
+	}
 	return [4]ui.Point{}, false
 }
 
