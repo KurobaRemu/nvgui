@@ -129,7 +129,7 @@ func TestLayerClipPlanning(t *testing.T) {
 	if fill.Op != "fill" || fill.X != cell.Width || fill.W != 2*cell.Width || fill.H != 2*cell.Height {
 		t.Errorf("clipped fill = %+v, want intersection x=1*cell w=2*cell h=2*cell", fill)
 	}
-	metas := metadataFor(partial)
+	metas := metadataFor(partial).rows
 	if len(metas) != len(partial.Commands) {
 		t.Fatalf("metadata entries = %d, want %d", len(metas), len(partial.Commands))
 	}
@@ -185,10 +185,10 @@ func TestClipRenderingUsesDIPs(t *testing.T) {
 	frame.Commands = append(frame.Commands, renderlist.Command{
 		Op: "fill", X: cell.Width, Y: 0, W: cell.Width, H: cell.Height, BG: 0x00ff00,
 	})
-	metas := append(metadataFor(frame), rowMeta{})
+	metas := append(metadataFor(frame).rows, rowMeta{})
 	view := NewView()
 	view.SetFrame(frame)
-	view.impl.metas = metas
+	view.impl.meta = frameMetadata{rows: metas}
 	tester := ui.NewTester(func(c *ui.Context) { view.Draw(c) }, int(2*cell.Width), int(cell.Height))
 	image := tester.Image()
 	if pixelAt(image, int(cell.Width/2), int(cell.Height/2)) == (imagecolor.RGBA{}) {
@@ -203,17 +203,17 @@ func TestMetadataHashRejectsFalseMatches(t *testing.T) {
 	}
 	firstSeq := uint64(9)
 	otherSeq := uint64(10)
-	storeMetadata(renderlist.Frame{Seq: firstSeq, Commands: commands}, []rowMeta{{grid: 1}, {attrMask: attrUnderline}})
-	storeMetadata(renderlist.Frame{Seq: otherSeq, Commands: commands}, []rowMeta{{grid: 2}, {attrMask: attrBold}})
-	if got := metadataFor(renderlist.Frame{Seq: firstSeq, Commands: commands}); got[0].grid != 1 || got[1].attrMask != attrUnderline {
+	storeMetadata(renderlist.Frame{Seq: firstSeq, Commands: commands}, frameMetadata{rows: []rowMeta{{grid: 1}, {attrMask: attrUnderline}}})
+	storeMetadata(renderlist.Frame{Seq: otherSeq, Commands: commands}, frameMetadata{rows: []rowMeta{{grid: 2}, {attrMask: attrBold}}})
+	if got := metadataFor(renderlist.Frame{Seq: firstSeq, Commands: commands}).rows; got[0].grid != 1 || got[1].attrMask != attrUnderline {
 		t.Fatalf("metadata for seq %d = %+v, want first frame metadata", firstSeq, got)
 	}
-	if got := metadataFor(renderlist.Frame{Seq: otherSeq, Commands: commands}); got[0].grid != 2 || got[1].attrMask != attrBold {
+	if got := metadataFor(renderlist.Frame{Seq: otherSeq, Commands: commands}).rows; got[0].grid != 2 || got[1].attrMask != attrBold {
 		t.Fatalf("metadata for seq %d = %+v, want second frame metadata", otherSeq, got)
 	}
 	changed := append([]renderlist.Command(nil), commands...)
 	changed[1].BG = 99
-	if got := metadataFor(renderlist.Frame{Seq: firstSeq, Commands: changed}); got != nil {
+	if got := metadataFor(renderlist.Frame{Seq: firstSeq, Commands: changed}); !reflect.DeepEqual(got, frameMetadata{}) {
 		t.Fatalf("metadataFor accepted changed commands: %+v", got)
 	}
 }
@@ -375,7 +375,7 @@ func TestDecorationsRender(t *testing.T) {
 			}}
 			view := NewView()
 			view.SetFrame(frame)
-			view.impl.metas = []rowMeta{{attrMask: attrsMask([]string{attr})}, {attrMask: attrsMask([]string{attr})}}
+			view.impl.meta = frameMetadata{rows: []rowMeta{{attrMask: attrsMask([]string{attr})}, {attrMask: attrsMask([]string{attr})}}}
 			image := renderView(view, 120, 30)
 			if !hasColorNear(image, imagecolor.RGBA{R: 255, A: 255}) {
 				t.Errorf("%s did not paint its SP color", attr)
@@ -484,7 +484,7 @@ func TestDecorationColorFallsBackWhenSPZero(t *testing.T) {
 	}}
 	view := NewView()
 	view.SetFrame(frame)
-	view.impl.metas = []rowMeta{{attrMask: attrUnderline}, {attrMask: attrUnderline}}
+	view.impl.meta = frameMetadata{rows: []rowMeta{{attrMask: attrUnderline}, {attrMask: attrUnderline}}}
 	if image := renderView(view, 120, 30); !hasGreenForeground(image) {
 		t.Error("decoration did not use FG when SP was zero")
 	}
@@ -952,7 +952,7 @@ func TestPlannerMergesOnlyVisibleColumnsInsideClip(t *testing.T) {
 	if got.Text != text[3:9] || got.X != 3*cell.Width || got.W != 6*cell.Width {
 		t.Fatalf("visible run = %+v, want Text=%q X=%v W=%v", got, text[3:9], 3*cell.Width, 6*cell.Width)
 	}
-	metas := metadataFor(frame)
+	metas := metadataFor(frame).rows
 	if len(metas) != 1 || metas[0].clip != (ui.Rect{X: 3 * cell.Width, W: 6 * cell.Width, H: 3 * cell.Height}) {
 		t.Fatalf("run metadata = %+v, want layer clip", metas)
 	}
@@ -982,7 +982,7 @@ func TestLongMergedUnderdashedRunUsesCellSizedDashes(t *testing.T) {
 	command.SP = 0xff0000
 	view := NewView()
 	view.SetFrame(renderlist.Frame{Version: 1, Seq: 304, Commands: []renderlist.Command{command}})
-	view.impl.metas = []rowMeta{{attrMask: attrUnderdashed}}
+	view.impl.meta = frameMetadata{rows: []rowMeta{{attrMask: attrUnderdashed}}}
 	image := renderView(view, int(24*cell.Width), int(cell.Height))
 	segments := 0
 	inSegment := false
@@ -1039,7 +1039,7 @@ func TestDrawFrameGroupsClipAndKeepsAcrossLayerOrder(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Plan: %v", err)
 	}
-	metas := metadataFor(frame)
+	metas := metadataFor(frame).rows
 	if len(metas) != len(frame.Commands) {
 		t.Fatalf("metadata entries = %d, commands = %d", len(metas), len(frame.Commands))
 	}
@@ -1054,7 +1054,7 @@ func TestDrawFrameGroupsClipAndKeepsAcrossLayerOrder(t *testing.T) {
 		if metas[index].clip == clipRect {
 			grouped++
 			clipOps++
-			clipGrids[metas[index].grid] = true
+			clipGrids[int(metas[index].grid)] = true
 		}
 	}
 	if grouped < 3 {
@@ -1135,7 +1135,7 @@ func TestUnknownAttrsPreventMergingAcrossDifferentValues(t *testing.T) {
 			t.Errorf("command %d = %+v, want single %q cell", index, got, want)
 		}
 	}
-	metas := metadataFor(frame)
+	metas := metadataFor(frame).rows
 	for index, meta := range metas {
 		if meta.attrMask&attrOther == 0 {
 			t.Errorf("metadata %d lost unknown attr marker: %+v", index, meta)

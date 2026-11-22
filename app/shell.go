@@ -43,30 +43,33 @@ type shellImpl struct {
 	view      *render.View
 	window    *mygo.Window
 
-	mu                sync.Mutex
-	inputSyncMu       sync.Mutex
-	services          ui.Services
-	resizeCh          chan struct{}
-	closed            bool
-	closeErr          error
-	lastSeq           uint64
-	lastColumns       int
-	lastRows          int
-	pendingColumns    int
-	pendingRows       int
-	resizePending     bool
-	inFlightColumns   int
-	inFlightRows      int
-	resizeInFlight    bool
-	forwardedInputSeq uint64
-	lastGUIFont       string
-	failedGUIFont     string
-	lastAnimNow       time.Time
-	explicitConfig    bool
-	configDirty       bool
-	configGeneration  uint64
-	envConfigKeys     map[string]bool
-	explicitKeys      map[string]bool
+	mu                    sync.Mutex
+	inputSyncMu           sync.Mutex
+	services              ui.Services
+	resizeCh              chan struct{}
+	closed                bool
+	closeErr              error
+	lastSeq               uint64
+	lastColumns           int
+	lastRows              int
+	pendingColumns        int
+	pendingRows           int
+	resizePending         bool
+	inFlightColumns       int
+	inFlightRows          int
+	resizeInFlight        bool
+	forwardedInputSeq     uint64
+	lastGUIFont           string
+	failedGUIFont         string
+	envGUIFontOverride    bool
+	sawInitialNvimGUIFont bool
+	initialNvimGUIFont    string
+	lastAnimNow           time.Time
+	explicitConfig        bool
+	configDirty           bool
+	configGeneration      uint64
+	envConfigKeys         map[string]bool
+	explicitKeys          map[string]bool
 
 	closeOnce sync.Once
 	quitOnce  sync.Once
@@ -356,6 +359,7 @@ func Start(ctx context.Context, req LaunchRequest, clock diag.Clock, clipboard C
 	impl.planner = render.NewPlanner(resolver)
 	impl.animator = render.NewAnimator(impl.planner, cfg, impl.animClock)
 	impl.lastGUIFont = guiFont
+	impl.envGUIFontOverride = guiFont != ""
 	impl.view = render.NewView()
 	impl.recorder = input.NewTraceRecorder()
 	impl.queue = input.NewQueue(sess.Nvim(), impl.recorder)
@@ -661,27 +665,33 @@ func (impl *shellImpl) refreshFrameWithContext(c *ui.Context, now time.Time, ins
 
 	impl.mu.Lock()
 	snapshot := struct {
-		newSeq        bool
-		configDirty   bool
-		generation    uint64
-		lastAnimNow   time.Time
-		active        bool
-		lastGUIFont   string
-		failedGUIFont string
-		services      ui.Services
-		window        *mygo.Window
-		closed        bool
+		newSeq                bool
+		configDirty           bool
+		generation            uint64
+		lastAnimNow           time.Time
+		active                bool
+		lastGUIFont           string
+		failedGUIFont         string
+		envGUIFontOverride    bool
+		sawInitialNvimGUIFont bool
+		initialNvimGUIFont    string
+		services              ui.Services
+		window                *mygo.Window
+		closed                bool
 	}{
-		newSeq:        state.Seq != impl.lastSeq,
-		configDirty:   impl.configDirty,
-		generation:    impl.configGeneration,
-		lastAnimNow:   impl.lastAnimNow,
-		active:        impl.animator.Active(),
-		lastGUIFont:   impl.lastGUIFont,
-		failedGUIFont: impl.failedGUIFont,
-		services:      impl.services,
-		window:        impl.window,
-		closed:        impl.closed,
+		newSeq:                state.Seq != impl.lastSeq,
+		configDirty:           impl.configDirty,
+		generation:            impl.configGeneration,
+		lastAnimNow:           impl.lastAnimNow,
+		active:                impl.animator.Active(),
+		lastGUIFont:           impl.lastGUIFont,
+		failedGUIFont:         impl.failedGUIFont,
+		envGUIFontOverride:    impl.envGUIFontOverride,
+		sawInitialNvimGUIFont: impl.sawInitialNvimGUIFont,
+		initialNvimGUIFont:    impl.initialNvimGUIFont,
+		services:              impl.services,
+		window:                impl.window,
+		closed:                impl.closed,
 	}
 	impl.mu.Unlock()
 	if snapshot.closed {
@@ -696,11 +706,34 @@ func (impl *shellImpl) refreshFrameWithContext(c *ui.Context, now time.Time, ins
 	}
 
 	cellChanged := false
-	if meta != nil && meta.GUIFont != "" && meta.GUIFont != snapshot.lastGUIFont && meta.GUIFont != snapshot.failedGUIFont {
-		resolver, err := text.NewResolver(text.Config{GUIFont: meta.GUIFont, Scale: 1})
+	fontGUIFont := ""
+	if meta != nil {
+		fontGUIFont = meta.GUIFont
+	}
+	if snapshot.envGUIFontOverride && meta != nil {
+		initial := snapshot.initialNvimGUIFont
+		if !snapshot.sawInitialNvimGUIFont {
+			impl.mu.Lock()
+			if !impl.sawInitialNvimGUIFont {
+				impl.initialNvimGUIFont = meta.GUIFont
+				impl.sawInitialNvimGUIFont = true
+			}
+			initial = impl.initialNvimGUIFont
+			impl.mu.Unlock()
+		}
+		if meta.GUIFont == initial {
+			fontGUIFont = ""
+		} else {
+			impl.mu.Lock()
+			impl.envGUIFontOverride = false
+			impl.mu.Unlock()
+		}
+	}
+	if fontGUIFont != "" && fontGUIFont != snapshot.lastGUIFont && fontGUIFont != snapshot.failedGUIFont {
+		resolver, err := text.NewResolver(text.Config{GUIFont: fontGUIFont, Scale: 1})
 		if err != nil {
 			impl.mu.Lock()
-			impl.failedGUIFont = meta.GUIFont
+			impl.failedGUIFont = fontGUIFont
 			impl.mu.Unlock()
 		} else {
 			impl.mu.Lock()
@@ -710,7 +743,7 @@ func (impl *shellImpl) refreshFrameWithContext(c *ui.Context, now time.Time, ins
 			impl.planner = render.NewPlanner(resolver)
 			impl.animator = render.NewAnimator(impl.planner, cfg, impl.animClock)
 			planner, animator = impl.planner, impl.animator
-			impl.lastGUIFont = meta.GUIFont
+			impl.lastGUIFont = fontGUIFont
 			impl.failedGUIFont = ""
 			impl.configDirty = true
 			impl.configGeneration++

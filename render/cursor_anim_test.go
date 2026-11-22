@@ -154,7 +154,7 @@ func TestCursorAnimStoppedFrameRefreshesMetadataAndMatchesStatic(t *testing.T) {
 	if got := metadataFor(stopped); !reflect.DeepEqual(got, metadataFor(static)) {
 		t.Fatalf("Step metadata = %+v, want %+v", got, metadataFor(static))
 	}
-	if got := metadataFor(stopped); len(got) != len(static.Commands) {
+	if got := metadataFor(stopped).rows; len(got) != len(static.Commands) {
 		t.Fatalf("metadata entries = %d, want %d", len(got), len(static.Commands))
 	}
 }
@@ -189,8 +189,8 @@ func TestCursorAnimZeroDeltaReturnsLatestQuadFrame(t *testing.T) {
 	if got, ok := animator.CursorQuad(); !ok || got != quad {
 		t.Fatalf("Step dt=0 quad = (%+v, %v), want (%+v, true)", got, ok, quad)
 	}
-	if got := metadataFor(zeroDelta); !reflect.DeepEqual(got, animator.impl.latestMetas) {
-		t.Fatalf("Step dt=0 metadata = %+v, want %+v", got, animator.impl.latestMetas)
+	if got := metadataFor(zeroDelta); !reflect.DeepEqual(got, animator.impl.latestMeta) {
+		t.Fatalf("Step dt=0 metadata = %+v, want %+v", got, animator.impl.latestMeta)
 	}
 }
 
@@ -221,11 +221,9 @@ func TestCursorAnimRepeatedSubmitKeepsStoppedFrameAndFlightLength(t *testing.T) 
 	if !reflect.DeepEqual(repeated, static) {
 		t.Fatalf("repeat Submit frame = %+v, want static %+v", repeated, static)
 	}
-	repeatedMetas := metadataFor(repeated)
-	for index, meta := range repeatedMetas {
-		if meta.hasCursorQuad || meta.cursorQuad != ([4]ui.Point{}) {
-			t.Fatalf("repeat Submit metadata %d = %+v, want no cursor quad", index, meta)
-		}
+	repeatedMeta := metadataFor(repeated)
+	if repeatedMeta.hasCursorQuad || repeatedMeta.cursorIndex != 0 || repeatedMeta.cursorQuad != ([4]ui.Point{}) {
+		t.Fatalf("repeat Submit metadata = %+v, want no cursor quad", repeatedMeta)
 	}
 
 	targetState := cursorAnimState(3, 12, 30, "normal")

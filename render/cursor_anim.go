@@ -417,38 +417,33 @@ func (animation *cursorAnimation) remember(input cursorInput, index int, busy bo
 	animation.hasPrev = true
 }
 
-func cursorAnimationFrame(animation *cursorAnimation, frame renderlist.Frame, metas []rowMeta) (renderlist.Frame, []rowMeta) {
+func cursorAnimationFrame(animation *cursorAnimation, frame renderlist.Frame, metas []rowMeta) (renderlist.Frame, frameMetadata) {
 	result := cloneFrame(frame)
-	metasCopy := append([]rowMeta(nil), metas...)
+	frameMeta := frameMetadata{rows: append([]rowMeta(nil), metas...)}
 	index := cursorCommandIndex(result)
 	if index < 0 {
-		return result, metasCopy
+		return result, frameMeta
 	}
 	quad, ok := animation.quad()
 	if !ok {
 		result.Commands = append(result.Commands[:index], result.Commands[index+1:]...)
-		if len(metasCopy) > index {
-			metasCopy = append(metasCopy[:index], metasCopy[index+1:]...)
+		if len(frameMeta.rows) > index {
+			frameMeta.rows = append(frameMeta.rows[:index], frameMeta.rows[index+1:]...)
 		}
-		return result, metasCopy
+		return result, frameMeta
 	}
 	if !animation.active {
-		if len(metasCopy) > index {
-			metasCopy[index].hasCursorQuad = false
-			metasCopy[index].cursorQuad = [4]ui.Point{}
-		}
-		return result, metasCopy
+		return result, frameMeta
 	}
 	minX, minY, maxX, maxY := quadBounds(quad)
 	result.Commands[index].X = minX
 	result.Commands[index].Y = minY
 	result.Commands[index].W = maxX - minX
 	result.Commands[index].H = maxY - minY
-	if len(metasCopy) > index {
-		metasCopy[index].hasCursorQuad = true
-		metasCopy[index].cursorQuad = quad
-	}
-	return result, metasCopy
+	frameMeta.hasCursorQuad = true
+	frameMeta.cursorIndex = index
+	frameMeta.cursorQuad = quad
+	return result, frameMeta
 }
 
 func quadBounds(quad [4]ui.Point) (minX, minY, maxX, maxY float32) {

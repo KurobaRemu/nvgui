@@ -49,7 +49,7 @@ func TestAnimatorSetConfigRecomputesSettledFrame(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Plan cached list: %v", err)
 	}
-	wantMetas := metadataFor(wantFrame)
+	wantMetas := metadataFor(wantFrame).rows
 	impl.settledFrame = renderlist.Frame{}
 	impl.settledMetas = nil
 
@@ -63,7 +63,7 @@ func TestAnimatorSetConfigRecomputesSettledFrame(t *testing.T) {
 	if !reflect.DeepEqual(impl.settledMetas, wantMetas) {
 		t.Fatalf("SetConfig settledMetas = %+v, want %+v", impl.settledMetas, wantMetas)
 	}
-	if got := metadataFor(impl.settledFrame); !reflect.DeepEqual(got, wantMetas) {
+	if got := metadataFor(impl.settledFrame).rows; !reflect.DeepEqual(got, wantMetas) {
 		t.Fatalf("SetConfig metadataLRU = %+v, want %+v", got, wantMetas)
 	}
 }
@@ -102,7 +102,7 @@ func TestAnimatorStepZeroDeltaKeepsActiveState(t *testing.T) {
 	frame := renderlist.Frame{Version: 1, Seq: 993, Commands: []renderlist.Command{{Op: "fill", BG: 8}}}
 	impl.settledFrame = frame
 	impl.settledMetas = []rowMeta{{grid: 1}}
-	storeMetadata(frame, impl.settledMetas)
+	storeMetadata(frame, frameMetadata{rows: impl.settledMetas})
 	clearMetadataLRU(t)
 	lastTime := impl.lastTime
 
@@ -117,7 +117,7 @@ func TestAnimatorStepZeroDeltaKeepsActiveState(t *testing.T) {
 		t.Fatalf("Step dt<=0 moved lastTime from %v to %v", lastTime, impl.lastTime)
 	}
 	key := metadataKey(frame.Seq, frame.Commands)
-	if got := metadataFor(gotFrame); !reflect.DeepEqual(got, impl.settledMetas) {
+	if got := metadataFor(gotFrame).rows; !reflect.DeepEqual(got, impl.settledMetas) {
 		t.Fatalf("metadataFor(gotFrame) = %+v, want %+v", got, impl.settledMetas)
 	}
 	if metadataIndex[key] == nil {

@@ -142,17 +142,17 @@ func (p *Planner) Plan(list *drawlist.List) (renderlist.Frame, error) {
 			}
 			frame.Commands = append(frame.Commands, command)
 			metas = append(metas, rowMeta{
-				grid:      layer.Grid,
-				attrMask:  attrMask,
 				clip:      commandClipValue,
 				cellWidth: cell.Width,
+				grid:      int32(layer.Grid),
+				row:       int32(layer.ScreenRow + item.Row),
+				attrMask:  attrMask,
 				hasRow:    true,
-				row:       layer.ScreenRow + item.Row,
 			})
 			itemIndex = nextIndex
 		}
 	}
-	storeMetadata(frame, metas)
+	storeMetadataOwned(frame, frameMetadata{rows: metas})
 	return frame, nil
 }
 
@@ -358,20 +358,28 @@ func (p *Planner) planItem(layer drawlist.Layer, item drawlist.Item, cell text.C
 }
 
 type rowMeta struct {
-	grid          int
-	attrMask      uint16
-	clip          ui.Rect
-	cellWidth     float32
-	hasRow        bool
-	row           int
+	clip      ui.Rect
+	cellWidth float32
+	grid      int32
+	row       int32
+	attrMask  uint16
+	hasRow    bool
+}
+
+type frameMetadata struct {
+	rows          []rowMeta
 	hasCursorQuad bool
+	cursorIndex   int
 	cursorQuad    [4]ui.Point
 }
 
 type metadataEntry struct {
-	seq      uint64
-	commands []renderlist.Command
-	metas    []rowMeta
+	seq           uint64
+	commands      []renderlist.Command
+	metas         []rowMeta
+	hasCursorQuad bool
+	cursorIndex   int
+	cursorQuad    [4]ui.Point
 }
 
 const metadataCapacity = 64
@@ -383,7 +391,24 @@ var (
 	metadataSeed  = maphash.MakeSeed()
 )
 
-func storeMetadata(frame renderlist.Frame, metas []rowMeta) {
+func cloneFrameMetadata(meta frameMetadata) frameMetadata {
+	return frameMetadata{
+		rows:          append([]rowMeta(nil), meta.rows...),
+		hasCursorQuad: meta.hasCursorQuad,
+		cursorIndex:   meta.cursorIndex,
+		cursorQuad:    meta.cursorQuad,
+	}
+}
+
+func storeMetadata(frame renderlist.Frame, meta frameMetadata) {
+	storeMetadataWithRows(frame, cloneFrameMetadata(meta).rows, meta)
+}
+
+func storeMetadataOwned(frame renderlist.Frame, meta frameMetadata) {
+	storeMetadataWithRows(frame, meta.rows[:len(meta.rows):len(meta.rows)], meta)
+}
+
+func storeMetadataWithRows(frame renderlist.Frame, rows []rowMeta, meta frameMetadata) {
 	key := metadataKey(frame.Seq, frame.Commands)
 	metadataMu.Lock()
 	defer metadataMu.Unlock()
@@ -393,16 +418,22 @@ func storeMetadata(frame renderlist.Frame, metas []rowMeta) {
 			continue
 		}
 		metadataLRU.MoveToFront(element)
-		entry.metas = append([]rowMeta(nil), metas...)
+		entry.metas = rows
+		entry.hasCursorQuad = meta.hasCursorQuad
+		entry.cursorIndex = meta.cursorIndex
+		entry.cursorQuad = meta.cursorQuad
 		bucket := metadataIndex[key]
 		copy(bucket[1:index+1], bucket[:index])
 		bucket[0] = element
 		return
 	}
 	entry := &metadataEntry{
-		seq:      frame.Seq,
-		commands: append([]renderlist.Command(nil), frame.Commands...),
-		metas:    append([]rowMeta(nil), metas...),
+		seq:           frame.Seq,
+		commands:      append([]renderlist.Command(nil), frame.Commands...),
+		metas:         rows,
+		hasCursorQuad: meta.hasCursorQuad,
+		cursorIndex:   meta.cursorIndex,
+		cursorQuad:    meta.cursorQuad,
 	}
 	element := metadataLRU.PushFront(entry)
 	metadataIndex[key] = append([]*list.Element{element}, metadataIndex[key]...)
@@ -429,7 +460,7 @@ func storeMetadata(frame renderlist.Frame, metas []rowMeta) {
 	}
 }
 
-func metadataFor(frame renderlist.Frame) []rowMeta {
+func metadataFor(frame renderlist.Frame) frameMetadata {
 	key := metadataKey(frame.Seq, frame.Commands)
 	metadataMu.Lock()
 	defer metadataMu.Unlock()
@@ -442,9 +473,14 @@ func metadataFor(frame renderlist.Frame) []rowMeta {
 		bucket := metadataIndex[key]
 		copy(bucket[1:index+1], bucket[:index])
 		bucket[0] = element
-		return append([]rowMeta(nil), entry.metas...)
+		return frameMetadata{
+			rows:          append([]rowMeta(nil), entry.metas...),
+			hasCursorQuad: entry.hasCursorQuad,
+			cursorIndex:   entry.cursorIndex,
+			cursorQuad:    entry.cursorQuad,
+		}
 	}
-	return nil
+	return frameMetadata{}
 }
 
 func metadataKey(seq uint64, commands []renderlist.Command) uint64 {
@@ -565,14 +601,14 @@ type viewImpl struct {
 	mu    sync.Mutex
 	frame renderlist.Frame
 	caret ui.Rect
-	metas []rowMeta
+	meta  frameMetadata
 	cache *rowCache
 	cell  text.CellSize
 }
 
 type drawState struct {
 	cache *rowCache
-	metas []rowMeta
+	meta  frameMetadata
 }
 
 var (
@@ -686,10 +722,10 @@ func (cache *rowCache) glyphRun(command renderlist.Command, meta rowMeta) ([]ui.
 func rowCacheKey(command renderlist.Command, meta rowMeta) rowKey {
 	row := int(math.Round(float64(command.Y / positiveHeight(command.H))))
 	if meta.hasRow {
-		row = meta.row
+		row = int(meta.row)
 	}
 	return rowKey{
-		grid:      meta.grid,
+		grid:      int(meta.grid),
 		row:       row,
 		text:      command.Text,
 		attrMask:  meta.attrMask,
@@ -747,7 +783,7 @@ func newView() *View {
 type viewSnapshot struct {
 	frame renderlist.Frame
 	caret ui.Rect
-	metas []rowMeta
+	meta  frameMetadata
 	cache *rowCache
 }
 
@@ -759,7 +795,7 @@ func viewDraw(view *View, c *ui.Context) ui.Element {
 	snapshot := viewSnapshot{
 		frame: view.impl.frame,
 		caret: view.impl.caret,
-		metas: view.impl.metas,
+		meta:  view.impl.meta,
 		cache: view.impl.cache,
 	}
 	view.impl.mu.Unlock()
@@ -768,10 +804,10 @@ func viewDraw(view *View, c *ui.Context) ui.Element {
 	}
 	return ui.Box(c).Fill().Focusable().TextCaret(snapshot.caret).Draw(func(p *ui.Painter, r ui.Rect) {
 		paint := func() {
-			state := drawState{cache: snapshot.cache, metas: snapshot.metas}
+			state := drawState{cache: snapshot.cache, meta: snapshot.meta}
 			done := pushDrawState(p, state)
 			defer done()
-			drawFrame(p, snapshot.frame, snapshot.cache, snapshot.metas)
+			drawFrame(p, snapshot.frame, snapshot.cache, snapshot.meta)
 		}
 		transformed := func() {
 			if r.X != 0 || r.Y != 0 {
@@ -796,7 +832,7 @@ func viewSetFrame(view *View, frame renderlist.Frame) {
 	defer view.impl.mu.Unlock()
 	view.impl.frame = cloneFrame(frame)
 	view.impl.caret = caretRect(view.impl.frame, view.impl.cell)
-	view.impl.metas = metadataFor(view.impl.frame)
+	view.impl.meta = metadataFor(view.impl.frame)
 }
 
 func cloneFrame(frame renderlist.Frame) renderlist.Frame {
@@ -849,17 +885,18 @@ func Draw(p *ui.Painter, frame renderlist.Frame) {
 	}
 	state, ok := drawStateFor(p)
 	if !ok {
-		state = drawState{cache: globalCache, metas: metadataFor(frame)}
+		state = drawState{cache: globalCache, meta: metadataFor(frame)}
 	}
-	drawFrame(p, frame, state.cache, state.metas)
+	drawFrame(p, frame, state.cache, state.meta)
 }
 
 var globalCache = newRowCache()
 
-func drawFrame(p *ui.Painter, frame renderlist.Frame, cache *rowCache, metas []rowMeta) {
+func drawFrame(p *ui.Painter, frame renderlist.Frame, cache *rowCache, frameMeta frameMetadata) {
 	if cache == nil {
 		cache = globalCache
 	}
+	metas := frameMeta.rows
 	for index := 0; index < len(frame.Commands); {
 		meta := rowMeta{}
 		if index < len(metas) {
@@ -872,15 +909,16 @@ func drawFrame(p *ui.Painter, frame renderlist.Frame, cache *rowCache, metas []r
 				(frame.Commands[end].Op != "fill" || frame.Commands[index].Op == "fill") {
 				end++
 			}
-			p.Clip(meta.clip, 0, func() { drawCommandRange(p, frame, cache, metas, index, end) })
+			p.Clip(meta.clip, 0, func() { drawCommandRange(p, frame, cache, frameMeta, index, end) })
 		} else {
-			drawCommandRange(p, frame, cache, metas, index, end)
+			drawCommandRange(p, frame, cache, frameMeta, index, end)
 		}
 		index = end
 	}
 }
 
-func drawCommandRange(p *ui.Painter, frame renderlist.Frame, cache *rowCache, metas []rowMeta, start, end int) {
+func drawCommandRange(p *ui.Painter, frame renderlist.Frame, cache *rowCache, frameMeta frameMetadata, start, end int) {
+	metas := frameMeta.rows
 	for index := start; index < end; index++ {
 		meta := rowMeta{}
 		if index < len(metas) {
@@ -896,7 +934,8 @@ func drawCommandRange(p *ui.Painter, frame renderlist.Frame, cache *rowCache, me
 		case "box":
 			drawBoxRune(p, command, color(command.FG))
 		case "cursor":
-			drawCursor(p, command, cache, meta)
+			hasQuad := frameMeta.hasCursorQuad && index == frameMeta.cursorIndex
+			drawCursor(p, command, cache, meta, hasQuad, frameMeta.cursorQuad)
 		}
 	}
 }
@@ -1029,7 +1068,7 @@ func drawWave(p *ui.Painter, x, y, width, thick float32, paintColor ui.Color) {
 	p.StrokePath(&path, thick, paintColor)
 }
 
-func drawCursor(p *ui.Painter, command renderlist.Command, cache *rowCache, meta rowMeta) {
+func drawCursor(p *ui.Painter, command renderlist.Command, cache *rowCache, meta rowMeta, hasQuad bool, quad [4]ui.Point) {
 	rect := commandRect(command)
 	if rect.W <= 0 || rect.H <= 0 {
 		return
@@ -1038,8 +1077,7 @@ func drawCursor(p *ui.Painter, command renderlist.Command, cache *rowCache, meta
 	if command.FG == 0 && command.BG == 0 {
 		fillColor = ui.Color{R: 128, G: 128, B: 128, A: 200}
 	}
-	if meta.hasCursorQuad {
-		quad := meta.cursorQuad
+	if hasQuad {
 		var path ui.Path
 		path.MoveTo(quad[0].X, quad[0].Y).
 			LineTo(quad[1].X, quad[1].Y).

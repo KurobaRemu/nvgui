@@ -10,6 +10,7 @@ import (
 	"github.com/egoist/mygo/ui"
 
 	"nvgui/render"
+	"nvgui/text"
 )
 
 func m4AnimFilteredEnv(extra ...string) []string {
@@ -154,6 +155,130 @@ func TestM4Anim_OptionSetGUIFontHotUpdate(t *testing.T) {
 		shell.impl.mu.Unlock()
 		return lastGUIFont == "Menlo:h15"
 	})
+}
+
+func TestM4Anim_EnvGUIFontSurvivesInitialOptionSetAndHotUpdates(t *testing.T) {
+	const (
+		envFont    = "Menlo:h18"
+		hotFont    = "Menlo:h15"
+		cmdFont    = "Menlo:h12"
+		cmdHotFont = "Menlo:h16"
+	)
+
+	t.Run("clean startup preserves NVGUI_GUIFONT then interactive set guifont hot updates", func(t *testing.T) {
+		shell := m4AnimStart(t, nil, m4AnimFilteredEnv("NVGUI_GUIFONT="+envFont))
+		impl := shell.impl
+		cell0 := m4AnimCell(impl)
+		tester := ui.NewTester(shell.View, 800, 480)
+		waitUntil(t, 5*time.Second, "initial state and frame metadata", func() bool {
+			tester.Frame()
+			state, meta := impl.session.LatestSnapshot()
+			return state != nil && meta != nil
+		})
+		_, initialMeta := impl.session.LatestSnapshot()
+		initialNvimGUIFont := ""
+		if initialMeta != nil {
+			initialNvimGUIFont = initialMeta.GUIFont
+		}
+		if initialNvimGUIFont != envFont {
+			assertGUIFontState(t, impl, envFont, cell0, true)
+		}
+		for frame := 0; frame < 8; frame++ {
+			tester.Frame()
+			assertGUIFontState(t, impl, envFont, cell0, true)
+		}
+
+		hotUpdateGUIFont(t, impl, tester, "set guifont="+hotFont, hotFont, cell0)
+		if initialNvimGUIFont != "" && initialNvimGUIFont != hotFont {
+			escaped := strings.ReplaceAll(initialNvimGUIFont, " ", "\\ ")
+			hotUpdateGUIFont(t, impl, tester, "set guifont="+escaped, initialNvimGUIFont, cell0)
+		}
+	})
+
+	t.Run("explicit cmd guifont overridden by NVGUI_GUIFONT on startup", func(t *testing.T) {
+		shell := m4AnimStart(t, []string{"--cmd", "set guifont=" + cmdFont}, m4AnimFilteredEnv("NVGUI_GUIFONT="+envFont))
+		impl := shell.impl
+		cell0 := m4AnimCell(impl)
+		tester := ui.NewTester(shell.View, 800, 480)
+		waitUntil(t, 5*time.Second, "initial state and frame metadata", func() bool {
+			tester.Frame()
+			state, meta := impl.session.LatestSnapshot()
+			return state != nil && meta != nil
+		})
+		for frame := 0; frame < 8; frame++ {
+			tester.Frame()
+			assertGUIFontState(t, impl, envFont, cell0, true)
+		}
+		hotUpdateGUIFont(t, impl, tester, "set guifont="+cmdHotFont, cmdHotFont, cell0)
+	})
+
+	t.Run("without NVGUI_GUIFONT startup option_set applies normally", func(t *testing.T) {
+		shell := m4AnimStart(t, []string{"--cmd", "set guifont=" + cmdHotFont}, m4AnimFilteredEnv())
+		impl := shell.impl
+		defaultCell := m4AnimCell(impl)
+		tester := ui.NewTester(shell.View, 800, 480)
+		waitUntil(t, 5*time.Second, "startup option_set guifont", func() bool {
+			tester.Frame()
+			impl.mu.Lock()
+			got := impl.lastGUIFont
+			impl.mu.Unlock()
+			return got == cmdHotFont
+		})
+		assertGUIFontState(t, impl, cmdHotFont, defaultCell, false)
+	})
+}
+
+func m4AnimCell(impl *shellImpl) text.CellSize {
+	impl.mu.Lock()
+	resolver := impl.resolver
+	impl.mu.Unlock()
+	return resolver.Cell()
+}
+
+func assertGUIFontState(t *testing.T, impl *shellImpl, want string, originalCell text.CellSize, wantOriginalCell bool) {
+	t.Helper()
+	impl.mu.Lock()
+	lastGUIFont := impl.lastGUIFont
+	configGUIFont := impl.resolver.Config().GUIFont
+	resolver := impl.resolver
+	impl.mu.Unlock()
+	cell := resolver.Cell()
+	if lastGUIFont != want || configGUIFont != want {
+		t.Fatalf("guifont = (%q, %q), want %q twice", lastGUIFont, configGUIFont, want)
+	}
+	if wantOriginalCell {
+		if cell != originalCell {
+			t.Fatalf("cell = %+v, want startup cell %+v", cell, originalCell)
+		}
+		return
+	}
+	if cell == originalCell {
+		t.Fatalf("cell stayed %+v after guifont %q changed", cell, want)
+	}
+}
+
+func hotUpdateGUIFont(t *testing.T, impl *shellImpl, tester *ui.Tester, command, want string, originalCell text.CellSize) {
+	t.Helper()
+	if err := impl.session.Nvim().Command(command); err != nil {
+		t.Fatalf("%s: %v", command, err)
+	}
+	waitUntil(t, 5*time.Second, "interactive guifont hot update "+want, func() bool {
+		tester.Frame()
+		impl.mu.Lock()
+		lastGUIFont := impl.lastGUIFont
+		configGUIFont := impl.resolver.Config().GUIFont
+		resolver := impl.resolver
+		impl.mu.Unlock()
+		cell := resolver.Cell()
+		if lastGUIFont != want || configGUIFont != want {
+			return false
+		}
+		return cell != originalCell
+	})
+	for frame := 0; frame < 8; frame++ {
+		tester.Frame()
+		assertGUIFontState(t, impl, want, originalCell, false)
+	}
 }
 
 func TestM4Anim_InstantSettlesActiveAnimationImmediately(t *testing.T) {

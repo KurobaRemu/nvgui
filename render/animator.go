@@ -34,7 +34,7 @@ type animatorImpl struct {
 	settledMetas []rowMeta
 	initialized  bool
 	latestFrame  renderlist.Frame
-	latestMetas  []rowMeta
+	latestMeta   frameMetadata
 }
 
 type previousScrollFrame struct {
@@ -110,15 +110,15 @@ func animatorSetConfig(a *Animator, cfg AnimationConfig) {
 			refreshBaseline := ligaturesChanged || baselineExpired || animationsDisabled
 			if refreshBaseline {
 				impl.settledFrame = cloneFrame(settledFrame)
-				impl.settledMetas = metadataFor(impl.settledFrame)
+				impl.settledMetas = metadataFor(impl.settledFrame).rows
 			}
-			storeMetadata(impl.settledFrame, impl.settledMetas)
+			storeMetadata(impl.settledFrame, frameMetadata{rows: impl.settledMetas})
 			settled, settledMetas := impl.composedFrame(impl.settledFrame, impl.settledMetas)
 			frame, frameMetas := cursorAnimationFrame(impl.cursor, settled, settledMetas)
 			storeMetadata(frame, frameMetas)
 			if refreshBaseline {
 				impl.latestFrame = cloneFrame(frame)
-				impl.latestMetas = append([]rowMeta(nil), frameMetas...)
+				impl.latestMeta = cloneFrameMetadata(frameMetas)
 			}
 		}
 	}
@@ -290,7 +290,7 @@ func animatorSubmit(a *Animator, state *screen.State, meta *screen.FrameMeta, li
 	impl.lastState = state
 	impl.lastMeta = cloneFrameMeta(meta)
 	impl.settledFrame = cloneFrame(settledFrame)
-	impl.settledMetas = metadataFor(impl.settledFrame)
+	impl.settledMetas = metadataFor(impl.settledFrame).rows
 	impl.scrollDelta(impl.cfg, state, impl.lastMeta, cachedList, previous)
 	cell := impl.planner.resolver.Cell()
 	input := cursorInput{state: state, meta: meta, list: cachedList, frame: impl.settledFrame, metas: impl.settledMetas, cfg: impl.cfg, cell: cell}
@@ -333,7 +333,7 @@ func animatorSubmit(a *Animator, state *screen.State, meta *screen.FrameMeta, li
 	frame, frameMetas := cursorAnimationFrame(impl.cursor, settled, settledMetas)
 	storeMetadata(frame, frameMetas)
 	impl.latestFrame = cloneFrame(frame)
-	impl.latestMetas = append([]rowMeta(nil), frameMetas...)
+	impl.latestMeta = cloneFrameMetadata(frameMetas)
 	return cloneFrame(frame), impl.active || impl.scrollActive(), nil
 }
 
@@ -352,10 +352,10 @@ func stoppedFrame(impl *animatorImpl) (renderlist.Frame, bool, error) {
 		state.lastScrollDelta = 0
 	}
 	frame, frameMetas := cursorAnimationFrame(impl.cursor, impl.settledFrame, impl.settledMetas)
-	storeMetadata(impl.settledFrame, impl.settledMetas)
+	storeMetadata(impl.settledFrame, frameMetadata{rows: impl.settledMetas})
 	storeMetadata(frame, frameMetas)
 	impl.latestFrame = cloneFrame(frame)
-	impl.latestMetas = append([]rowMeta(nil), frameMetas...)
+	impl.latestMeta = cloneFrameMetadata(frameMetas)
 	return cloneFrame(frame), false, nil
 }
 
@@ -376,12 +376,12 @@ func animatorStep(a *Animator) (renderlist.Frame, bool, error) {
 	}
 	if dt <= 0 {
 		frame := impl.latestFrame
-		frameMetas := impl.latestMetas
+		frameMeta := impl.latestMeta
 		if len(frame.Commands) == 0 {
 			settled, settledMetas := impl.composedFrame(impl.settledFrame, impl.settledMetas)
-			frame, frameMetas = cursorAnimationFrame(impl.cursor, settled, settledMetas)
+			frame, frameMeta = cursorAnimationFrame(impl.cursor, settled, settledMetas)
 		}
-		storeMetadata(frame, frameMetas)
+		storeMetadata(frame, frameMeta)
 		return cloneFrame(frame), impl.active || impl.cursor.active || impl.scrollActive(), nil
 	}
 	impl.lastTime = now
@@ -395,7 +395,7 @@ func animatorStep(a *Animator) (renderlist.Frame, bool, error) {
 	frame, frameMetas := cursorAnimationFrame(impl.cursor, settled, settledMetas)
 	storeMetadata(frame, frameMetas)
 	impl.latestFrame = cloneFrame(frame)
-	impl.latestMetas = append([]rowMeta(nil), frameMetas...)
+	impl.latestMeta = cloneFrameMetadata(frameMetas)
 	return cloneFrame(frame), impl.active || impl.scrollActive(), nil
 }
 

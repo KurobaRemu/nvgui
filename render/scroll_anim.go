@@ -139,7 +139,7 @@ func rectsOverlap(left, right ui.Rect) bool {
 func scrollInnerBackground(frame renderlist.Frame, metas []rowMeta, layer scrollLayer) (uint32, bool) {
 	commandRect := ui.Rect{X: layer.innerClip.X, Y: layer.innerClip.Y, W: layer.innerClip.W, H: layer.innerClip.H}
 	for index, command := range frame.Commands {
-		if index >= len(metas) || metas[index].grid != layer.grid || command.Op != "fill" {
+		if index >= len(metas) || int(metas[index].grid) != layer.grid || command.Op != "fill" {
 			continue
 		}
 		fillRect := ui.Rect{X: command.X, Y: command.Y, W: command.W, H: command.H}
@@ -199,7 +199,7 @@ func scrollPreviousInner(frame renderlist.Frame, metas []rowMeta, drawLayer draw
 		if index < len(metas) {
 			commandMeta = metas[index]
 		}
-		if commandMeta.grid != gridID || marginsKeepCommandStatic(command, context, cell.Width, cell.Height) {
+		if int(commandMeta.grid) != gridID || marginsKeepCommandStatic(command, context, cell.Width, cell.Height) {
 			continue
 		}
 		commands = append(commands, command)
@@ -227,7 +227,7 @@ func scrollHistoryCommands(layer scrollLayer, cellWidth, cellHeight float32) ([]
 		if index < len(layer.prevMetas) {
 			meta = layer.prevMetas[index]
 		}
-		if meta.grid != layer.grid || marginsKeepCommandStatic(command, layer, cellWidth, cellHeight) {
+		if int(meta.grid) != layer.grid || marginsKeepCommandStatic(command, layer, cellWidth, cellHeight) {
 			continue
 		}
 		shifted := command
@@ -280,7 +280,7 @@ func scrollAnimationFrame(frame renderlist.Frame, metas []rowMeta, state *screen
 				H:  layer.innerClip.H,
 				BG: layerBackgrounds[gridID],
 			})
-			resultMetas = append(resultMetas, rowMeta{grid: gridID, cellWidth: cellWidth})
+			resultMetas = append(resultMetas, rowMeta{grid: int32(gridID), cellWidth: cellWidth})
 		}
 		history, historyMetas := scrollHistoryCommands(layer, cellWidth, cellHeight)
 		result.Commands = append(result.Commands, history...)
@@ -291,9 +291,9 @@ func scrollAnimationFrame(frame renderlist.Frame, metas []rowMeta, state *screen
 		if index < len(metas) {
 			commandMeta = metas[index]
 		}
-		layer, ok := layerMap[commandMeta.grid]
+		layer, ok := layerMap[int(commandMeta.grid)]
 		if ok {
-			appendLayerPrefix(commandMeta.grid, layer)
+			appendLayerPrefix(int(commandMeta.grid), layer)
 		}
 		if !ok || marginsKeepCommandStatic(command, layer, cellWidth, cellHeight) {
 			result.Commands = append(result.Commands, command)
