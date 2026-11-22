@@ -5,13 +5,13 @@ import "math"
 func defaultAnimationConfig() AnimationConfig {
 	return AnimationConfig{
 		CursorEnabled:            true,
-		CursorAnimationLength:    0.150,
-		CursorShortLength:        0.040,
-		CursorTrailSize:          1.0,
+		CursorAnimationLength:    0.080,
+		CursorShortLength:        0.030,
+		CursorTrailSize:          0.25,
 		CursorAnimateInsertMode:  true,
 		CursorAnimateCommandLine: false,
 		ScrollEnabled:            true,
-		ScrollAnimationLength:    0.250,
+		ScrollAnimationLength:    0.180,
 		ScrollFarLines:           10,
 		LigaturesEnabled:         true,
 	}

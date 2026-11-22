@@ -43,13 +43,14 @@ type cursorAnimation struct {
 }
 
 type cursorInput struct {
-	state *screen.State
-	meta  *screen.FrameMeta
-	list  *drawlist.List
-	frame renderlist.Frame
-	metas []rowMeta
-	cfg   AnimationConfig
-	cell  text.CellSize
+	state     *screen.State
+	meta      *screen.FrameMeta
+	list      *drawlist.List
+	frame     renderlist.Frame
+	metas     []rowMeta
+	cfg       AnimationConfig
+	cell      text.CellSize
+	scrolling bool
 }
 
 type cursorTargetState struct {
@@ -244,6 +245,9 @@ func cursorInMsgGrid(state *screen.State) bool {
 
 func (animation *cursorAnimation) immediate(input cursorInput, index int, busy bool) bool {
 	cfg := input.cfg
+	if input.scrolling {
+		return true
+	}
 	if !cfg.CursorEnabled || cfg.CursorAnimationLength <= 0 {
 		return true
 	}
@@ -385,6 +389,14 @@ func (animation *cursorAnimation) snappedCorner(index int) ui.Point {
 	}
 }
 
+func (animation *cursorAnimation) maxTrailPixels() float32 {
+	maxCell := max(animation.cell.Width, animation.cell.Height)
+	if maxCell <= 0 {
+		maxCell = max(animation.dim.X, animation.dim.Y)
+	}
+	return 1.5 * maxCell
+}
+
 func (animation *cursorAnimation) quad() ([4]ui.Point, bool) {
 	if !animation.hasTarget || !animation.visible || animation.suppressed {
 		return [4]ui.Point{}, false
@@ -395,6 +407,41 @@ func (animation *cursorAnimation) quad() ([4]ui.Point, bool) {
 	var quad [4]ui.Point
 	for index := range quad {
 		quad[index] = animation.snappedCorner(index)
+	}
+	maxTrail := animation.maxTrailPixels()
+	if maxTrail <= 0 {
+		return quad, true
+	}
+	residuals := [4]ui.Point{}
+	leadIdx := 0
+	closest := math.Inf(1)
+	for index := range residuals {
+		destination := animation.cornerDestination(index, animation.dest)
+		current := animation.corners[index].current
+		residuals[index] = ui.Point{X: destination.X - current.X, Y: destination.Y - current.Y}
+		distance := math.Hypot(float64(residuals[index].X), float64(residuals[index].Y))
+		if distance < closest {
+			closest = distance
+			leadIdx = index
+		}
+	}
+	leadResidual := residuals[leadIdx]
+	for index := range quad {
+		lag := ui.Point{X: residuals[index].X - leadResidual.X, Y: residuals[index].Y - leadResidual.Y}
+		lagLen := math.Hypot(float64(lag.X), float64(lag.Y))
+		if lagLen <= float64(maxTrail) || lagLen == 0 {
+			continue
+		}
+		scale := float64(maxTrail) / lagLen
+		destination := animation.cornerDestination(index, animation.dest)
+		clamped := ui.Point{
+			X: destination.X - (leadResidual.X + lag.X*float32(scale)),
+			Y: destination.Y - (leadResidual.Y + lag.Y*float32(scale)),
+		}
+		quad[index] = ui.Point{
+			X: float32(math.Round(float64(clamped.X-animation.frac.X))) + animation.frac.X,
+			Y: float32(math.Round(float64(clamped.Y-animation.frac.Y))) + animation.frac.Y,
+		}
 	}
 	return quad, true
 }

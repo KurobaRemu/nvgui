@@ -2,6 +2,7 @@ package render
 
 import (
 	"math"
+	"slices"
 
 	"github.com/egoist/mygo/ui"
 
@@ -11,15 +12,21 @@ import (
 	"nvgui/text"
 )
 
+const maxScrollSnapshots = 8
+
+type scrollSnapshot struct {
+	commands   []renderlist.Command
+	metas      []rowMeta
+	lineOffset float32
+}
+
 type gridScrollState struct {
-	spring          Spring
-	prevInner       []renderlist.Command
-	prevInnerMetas  []rowMeta
-	lastScrollDelta float32
-	width           int
-	height          int
-	margins         screen.ViewportMargins
-	viewport        screen.Viewport
+	spring    Spring
+	snapshots []scrollSnapshot
+	width     int
+	height    int
+	margins   screen.ViewportMargins
+	viewport  screen.Viewport
 }
 
 type scrollLayer struct {
@@ -30,9 +37,7 @@ type scrollLayer struct {
 	screenCol    int
 	innerClip    ui.Rect
 	margins      screen.ViewportMargins
-	prev         []renderlist.Command
-	prevMetas    []rowMeta
-	prevDelta    float32
+	snapshots    []scrollSnapshot
 	offsetPixels float32
 }
 
@@ -171,9 +176,7 @@ func scrollLayerFor(state *screen.State, meta *screen.FrameMeta, drawLayer drawl
 		screenCol:    drawLayer.ScreenCol,
 		innerClip:    innerClip,
 		margins:      margins,
-		prev:         gridState.prevInner,
-		prevMetas:    gridState.prevInnerMetas,
-		prevDelta:    gridState.lastScrollDelta,
+		snapshots:    gridState.snapshots,
 		offsetPixels: gridState.spring.Position * cellHeight,
 	}, true
 }
@@ -199,7 +202,21 @@ func scrollPreviousInner(frame renderlist.Frame, metas []rowMeta, drawLayer draw
 		if index < len(metas) {
 			commandMeta = metas[index]
 		}
-		if int(commandMeta.grid) != gridID || marginsKeepCommandStatic(command, context, cell.Width, cell.Height) {
+		if int(commandMeta.grid) != gridID {
+			continue
+		}
+		if command.Op == "fill" {
+			clipped := intersectRects(commandRect(command), context.innerClip)
+			if clipped.W <= 0 || clipped.H <= 0 {
+				continue
+			}
+			snapshot := command
+			snapshot.X, snapshot.Y, snapshot.W, snapshot.H = clipped.X, clipped.Y, clipped.W, clipped.H
+			commands = append(commands, snapshot)
+			outMetas = append(outMetas, commandMeta)
+			continue
+		}
+		if marginsKeepCommandStatic(command, context, cell.Width, cell.Height) {
 			continue
 		}
 		commands = append(commands, command)
@@ -209,34 +226,134 @@ func scrollPreviousInner(frame renderlist.Frame, metas []rowMeta, drawLayer draw
 }
 
 func scrollHistoryCommands(layer scrollLayer, cellWidth, cellHeight float32) ([]renderlist.Command, []rowMeta) {
-	if layer.prevDelta == 0 || len(layer.prev) == 0 {
+	if len(layer.snapshots) == 0 {
 		return nil, nil
 	}
-	innerHeight := layer.height - layer.margins.Top - layer.margins.Bottom
-	if innerHeight <= 0 || math.Abs(float64(layer.prevDelta)) > float64(innerHeight) {
-		return nil, nil
-	}
-	historyOffset := layer.offsetPixels - layer.prevDelta*cellHeight
-	if math.Abs(float64(historyOffset)) < 0.001 {
-		return nil, nil
-	}
-	commands := make([]renderlist.Command, 0, len(layer.prev))
-	metas := make([]rowMeta, 0, len(layer.prev))
-	for index, command := range layer.prev {
-		meta := rowMeta{}
-		if index < len(layer.prevMetas) {
-			meta = layer.prevMetas[index]
-		}
-		if int(meta.grid) != layer.grid || marginsKeepCommandStatic(command, layer, cellWidth, cellHeight) {
+	commands := make([]renderlist.Command, 0)
+	metas := make([]rowMeta, 0)
+	for _, snapshot := range layer.snapshots {
+		snapOffsetPixels := layer.offsetPixels + snapshot.lineOffset*cellHeight
+		if snapOffsetPixels <= -layer.innerClip.H || snapOffsetPixels >= layer.innerClip.H {
 			continue
 		}
-		shifted := command
-		shifted.Y += historyOffset
-		meta.clip = layer.innerClip
-		commands = append(commands, shifted)
-		metas = append(metas, meta)
+		for index, command := range snapshot.commands {
+			meta := rowMeta{}
+			if index < len(snapshot.metas) {
+				meta = snapshot.metas[index]
+			}
+			if int(meta.grid) != layer.grid {
+				continue
+			}
+			shifted := command
+			shifted.Y += snapOffsetPixels
+			if shifted.Y+shifted.H <= layer.innerClip.Y || shifted.Y >= layer.innerClip.Y+layer.innerClip.H {
+				continue
+			}
+			meta.clip = layer.innerClip
+			commands = append(commands, shifted)
+			metas = append(metas, meta)
+		}
 	}
 	return commands, metas
+}
+
+func scrollVisibleCommands(commands []renderlist.Command, metas []rowMeta, layer scrollLayer, offsetPixels float32) ([]renderlist.Command, []rowMeta) {
+	result := make([]renderlist.Command, 0, len(commands))
+	resultMetas := make([]rowMeta, 0, len(metas))
+	for index, command := range commands {
+		meta := rowMeta{}
+		if index < len(metas) {
+			meta = metas[index]
+		}
+		shifted := command
+		shifted.Y += offsetPixels
+		if shifted.Y+shifted.H <= layer.innerClip.Y || shifted.Y >= layer.innerClip.Y+layer.innerClip.H {
+			continue
+		}
+		meta.clip = layer.innerClip
+		result = append(result, shifted)
+		resultMetas = append(resultMetas, meta)
+	}
+	return result, resultMetas
+}
+
+func scrollSegmentCommands(gridID int, commands []renderlist.Command, metas []rowMeta, layer scrollLayer, cellWidth, cellHeight float32, background uint32, backgroundPresent bool) ([]renderlist.Command, []rowMeta) {
+	staticFills := make([]renderlist.Command, 0)
+	staticFillsMetas := make([]rowMeta, 0)
+	staticForeground := make([]renderlist.Command, 0)
+	staticForegroundMetas := make([]rowMeta, 0)
+	cursorCommands := make([]renderlist.Command, 0)
+	cursorMetas := make([]rowMeta, 0)
+	innerFills := make([]renderlist.Command, 0)
+	innerFillsMetas := make([]rowMeta, 0)
+	innerForeground := make([]renderlist.Command, 0)
+	innerForegroundMetas := make([]rowMeta, 0)
+	for index, command := range commands {
+		meta := rowMeta{}
+		if index < len(metas) {
+			meta = metas[index]
+		}
+		if command.Op == "cursor" {
+			cursorCommands = append(cursorCommands, command)
+			cursorMetas = append(cursorMetas, meta)
+			continue
+		}
+		static := layer.margins != (screen.ViewportMargins{}) &&
+			marginsKeepCommandStatic(command, layer, cellWidth, cellHeight)
+		if static {
+			if command.Op == "fill" {
+				staticFills = append(staticFills, command)
+				staticFillsMetas = append(staticFillsMetas, meta)
+			} else {
+				staticForeground = append(staticForeground, command)
+				staticForegroundMetas = append(staticForegroundMetas, meta)
+			}
+		}
+		if command.Op == "fill" {
+			clipped := intersectRects(commandRect(command), layer.innerClip)
+			if clipped.W > 0 && clipped.H > 0 {
+				innerFill := command
+				innerFill.X, innerFill.Y, innerFill.W, innerFill.H = clipped.X, clipped.Y, clipped.W, clipped.H
+				innerFills = append(innerFills, innerFill)
+				innerFillsMetas = append(innerFillsMetas, meta)
+			}
+			continue
+		}
+		if !static {
+			innerForeground = append(innerForeground, command)
+			innerForegroundMetas = append(innerForegroundMetas, meta)
+		}
+	}
+
+	result := make([]renderlist.Command, 0, len(commands)+len(layer.snapshots)*4+1)
+	resultMetas := make([]rowMeta, 0, len(commands)+len(layer.snapshots)*4+1)
+	result = append(result, staticFills...)
+	resultMetas = append(resultMetas, staticFillsMetas...)
+	if backgroundPresent {
+		result = append(result, renderlist.Command{
+			Op: "fill",
+			X:  layer.innerClip.X,
+			Y:  layer.innerClip.Y,
+			W:  layer.innerClip.W,
+			H:  layer.innerClip.H,
+			BG: background,
+		})
+		resultMetas = append(resultMetas, rowMeta{grid: int32(gridID), cellWidth: cellWidth})
+	}
+	history, historyMetas := scrollHistoryCommands(layer, cellWidth, cellHeight)
+	result = append(result, history...)
+	resultMetas = append(resultMetas, historyMetas...)
+	currentFills, currentFillsMetas := scrollVisibleCommands(innerFills, innerFillsMetas, layer, layer.offsetPixels)
+	result = append(result, currentFills...)
+	resultMetas = append(resultMetas, currentFillsMetas...)
+	currentForeground, currentForegroundMetas := scrollVisibleCommands(innerForeground, innerForegroundMetas, layer, layer.offsetPixels)
+	result = append(result, currentForeground...)
+	resultMetas = append(resultMetas, currentForegroundMetas...)
+	result = append(result, staticForeground...)
+	resultMetas = append(resultMetas, staticForegroundMetas...)
+	result = append(result, cursorCommands...)
+	resultMetas = append(resultMetas, cursorMetas...)
+	return result, resultMetas
 }
 
 func scrollAnimationFrame(frame renderlist.Frame, metas []rowMeta, state *screen.State, meta *screen.FrameMeta, list *drawlist.List, scroll map[int]*gridScrollState, cellWidth, cellHeight float32) (renderlist.Frame, []rowMeta) {
@@ -257,55 +374,61 @@ func scrollAnimationFrame(frame renderlist.Frame, metas []rowMeta, state *screen
 	layerBackgroundsPresent := make(map[int]bool, len(layerMap))
 	for gridID, layer := range layerMap {
 		color, ok := scrollInnerBackground(frame, metas, layer)
-		if ok {
-			layerBackgrounds[gridID] = color
-			layerBackgroundsPresent[gridID] = true
-		}
+		layerBackgrounds[gridID] = color
+		layerBackgroundsPresent[gridID] = ok
 	}
 	result := cloneFrame(frame)
 	result.Commands = make([]renderlist.Command, 0, len(frame.Commands)+len(layerMap)*2)
 	resultMetas := make([]rowMeta, 0, len(frame.Commands)+len(layerMap)*2)
-	layerStarted := make(map[int]bool, len(layerMap))
-	appendLayerPrefix := func(gridID int, layer scrollLayer) {
-		if layerStarted[gridID] {
+	segmentCommands := make([]renderlist.Command, 0, len(frame.Commands))
+	segmentMetas := make([]rowMeta, 0, len(frame.Commands))
+	activeGrid := 0
+	flush := func() {
+		if len(segmentCommands) == 0 {
 			return
 		}
-		layerStarted[gridID] = true
-		if layerBackgroundsPresent[gridID] {
-			result.Commands = append(result.Commands, renderlist.Command{
-				Op: "fill",
-				X:  layer.innerClip.X,
-				Y:  layer.innerClip.Y,
-				W:  layer.innerClip.W,
-				H:  layer.innerClip.H,
-				BG: layerBackgrounds[gridID],
-			})
-			resultMetas = append(resultMetas, rowMeta{grid: int32(gridID), cellWidth: cellWidth})
+		if layer, ok := layerMap[activeGrid]; ok {
+			commands, commandMetas := scrollSegmentCommands(activeGrid, segmentCommands, segmentMetas, layer, cellWidth, cellHeight, layerBackgrounds[activeGrid], layerBackgroundsPresent[activeGrid])
+			result.Commands = append(result.Commands, commands...)
+			resultMetas = append(resultMetas, commandMetas...)
+		} else {
+			result.Commands = append(result.Commands, segmentCommands...)
+			resultMetas = append(resultMetas, segmentMetas...)
 		}
-		history, historyMetas := scrollHistoryCommands(layer, cellWidth, cellHeight)
-		result.Commands = append(result.Commands, history...)
-		resultMetas = append(resultMetas, historyMetas...)
+		segmentCommands = segmentCommands[:0]
+		segmentMetas = segmentMetas[:0]
 	}
 	for index, command := range frame.Commands {
 		commandMeta := rowMeta{}
 		if index < len(metas) {
 			commandMeta = metas[index]
 		}
-		layer, ok := layerMap[int(commandMeta.grid)]
-		if ok {
-			appendLayerPrefix(int(commandMeta.grid), layer)
+		gridID := int(commandMeta.grid)
+		_, active := layerMap[gridID]
+		if active && activeGrid != gridID {
+			flush()
+			activeGrid = gridID
+		} else if !active && activeGrid != 0 {
+			flush()
+			activeGrid = 0
 		}
-		if !ok || marginsKeepCommandStatic(command, layer, cellWidth, cellHeight) {
-			result.Commands = append(result.Commands, command)
-			resultMetas = append(resultMetas, commandMeta)
-			continue
-		}
-		shifted := command
-		shifted.Y += layer.offsetPixels
-		shiftedMeta := commandMeta
-		shiftedMeta.clip = layer.innerClip
-		result.Commands = append(result.Commands, shifted)
-		resultMetas = append(resultMetas, shiftedMeta)
+		segmentCommands = append(segmentCommands, command)
+		segmentMetas = append(segmentMetas, commandMeta)
 	}
+	flush()
 	return result, resultMetas
+}
+
+func trimScrollSnapshots(state *gridScrollState, position float32, innerHeight int) {
+	if state == nil || innerHeight <= 0 {
+		return
+	}
+	snapshots := slices.DeleteFunc(state.snapshots, func(snapshot scrollSnapshot) bool {
+		return max(0, position)+snapshot.lineOffset <= -float32(innerHeight) ||
+			min(0, position)+snapshot.lineOffset >= float32(innerHeight)
+	})
+	if len(snapshots) > maxScrollSnapshots {
+		snapshots = append([]scrollSnapshot(nil), snapshots[len(snapshots)-maxScrollSnapshots:]...)
+	}
+	state.snapshots = snapshots
 }

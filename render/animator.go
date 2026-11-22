@@ -43,6 +43,19 @@ type previousScrollFrame struct {
 	layers map[int]drawlist.Layer
 }
 
+func hasNonZeroScrollDelta(meta *screen.FrameMeta) bool {
+	if meta == nil {
+		return false
+	}
+	for _, viewport := range meta.Viewports {
+		if viewport.HasScrollDelta && viewport.ScrollDelta != 0 &&
+			!math.IsNaN(viewport.ScrollDelta) && !math.IsInf(viewport.ScrollDelta, 0) {
+			return true
+		}
+	}
+	return false
+}
+
 func newAnimator(planner *Planner, cfg AnimationConfig, clock Clock) *Animator {
 	if clock == nil {
 		clock = systemClock{}
@@ -214,24 +227,34 @@ func (impl *animatorImpl) scrollDelta(cfg AnimationConfig, state *screen.State, 
 		gridState.width, gridState.height = layer.Width, layer.Height
 		gridState.margins = margins
 		gridState.viewport = viewport
-		gridState.lastScrollDelta = delta
 		far := max(1, cfg.ScrollFarLines)
 		maxClamp := float32(max(innerHeight, far))
 		injected := delta
 		if math.Abs(float64(delta)) > float64(innerHeight) {
 			farLimit := min(float32(innerHeight), float32(far))
 			injected = float32(math.Copysign(float64(farLimit), float64(delta)))
-			gridState.prevInner = nil
-			gridState.prevInnerMetas = nil
-		} else if previous != nil {
-			gridState.prevInner, gridState.prevInnerMetas = scrollPreviousInner(previous.frame, previous.metas, previous.layers[gridID], gridID, margins, cell)
-		} else {
-			gridState.prevInner = nil
-			gridState.prevInnerMetas = nil
+		}
+		for index := range gridState.snapshots {
+			gridState.snapshots[index].lineOffset -= injected
+		}
+		if previous != nil {
+			prevLayer, ok := previous.layers[gridID]
+			if ok && prevLayer.Width == layer.Width && prevLayer.Height == layer.Height &&
+				prevLayer.ScreenRow == layer.ScreenRow && prevLayer.ScreenCol == layer.ScreenCol {
+				prevCommands, prevMetas := scrollPreviousInner(previous.frame, previous.metas, prevLayer, gridID, margins, cell)
+				if len(prevCommands) > 0 {
+					gridState.snapshots = append(gridState.snapshots, scrollSnapshot{
+						commands:   prevCommands,
+						metas:      prevMetas,
+						lineOffset: -injected,
+					})
+				}
+			}
 		}
 		position := float64(gridState.spring.Position + injected)
 		gridState.spring.Position = float32(math.Copysign(math.Min(math.Abs(position), float64(maxClamp)), position))
 		gridState.spring.Velocity = 0
+		trimScrollSnapshots(gridState, gridState.spring.Position, innerHeight)
 	}
 }
 
@@ -241,9 +264,7 @@ func (impl *animatorImpl) updateScroll(dt float32) {
 			continue
 		}
 		state.spring.Reset()
-		state.prevInner = nil
-		state.prevInnerMetas = nil
-		state.lastScrollDelta = 0
+		state.snapshots = nil
 	}
 }
 
@@ -268,7 +289,8 @@ func animatorSubmit(a *Animator, state *screen.State, meta *screen.FrameMeta, li
 	now := impl.clock.Now()
 	cachedList := cloneDrawList(list)
 	var previous *previousScrollFrame
-	if impl.initialized && impl.lastList != nil && !impl.active && !impl.scrollActive() && len(impl.settledFrame.Commands) > 0 {
+	if impl.initialized && impl.lastList != nil && len(impl.settledFrame.Commands) > 0 &&
+		impl.cfg.ScrollEnabled && impl.cfg.ScrollAnimationLength > 0 && hasNonZeroScrollDelta(meta) {
 		previous = &previousScrollFrame{
 			frame:  cloneFrame(impl.settledFrame),
 			metas:  append([]rowMeta(nil), impl.settledMetas...),
@@ -293,9 +315,25 @@ func animatorSubmit(a *Animator, state *screen.State, meta *screen.FrameMeta, li
 	impl.settledMetas = metadataFor(impl.settledFrame).rows
 	impl.scrollDelta(impl.cfg, state, impl.lastMeta, cachedList, previous)
 	cell := impl.planner.resolver.Cell()
-	input := cursorInput{state: state, meta: meta, list: cachedList, frame: impl.settledFrame, metas: impl.settledMetas, cfg: impl.cfg, cell: cell}
 	busy := meta != nil && meta.Busy
 	index := cursorCommandIndex(impl.settledFrame)
+	cursorGrid := int32(0)
+	if state != nil {
+		cursorGrid = int32(state.Cursor.Grid)
+	}
+	if index >= 0 && index < len(impl.settledMetas) {
+		cursorGrid = impl.settledMetas[index].grid
+	}
+	scrolling := false
+	if meta != nil {
+		if viewport, ok := meta.Viewports[int(cursorGrid)]; ok && viewport.HasScrollDelta && viewport.ScrollDelta != 0 {
+			scrolling = true
+		}
+	}
+	if gridState := impl.scroll[int(cursorGrid)]; gridState != nil && gridState.spring.Active() {
+		scrolling = true
+	}
+	input := cursorInput{state: state, meta: meta, list: cachedList, frame: impl.settledFrame, metas: impl.settledMetas, cfg: impl.cfg, cell: cell, scrolling: scrolling}
 	if busy || index < 0 {
 		impl.cursor.active = false
 		impl.cursor.suppressed = true
@@ -347,9 +385,7 @@ func stoppedFrame(impl *animatorImpl) (renderlist.Frame, bool, error) {
 	impl.cursorSpring.Reset()
 	for _, state := range impl.scroll {
 		state.spring.Reset()
-		state.prevInner = nil
-		state.prevInnerMetas = nil
-		state.lastScrollDelta = 0
+		state.snapshots = nil
 	}
 	frame, frameMetas := cursorAnimationFrame(impl.cursor, impl.settledFrame, impl.settledMetas)
 	storeMetadata(impl.settledFrame, frameMetadata{rows: impl.settledMetas})

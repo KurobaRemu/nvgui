@@ -1,6 +1,8 @@
 package render
 
 import (
+	"fmt"
+	"math"
 	"reflect"
 	"testing"
 	"time"
@@ -378,3 +380,196 @@ func approxEqualCursor(a, b, tolerance float32) bool {
 }
 
 var _ = renderlist.Frame{}
+
+func restrainedCursorList(seq uint64, width, height, row, col int) (*screen.State, *drawlist.List) {
+	grid := &screen.Grid{Width: width, Height: height, Cells: make([][]screen.Cell, height)}
+	for rowIndex := 0; rowIndex < height; rowIndex++ {
+		grid.Cells[rowIndex] = make([]screen.Cell, width)
+		for colIndex := range grid.Cells[rowIndex] {
+			grid.Cells[rowIndex][colIndex] = screen.Cell{Text: " "}
+		}
+		line := fmt.Sprintf("restrained_cursor_line_%02d", rowIndex)
+		for colIndex, character := range line {
+			if colIndex >= width {
+				break
+			}
+			grid.Cells[rowIndex][colIndex] = screen.Cell{Text: string(character)}
+		}
+	}
+	state := &screen.State{
+		Seq:           seq,
+		Grids:         map[int]*screen.Grid{1: grid},
+		Attrs:         map[int]screen.Attr{0: {}},
+		DefaultColors: screen.Colors{FG: 0xcdd6f4, BG: 0x1e1e2e},
+		Placements:    map[int]screen.Placement{},
+		Cursor:        screen.Cursor{Grid: 1, Row: row, Col: col},
+		Mode:          "normal",
+	}
+	list, err := drawlist.Build(state)
+	if err != nil {
+		panic(err)
+	}
+	return state, list
+}
+
+func restrainedProjectionSpan(quad [4]ui.Point, ux, uy float64) (float64, float64) {
+	minProj, maxProj := math.Inf(1), math.Inf(-1)
+	for _, point := range quad {
+		projection := float64(point.X)*ux + float64(point.Y)*uy
+		minProj = min(minProj, projection)
+		maxProj = max(maxProj, projection)
+	}
+	return minProj, maxProj
+}
+
+func assertRestrainedCursorSnapped(t *testing.T, label string, anim *Animator, row, col int, cell ui.Point) {
+	t.Helper()
+	quad, ok := anim.CursorQuad()
+	if !ok {
+		t.Fatalf("%s: CursorQuad unavailable", label)
+	}
+	minX, minY, maxX, maxY := quadBounds(quad)
+	wantX := float32(col) * cell.X
+	wantY := float32(row) * cell.Y
+	if math.Abs(float64(minX-wantX)) > 0.75 || math.Abs(float64(minY-wantY)) > 0.75 ||
+		math.Abs(float64(maxX-wantX-cell.X)) > 0.75 || math.Abs(float64(maxY-wantY-cell.Y)) > 0.75 {
+		t.Fatalf("%s: CursorQuad bounds = [%v,%v]x[%v,%v], want cell [%v,%v]x[%v,%v]: %+v",
+			label, minX, maxX, minY, maxY, wantX, wantX+cell.X, wantY, wantY+cell.Y, quad)
+	}
+	if anim.impl.cursor.active {
+		t.Fatalf("%s: cursor animation active during scroll", label)
+	}
+}
+
+func TestCursorRestrainedElasticMaxStretchAndScrollNoZigZag(t *testing.T) {
+	cfg := DefaultAnimationConfig()
+	if cfg.CursorAnimationLength != 0.08 || cfg.CursorShortLength != 0.03 ||
+		cfg.CursorTrailSize != 0.25 || cfg.ScrollAnimationLength != 0.18 {
+		t.Fatalf("DefaultAnimationConfig() = %+v, want scheme B parameters", cfg)
+	}
+	resolver := cursorAnimResolver(t)
+	cell := resolver.Cell()
+	maxCell := math.Max(float64(cell.Width), float64(cell.Height))
+	planner := NewPlanner(resolver)
+
+	for _, jump := range []struct {
+		name          string
+		width, height int
+		targetRow     int
+		targetCol     int
+	}{
+		{name: "28x10", width: 40, height: 20, targetRow: 12, targetCol: 30},
+		{name: "160x60", width: 180, height: 70, targetRow: 62, targetCol: 162},
+	} {
+		t.Run(jump.name, func(t *testing.T) {
+			clock := NewManualClock(time.Unix(1_700_000_000, 0).UTC())
+			anim := NewAnimator(planner, cfg, clock)
+			state, list := restrainedCursorList(1, jump.width, jump.height, 2, 2)
+			if _, _, err := anim.Submit(state, &screen.FrameMeta{Seq: 1}, list); err != nil {
+				t.Fatalf("baseline Submit: %v", err)
+			}
+			state, list = restrainedCursorList(2, jump.width, jump.height, jump.targetRow, jump.targetCol)
+			if _, active, err := anim.Submit(state, &screen.FrameMeta{Seq: 2}, list); err != nil || !active {
+				t.Fatalf("long jump Submit active=%v err=%v", active, err)
+			}
+			dx := float64(jump.targetCol-2) * float64(cell.Width)
+			dy := float64(jump.targetRow-2) * float64(cell.Height)
+			distance := math.Hypot(dx, dy)
+			ux, uy := dx/distance, dy/distance
+			staticSpan := float64(cell.Width)*math.Abs(ux) + float64(cell.Height)*math.Abs(uy)
+			limit := 3.0 * maxCell
+			sawElastic := false
+			for elapsed := 0.0; elapsed <= 320; elapsed += 16 {
+				if elapsed > 0 {
+					clock.Advance(16 * time.Millisecond)
+					if _, _, err := anim.Step(); err != nil {
+						t.Fatalf("Step %vms: %v", elapsed, err)
+					}
+				}
+				quad, ok := anim.CursorQuad()
+				if !ok {
+					t.Fatalf("CursorQuad at %vms unavailable", elapsed)
+				}
+				minProj, maxProj := restrainedProjectionSpan(quad, ux, uy)
+				span := maxProj - minProj
+				if span > limit {
+					t.Fatalf("quad span at %vms = %.3f, exceeds 3*maxCell=%.3f: %+v", elapsed, span, limit, quad)
+				}
+				if elapsed == 16 && span > staticSpan+1.0 {
+					sawElastic = true
+				}
+			}
+			if !sawElastic {
+				t.Fatalf("16ms quad lost restrained elastic stretch (staticSpan=%.3f)", staticSpan)
+			}
+		})
+	}
+
+	t.Run("scroll no zigzag", func(t *testing.T) {
+		clock := NewManualClock(time.Unix(1_700_000_000, 0).UTC())
+		anim := NewAnimator(planner, cfg, clock)
+		sequence := []struct {
+			row, col    int
+			scrollDelta float64
+		}{
+			{row: 2, col: 2, scrollDelta: 0},
+			{row: 2, col: 28, scrollDelta: 4},
+			{row: 2, col: 4, scrollDelta: 4},
+			{row: 2, col: 32, scrollDelta: -4},
+		}
+		for index, item := range sequence {
+			state, list := restrainedCursorList(uint64(index+1), 40, 20, item.row, item.col)
+			meta := &screen.FrameMeta{Seq: uint64(index + 1)}
+			if item.scrollDelta != 0 {
+				meta.Viewports = map[int]screen.Viewport{
+					1: {Grid: 1, TopLine: 0, BotLine: 20, ScrollDelta: item.scrollDelta, HasScrollDelta: true},
+				}
+			}
+			frame, _, err := anim.Submit(state, meta, list)
+			if err != nil {
+				t.Fatalf("Submit %d: %v", index, err)
+			}
+			if cursorCommandIndex(frame) < 0 {
+				t.Fatalf("Submit %d: missing cursor command", index)
+			}
+			assertRestrainedCursorSnapped(t, fmt.Sprintf("Submit %d", index), anim, item.row, item.col,
+				ui.Point{X: cell.Width, Y: cell.Height})
+			if index < len(sequence)-1 {
+				clock.Advance(16 * time.Millisecond)
+				stepFrame, _, err := anim.Step()
+				if err != nil {
+					t.Fatalf("Step %d: %v", index, err)
+				}
+				if cursorCommandIndex(stepFrame) < 0 {
+					t.Fatalf("Step %d: missing cursor command", index)
+				}
+				assertRestrainedCursorSnapped(t, fmt.Sprintf("Step %d", index), anim, item.row, item.col,
+					ui.Point{X: cell.Width, Y: cell.Height})
+			}
+		}
+		lastRow, lastCol := sequence[len(sequence)-1].row, sequence[len(sequence)-1].col
+		for step := 0; step < 200; step++ {
+			clock.Advance(16 * time.Millisecond)
+			_, active, err := anim.Step()
+			if err != nil {
+				t.Fatalf("scroll converge Step %d: %v", step, err)
+			}
+			if active {
+				assertRestrainedCursorSnapped(t, fmt.Sprintf("scroll converge Step %d", step), anim, lastRow, lastCol,
+					ui.Point{X: cell.Width, Y: cell.Height})
+			} else {
+				break
+			}
+		}
+		if anim.impl.scroll[1].spring.Active() {
+			t.Fatal("scroll spring did not settle before non-scroll cursor jump")
+		}
+		state, list := restrainedCursorList(100, 40, 20, 12, 4)
+		if _, active, err := anim.Submit(state, &screen.FrameMeta{Seq: 100}, list); err != nil || !active {
+			t.Fatalf("non-scroll jump Submit active=%v err=%v", active, err)
+		}
+		if !anim.impl.cursor.active {
+			t.Fatal("non-scroll cursor jump did not restore restrained elastic animation")
+		}
+	})
+}
