@@ -28,20 +28,23 @@ import (
 var errShellClosed = errors.New("app: shell is closed")
 
 type shellImpl struct {
-	req       LaunchRequest
-	clipboard Clipboard
-	ctx       context.Context
-	cancel    context.CancelFunc
-	session   *session.Session
-	queue     *input.Queue
-	handler   *input.Handler
-	recorder  *input.TraceRecorder
-	resolver  *text.Resolver
-	planner   *render.Planner
-	animator  *render.Animator
-	animClock *animClock
-	view      *render.View
-	window    *mygo.Window
+	req        LaunchRequest
+	clipboard  Clipboard
+	ctx        context.Context
+	cancel     context.CancelFunc
+	session    *session.Session
+	queue      *input.Queue
+	handler    *input.Handler
+	recorder   *input.TraceRecorder
+	resolver   *text.Resolver
+	planner    *render.Planner
+	animator   *render.Animator
+	animClock  *animClock
+	view       *render.View
+	window     *mygo.Window
+	quitOnExit bool
+	onExit     func(*Shell)
+	onShortcut func(*ui.Context) bool
 
 	mu                    sync.Mutex
 	inputSyncMu           sync.Mutex
@@ -83,6 +86,13 @@ type animClock struct {
 	mu       sync.RWMutex
 	fallback diag.Clock
 	now      time.Time
+}
+
+type shellHooks struct {
+	quitOnExit   bool
+	workspaceGUI bool
+	onExit       func(*Shell)
+	onShortcut   func(*ui.Context) bool
 }
 
 func newAnimClock(clock diag.Clock) *animClock {
@@ -127,6 +137,9 @@ func shellView(shell *Shell, c *ui.Context) {
 	}
 	impl := shell.impl
 	if c != nil {
+		if impl.onShortcut != nil {
+			impl.onShortcut(c)
+		}
 		now := c.Now()
 		impl.mu.Lock()
 		impl.services = c.Services()
@@ -330,6 +343,10 @@ func (impl *shellImpl) preeditLayer(c *ui.Context, preedit string) {
 }
 
 func Start(ctx context.Context, req LaunchRequest, clock diag.Clock, clipboard Clipboard) (*Shell, error) {
+	return startShell(ctx, req, clock, clipboard, shellHooks{quitOnExit: true, workspaceGUI: !req.Headless})
+}
+
+func startShell(ctx context.Context, req LaunchRequest, clock diag.Clock, clipboard Clipboard, hooks shellHooks) (*Shell, error) {
 	if ctx == nil {
 		ctx = context.Background()
 	}
@@ -351,6 +368,9 @@ func Start(ctx context.Context, req LaunchRequest, clock diag.Clock, clipboard C
 	}
 	shell := newShell(req, clock, clipboard)
 	impl := shell.impl
+	impl.quitOnExit = hooks.quitOnExit
+	impl.onExit = hooks.onExit
+	impl.onShortcut = hooks.onShortcut
 	cfg := AnimationConfigFromEnv(req.Env)
 	impl.ctx = ctx
 	impl.cancel = cancel
@@ -389,7 +409,7 @@ func Start(ctx context.Context, req LaunchRequest, clock diag.Clock, clipboard C
 		defer impl.wg.Done()
 		impl.loadNvimAnimationConfig()
 	}()
-	if !req.Headless {
+	if hooks.workspaceGUI {
 		mygo.App.WhenReady(func() {
 			impl.mu.Lock()
 			closed := impl.closed
@@ -578,7 +598,9 @@ func isCleanSessionError(err error) bool {
 func (impl *shellImpl) watchSession() {
 	<-impl.session.Exited()
 	impl.closeOnce.Do(impl.finishClose)
-	if !impl.req.Headless {
+	if impl.onExit != nil {
+		impl.onExit(&Shell{impl: impl})
+	} else if impl.quitOnExit && !impl.req.Headless {
 		impl.quitOnce.Do(func() { mygo.App.Quit() })
 	}
 }

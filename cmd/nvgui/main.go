@@ -32,23 +32,28 @@ func mainWith(argv []string, env []string, cwd string) int {
 		fmt.Fprintln(os.Stderr, "nvgui: parse launch:", err)
 		return 1
 	}
-	shell, err := app.Start(context.Background(), req, nil, nil)
-	if err != nil {
+	opts := app.WorkspaceOptions{BaseRequest: req, Headless: req.Headless}
+	if !req.Headless {
+		opts.OnAllClosed = func() { mygo.App.Quit() }
+	}
+	ws := app.NewWorkspace(opts)
+	if _, _, err := ws.NewWindow(context.Background(), req); err != nil {
 		fmt.Fprintln(os.Stderr, "nvgui: start:", err)
 		return 1
 	}
 	defer func() {
-		if err := shell.Close(); err != nil {
+		if err := ws.Close(); err != nil {
 			fmt.Fprintln(os.Stderr, "nvgui: close:", err)
 		}
 	}()
 	if req.Headless {
-		if err := shell.Close(); err != nil {
+		if err := ws.Close(); err != nil {
 			fmt.Fprintln(os.Stderr, "nvgui: close:", err)
 			return 1
 		}
 		return 0
 	}
+	mygo.App.WhenReady(func() { mygo.App.SetMenu(ws.BuildMenu()) })
 	if err := mygo.App.Run(); err != nil {
 		fmt.Fprintln(os.Stderr, "nvgui: run:", err)
 		return 1
