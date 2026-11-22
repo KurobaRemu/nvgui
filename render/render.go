@@ -17,12 +17,13 @@ import (
 )
 
 type Planner struct {
-	mu         sync.Mutex
-	resolver   *text.Resolver
-	config     text.Config
-	fonts      [4]text.Font
-	otherFonts map[otherFontQuery]text.Font
-	ready      bool
+	mu                sync.Mutex
+	resolver          *text.Resolver
+	config            text.Config
+	fonts             [4]text.Font
+	otherFonts        map[otherFontQuery]text.Font
+	ready             bool
+	ligaturesDisabled bool
 }
 
 type otherFontQuery struct {
@@ -37,6 +38,28 @@ func NewPlanner(resolver *text.Resolver) *Planner {
 	return &Planner{resolver: resolver}
 }
 
+func plannerSetLigaturesEnabled(p *Planner, enabled bool) {
+	if p == nil {
+		return
+	}
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if p.ligaturesDisabled == !enabled {
+		return
+	}
+	p.ligaturesDisabled = !enabled
+	p.ready = false
+}
+
+func plannerLigaturesEnabled(p *Planner) bool {
+	if p == nil {
+		return false
+	}
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return !p.ligaturesDisabled
+}
+
 func (p *Planner) Plan(list *drawlist.List) (renderlist.Frame, error) {
 	if list == nil {
 		return renderlist.Frame{}, fmt.Errorf("render: nil Draw List")
@@ -49,7 +72,7 @@ func (p *Planner) Plan(list *drawlist.List) (renderlist.Frame, error) {
 		return renderlist.Frame{}, fmt.Errorf("render: invalid cell size %+v", cell)
 	}
 
-	fonts, config := p.refreshCache()
+	fonts, config, ligaturesEnabled := p.refreshCache()
 	frame := renderlist.Frame{Version: 1, Seq: list.Seq}
 	itemCount := 0
 	for _, layer := range list.Layers {
@@ -73,7 +96,7 @@ func (p *Planner) Plan(list *drawlist.List) (renderlist.Frame, error) {
 		clip := commandClip(layer.Clip, cell, clipping, true)
 		for itemIndex := 0; itemIndex < len(layer.Items); {
 			item := layer.Items[itemIndex]
-			command, ok, err := p.planItem(layer, item, cell, fonts, config)
+			command, ok, err := p.planItem(layer, item, cell, fonts, config, ligaturesEnabled)
 			if err != nil {
 				return renderlist.Frame{}, fmt.Errorf("render: layer %d item %d: %w", layerIndex, itemIndex, err)
 			}
@@ -167,21 +190,21 @@ func printableASCII(value string) bool {
 	return value[0] >= 0x21 && value[0] <= 0x7e
 }
 
-func (p *Planner) refreshCache() ([4]text.Font, text.Config) {
+func (p *Planner) refreshCache() ([4]text.Font, text.Config, bool) {
 	config := p.resolver.Config()
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	if !p.ready || p.config != config {
 		for bold := 0; bold < 2; bold++ {
 			for italic := 0; italic < 2; italic++ {
-				p.fonts[bold*2+italic] = p.resolver.FontFor("A", bold == 1, italic == 1)
+				p.fonts[bold*2+italic] = text.WithLigatures(p.resolver.FontFor("A", bold == 1, italic == 1), !p.ligaturesDisabled)
 			}
 		}
 		p.otherFonts = make(map[otherFontQuery]text.Font)
 		p.config = config
 		p.ready = true
 	}
-	return p.fonts, p.config
+	return p.fonts, p.config, !p.ligaturesDisabled
 }
 
 func (p *Planner) fontFor(item drawlist.Item, fonts [4]text.Font, config text.Config) text.Font {
@@ -277,7 +300,7 @@ func intersectCellRect(left, right drawlist.Rect) drawlist.Rect {
 	return drawlist.Rect{X: x0, Y: y0, W: x1 - x0, H: y1 - y0}
 }
 
-func (p *Planner) planItem(layer drawlist.Layer, item drawlist.Item, cell text.CellSize, fonts [4]text.Font, config text.Config) (renderlist.Command, bool, error) {
+func (p *Planner) planItem(layer drawlist.Layer, item drawlist.Item, cell text.CellSize, fonts [4]text.Font, config text.Config, ligaturesEnabled bool) (renderlist.Command, bool, error) {
 	if item.Width < 0 || item.Height < 0 {
 		return renderlist.Command{}, false, fmt.Errorf("negative item size %dx%d", item.Width, item.Height)
 	}
@@ -299,6 +322,9 @@ func (p *Planner) planItem(layer drawlist.Layer, item drawlist.Item, cell text.C
 		if item.Text != "" {
 			command.Text = item.Text
 			font := p.fontFor(item, fonts, config)
+			if !allASCIIBytes(item.Text) {
+				font = text.WithLigatures(font, ligaturesEnabled)
+			}
 			command.Family = font.Family
 			command.Size = font.Size
 			command.Weight = font.Weight
@@ -317,6 +343,9 @@ func (p *Planner) planItem(layer drawlist.Layer, item drawlist.Item, cell text.C
 		command.Op = "glyphs"
 		command.Text = item.Text
 		font := p.fontFor(item, fonts, config)
+		if !allASCIIBytes(item.Text) {
+			font = text.WithLigatures(font, ligaturesEnabled)
+		}
 		command.Family = font.Family
 		command.Size = font.Size
 		command.Weight = font.Weight
@@ -578,17 +607,18 @@ func drawStateFor(p *ui.Painter) (drawState, bool) {
 }
 
 type rowKey struct {
-	grid     int
-	row      int
-	text     string
-	attrMask uint16
-	fg       uint32
-	bg       uint32
-	family   string
-	size     float32
-	weight   int
-	italic   bool
-	features string
+	grid      int
+	row       int
+	text      string
+	attrMask  uint16
+	fg        uint32
+	bg        uint32
+	family    string
+	size      float32
+	weight    int
+	italic    bool
+	features  string
+	cellWidth float32
 }
 
 const rowCacheCapacity = 4096
@@ -635,6 +665,9 @@ func (cache *rowCache) glyphRun(command renderlist.Command, meta rowMeta) ([]ui.
 	}
 	font := commandFont(command)
 	entry.glyphs = ui.Shape(command.Text, font)
+	if meta.cellWidth > 0 && len(command.Text) > 1 && allASCIIBytes(command.Text) {
+		anchorGlyphClustersToCells(entry.glyphs, meta.cellWidth)
+	}
 	entry.ascent = cachedAscent(font)
 	element := cache.order.PushFront(entry)
 	cache.rows[key] = element
@@ -656,17 +689,34 @@ func rowCacheKey(command renderlist.Command, meta rowMeta) rowKey {
 		row = meta.row
 	}
 	return rowKey{
-		grid:     meta.grid,
-		row:      row,
-		text:     command.Text,
-		attrMask: meta.attrMask,
-		fg:       command.FG,
-		bg:       command.BG,
-		family:   command.Family,
-		size:     command.Size,
-		weight:   command.Weight,
-		italic:   command.Italic,
-		features: command.Features,
+		grid:      meta.grid,
+		row:       row,
+		text:      command.Text,
+		attrMask:  meta.attrMask,
+		fg:        command.FG,
+		bg:        command.BG,
+		family:    command.Family,
+		size:      command.Size,
+		weight:    command.Weight,
+		italic:    command.Italic,
+		features:  command.Features,
+		cellWidth: meta.cellWidth,
+	}
+}
+
+func anchorGlyphClustersToCells(glyphs []ui.Glyph, cellWidth float32) {
+	for start := 0; start < len(glyphs); {
+		end := start + 1
+		for end < len(glyphs) && glyphs[end].Cluster == glyphs[start].Cluster {
+			end++
+		}
+		dx := float32(glyphs[start].Cluster)*cellWidth - glyphs[start].X
+		if dx != 0 {
+			for index := start; index < end; index++ {
+				glyphs[index].X += dx
+			}
+		}
+		start = end
 	}
 }
 
@@ -861,7 +911,10 @@ func drawGlyphs(p *ui.Painter, command renderlist.Command, cache *rowCache, meta
 	}
 	glyphs, ascent := cache.glyphRun(command, meta)
 	baseline := command.Y + ascent
-	offsetX := glyphCenterOffset(glyphs, command.W)
+	offsetX := float32(0)
+	if !(meta.cellWidth > 0 && len(command.Text) > 1 && allASCIIBytes(command.Text)) {
+		offsetX = glyphCenterOffset(glyphs, command.W)
+	}
 	p.Glyphs(glyphs, command.X+offsetX, baseline, color(command.FG))
 	drawDecorations(p, command, meta, cellWidth)
 }

@@ -77,10 +77,13 @@ func animatorSetConfig(a *Animator, cfg AnimationConfig) {
 	impl := a.impl
 	impl.mu.Lock()
 	defer impl.mu.Unlock()
+	beforeLigatures := impl.planner != nil && impl.planner.LigaturesEnabled()
+	baselineExpired := len(impl.settledFrame.Commands) == 0
 	impl.cfg = cfg
 	if impl.planner != nil {
 		impl.planner.SetLigaturesEnabled(cfg.LigaturesEnabled)
 	}
+	ligaturesChanged := beforeLigatures != (impl.planner != nil && impl.planner.LigaturesEnabled())
 	cursorDisabled := !cfg.CursorEnabled || cfg.CursorAnimationLength <= 0
 	if cursorDisabled {
 		impl.cursorSpring.Reset()
@@ -100,17 +103,23 @@ func animatorSetConfig(a *Animator, cfg AnimationConfig) {
 	if !impl.scrollActive() && (cursorDisabled || impl.cursor == nil || !impl.cursor.active) {
 		impl.active = false
 	}
+	animationsDisabled := !impl.active && !impl.scrollActive() && (impl.cursor == nil || !impl.cursor.active)
 	if impl.initialized && impl.planner != nil && impl.lastList != nil {
 		settledFrame, err := impl.planner.Plan(impl.lastList)
 		if err == nil {
-			impl.settledFrame = cloneFrame(settledFrame)
-			impl.settledMetas = metadataFor(impl.settledFrame)
+			refreshBaseline := ligaturesChanged || baselineExpired || animationsDisabled
+			if refreshBaseline {
+				impl.settledFrame = cloneFrame(settledFrame)
+				impl.settledMetas = metadataFor(impl.settledFrame)
+			}
 			storeMetadata(impl.settledFrame, impl.settledMetas)
 			settled, settledMetas := impl.composedFrame(impl.settledFrame, impl.settledMetas)
 			frame, frameMetas := cursorAnimationFrame(impl.cursor, settled, settledMetas)
 			storeMetadata(frame, frameMetas)
-			impl.latestFrame = cloneFrame(frame)
-			impl.latestMetas = append([]rowMeta(nil), frameMetas...)
+			if refreshBaseline {
+				impl.latestFrame = cloneFrame(frame)
+				impl.latestMetas = append([]rowMeta(nil), frameMetas...)
+			}
 		}
 	}
 	impl.lastTime = impl.clock.Now()
