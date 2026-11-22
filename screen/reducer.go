@@ -3,15 +3,20 @@ package screen
 import (
 	"fmt"
 	"sort"
+	"sync"
 	"sync/atomic"
 
 	"nvgui/protocol"
 )
 
 type Reducer struct {
-	working *State
-	seq     uint64
-	latest  atomic.Pointer[State]
+	working     *State
+	seq         uint64
+	latest      atomic.Pointer[State]
+	metaMu      sync.Mutex
+	workingMeta *FrameMeta
+	latestMeta  atomic.Pointer[FrameMeta]
+	metasBySeq  *metaHistory
 }
 
 func NewReducer() *Reducer {
@@ -27,26 +32,47 @@ func NewReducer() *Reducer {
 func (r *Reducer) Apply(events []protocol.Event) ([]*State, error) {
 	committed := make([]*State, 0)
 	checkpoint := cloneState(r.working)
+	r.metaMu.Lock()
+	metaCheckpoint := cloneFrameMeta(r.workingFrameMetaLocked())
 	committedLatest := r.latest.Load()
+	committedMeta := r.latestMeta.Load()
 	committedSeq := r.seq
+	r.metaMu.Unlock()
 	restore := func() {
+		r.metaMu.Lock()
+		defer r.metaMu.Unlock()
 		r.working = cloneState(checkpoint)
+		r.workingMeta = cloneFrameMeta(metaCheckpoint)
 		r.seq = committedSeq
 		r.latest.Store(committedLatest)
+		r.latestMeta.Store(committedMeta)
 	}
 	for _, event := range events {
 		switch typed := event.(type) {
 		case protocol.Flush:
+			r.metaMu.Lock()
 			r.seq++
 			r.working.Seq = r.seq
 			published := cloneState(r.working)
-			r.latest.Store(published)
+			meta := cloneFrameMeta(r.workingFrameMetaLocked())
+			meta.Seq = r.seq
+			r.publishMetaLocked(meta)
+			r.workingMeta.Seq = r.seq
+			committedMeta = r.latestMeta.Load()
+			for gridID, viewport := range r.workingMeta.Viewports {
+				viewport.ScrollDelta = 0
+				viewport.HasScrollDelta = false
+				r.workingMeta.Viewports[gridID] = viewport
+			}
+			metaCheckpoint = cloneFrameMeta(r.workingMeta)
 			checkpoint = cloneState(r.working)
 			committedLatest = published
 			committedSeq = r.seq
+			r.latest.Store(published)
 			committed = append(committed, published)
+			r.metaMu.Unlock()
 		default:
-			if err := applyEvent(r.working, typed); err != nil {
+			if err := applyEvent(r.working, typed, r); err != nil {
 				restore()
 				return committed, err
 			}
@@ -132,19 +158,21 @@ func Layers(s *State) []Layer {
 	return result
 }
 
-func applyEvent(state *State, event protocol.Event) error {
+func applyEvent(state *State, event protocol.Event, reducer *Reducer) error {
 	switch event := event.(type) {
 	case protocol.HlAttrDefine:
 		return applyHlAttrDefine(state, event)
 	case protocol.GridResize:
-		return applyGridResize(state, event)
+		return applyGridResizeWithReducer(state, event, reducer)
 	case protocol.GridLine:
 		return applyGridLine(state, event)
 	case protocol.GridScroll:
 		return applyGridScroll(state, event)
 	case protocol.GridClear:
+		reducer.clearFrameMetaScrollDelta(event.Grid)
 		return applyGridClear(state, event)
 	case protocol.GridDestroy:
+		reducer.clearFrameMetaGrid(event.Grid)
 		delete(state.Grids, event.Grid)
 		delete(state.Placements, event.Grid)
 		return nil
@@ -187,9 +215,11 @@ func applyEvent(state *State, event protocol.Event) error {
 		state.Placements[event.Grid] = Placement{Kind: PlacedExternal, Win: int64(event.Win)}
 		return nil
 	case protocol.WinHide:
+		reducer.clearFrameMetaScrollDelta(event.Grid)
 		delete(state.Placements, event.Grid)
 		return nil
 	case protocol.WinClose:
+		reducer.clearFrameMetaScrollDelta(event.Grid)
 		if placement, found := state.Placements[event.Grid]; found && placement.Kind != PlacedWin {
 			delete(state.Placements, event.Grid)
 		}
@@ -204,12 +234,22 @@ func applyEvent(state *State, event protocol.Event) error {
 			CompIndex: event.CompIndex,
 		}
 		return nil
+	case protocol.Unknown:
+		reducer.applyFrameMetaEvent(state, event)
+		return nil
 	default:
 		return nil
 	}
 }
 
 func applyGridResize(state *State, event protocol.GridResize) error {
+	return applyGridResizeWithReducer(state, event, nil)
+}
+
+func applyGridResizeWithReducer(state *State, event protocol.GridResize, reducer *Reducer) error {
+	if reducer != nil {
+		reducer.clearFrameMetaScrollDelta(event.Grid)
+	}
 	if event.Width < 0 || event.Height < 0 {
 		return fmt.Errorf("screen: grid %d has negative size %dx%d", event.Grid, event.Width, event.Height)
 	}
