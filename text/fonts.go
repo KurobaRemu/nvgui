@@ -73,6 +73,41 @@ func ParseGUIFont(value string) ([]Font, error) {
 	return fonts, nil
 }
 
+func normalizePrimaryFonts(value string, index fontFamilyIndex) ([]Font, error) {
+	fonts, err := ParseGUIFont(value)
+	if err != nil {
+		return nil, err
+	}
+	selected := make([]Font, 0, len(fonts))
+	for _, font := range fonts {
+		family := strings.TrimSpace(font.Family)
+		if family == "" {
+			continue
+		}
+		if !strings.EqualFold(family, genericMonospaceFamily) {
+			installed, ok := index.byName[strings.ToLower(family)]
+			if !ok {
+				continue
+			}
+			family = installed.Name
+		}
+		font.Family = family
+		selected = append(selected, font)
+	}
+	if len(selected) == 0 {
+		fallback := fonts[0]
+		fallback.Family = defaultMonospaceFamily(index)
+		if fallback.Size <= 0 {
+			fallback.Size = defaultFontSize
+		}
+		if fallback.Weight <= 0 {
+			fallback.Weight = defaultFontWeight
+		}
+		selected = append(selected, fallback)
+	}
+	return selected, nil
+}
+
 func BuiltinFallbacks() []Font {
 	entries := builtinFallbackEntries()
 	fonts := make([]Font, 0, len(entries))
@@ -169,7 +204,7 @@ func splitGUIFont(value string) ([]guifontEntry, error) {
 	for _, character := range value {
 		if escaped {
 			switch character {
-			case '_':
+			case '_', ' ':
 				builder.WriteByte(' ')
 			case ',', ':', '\\':
 				builder.WriteRune(character)

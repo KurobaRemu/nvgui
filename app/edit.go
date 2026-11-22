@@ -6,6 +6,8 @@ import (
 	"github.com/egoist/mygo/ui"
 )
 
+const maxPasteChunkBytes = 1024
+
 func (s *Shell) HandleEditCommand(c *ui.Context, ev ui.InputEvent) bool {
 	if s == nil || s.impl == nil || s.impl.checkOpen() != nil || s.impl.session == nil {
 		return false
@@ -88,7 +90,39 @@ func (impl *shellImpl) pasteFromClipboard() bool {
 	}
 	textValue = strings.ReplaceAll(textValue, "\r\n", "\n")
 	textValue = strings.ReplaceAll(textValue, "\r", "\n")
-	return impl.queue.Enqueue(ui.InputEvent{Kind: ui.InputText, Text: textValue}) == nil
+	for _, chunk := range pasteChunks(textValue, maxPasteChunkBytes) {
+		if err := impl.queue.Enqueue(ui.InputEvent{Kind: ui.InputText, Text: chunk}); err != nil {
+			return false
+		}
+	}
+	return true
+}
+
+func pasteChunks(value string, limit int) []string {
+	if limit < 1 {
+		limit = 1
+	}
+	if len(value) <= limit {
+		if value == "" {
+			return nil
+		}
+		return []string{value}
+	}
+	chunks := make([]string, 0, (len(value)+limit-1)/limit)
+	for start := 0; start < len(value); {
+		end := min(start+limit, len(value))
+		for end < len(value) && value[end]&0xc0 == 0x80 {
+			end++
+		}
+		if end < len(value) {
+			for end > start+1 && (value[end-1] == '<' || value[end-1] == '\\') {
+				end--
+			}
+		}
+		chunks = append(chunks, value[start:end])
+		start = end
+	}
+	return chunks
 }
 
 func (impl *shellImpl) readRegister() (string, error) {

@@ -169,12 +169,12 @@ func resolverClearCache(resolver *Resolver) {
 func parseUserFonts(value string, index fontFamilyIndex) ([]Font, error) {
 	if strings.TrimSpace(value) == "" {
 		return []Font{{
-			Family: defaultMonospaceFamily(index),
+			Family: genericMonospaceFamily,
 			Size:   defaultFontSize,
 			Weight: defaultFontWeight,
 		}}, nil
 	}
-	return ParseGUIFont(value)
+	return normalizePrimaryFonts(value, index)
 }
 
 func builtinFallbackEntriesFromIndex(index fontFamilyIndex) []fallbackEntry {
