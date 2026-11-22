@@ -19,6 +19,8 @@ import (
 	"nvgui/drawlist"
 	"nvgui/input"
 	"nvgui/render"
+	"nvgui/renderlist"
+	"nvgui/screen"
 	"nvgui/session"
 	"nvgui/text"
 )
@@ -36,6 +38,8 @@ type shellImpl struct {
 	recorder  *input.TraceRecorder
 	resolver  *text.Resolver
 	planner   *render.Planner
+	animator  *render.Animator
+	animClock *animClock
 	view      *render.View
 	window    *mygo.Window
 
@@ -55,6 +59,14 @@ type shellImpl struct {
 	inFlightRows      int
 	resizeInFlight    bool
 	forwardedInputSeq uint64
+	lastGUIFont       string
+	failedGUIFont     string
+	lastAnimNow       time.Time
+	explicitConfig    bool
+	configDirty       bool
+	configGeneration  uint64
+	envConfigKeys     map[string]bool
+	explicitKeys      map[string]bool
 
 	closeOnce sync.Once
 	quitOnce  sync.Once
@@ -64,13 +76,45 @@ type shellImpl struct {
 	started   bool
 }
 
-func newShell(req LaunchRequest, _ diag.Clock, clipboard Clipboard) *Shell {
+type animClock struct {
+	mu       sync.RWMutex
+	fallback diag.Clock
+	now      time.Time
+}
+
+func newAnimClock(clock diag.Clock) *animClock {
+	return &animClock{fallback: clock}
+}
+
+func (clock *animClock) Now() time.Time {
+	clock.mu.RLock()
+	now, fallback := clock.now, clock.fallback
+	clock.mu.RUnlock()
+	if !now.IsZero() {
+		return now
+	}
+	if fallback != nil {
+		return fallback.Now()
+	}
+	return time.Now()
+}
+
+func (clock *animClock) Sync(now time.Time) {
+	clock.mu.Lock()
+	clock.now = now
+	clock.mu.Unlock()
+}
+
+func newShell(req LaunchRequest, clock diag.Clock, clipboard Clipboard) *Shell {
 	return &Shell{impl: &shellImpl{
-		req:       req,
-		clipboard: clipboard,
-		closing:   make(chan struct{}),
-		closeDone: make(chan struct{}),
-		resizeCh:  make(chan struct{}, 1),
+		req:           req,
+		clipboard:     clipboard,
+		animClock:     newAnimClock(clock),
+		envConfigKeys: envConfigKeys(req.Env),
+		explicitKeys:  make(map[string]bool),
+		closing:       make(chan struct{}),
+		closeDone:     make(chan struct{}),
+		resizeCh:      make(chan struct{}, 1),
 	}}
 }
 
@@ -80,11 +124,15 @@ func shellView(shell *Shell, c *ui.Context) {
 	}
 	impl := shell.impl
 	if c != nil {
+		now := c.Now()
 		impl.mu.Lock()
 		impl.services = c.Services()
 		impl.mu.Unlock()
+		impl.animClock.Sync(now)
+		impl.refreshFrameWithContext(c, now, c.Instant())
+	} else {
+		impl.refreshFrameWithContext(nil, impl.animClock.Now(), false)
 	}
-	impl.refreshFrame()
 	shell.AttachInput(c)
 }
 
@@ -166,7 +214,7 @@ func (s *Shell) Resize(width, height int) error {
 	default:
 	}
 	impl.mu.Unlock()
-	cell := impl.resolver.Cell()
+	cell := impl.cell()
 	cols := cellsFor(width, cell.Width)
 	rows := cellsFor(height, cell.Height)
 	if cols < 1 {
@@ -234,7 +282,12 @@ func (s *Shell) AttachInput(c *ui.Context) ui.Element {
 		return handled
 	}).TextCaret(impl.caret()).InputMethod(impl.handler.IMEAllowed())
 	inputBox.Children(func() {
-		impl.view.Draw(c).IgnoreInput(true)
+		impl.mu.Lock()
+		view := impl.view
+		impl.mu.Unlock()
+		if view != nil {
+			view.Draw(c).IgnoreInput(true)
+		}
 		if preedit := impl.handler.Preedit(); preedit != "" {
 			impl.preeditLayer(c, preedit)
 		}
@@ -243,12 +296,18 @@ func (s *Shell) AttachInput(c *ui.Context) ui.Element {
 }
 
 func (impl *shellImpl) preeditLayer(c *ui.Context, preedit string) {
-	caret := impl.caret()
-	if caret.H <= 0 && impl.resolver != nil {
-		caret.H = impl.resolver.Cell().Height
+	impl.mu.Lock()
+	resolver := impl.resolver
+	impl.mu.Unlock()
+	if resolver == nil {
+		return
 	}
-	font := impl.resolver.FontFor(preedit, false, false)
-	glyphs := impl.resolver.Shape(preedit, font)
+	caret := impl.caret()
+	if caret.H <= 0 {
+		caret.H = resolver.Cell().Height
+	}
+	font := resolver.FontFor(preedit, false, false)
+	glyphs := resolver.Shape(preedit, font)
 	width := float32(0)
 	for _, glyph := range glyphs {
 		width = max(width, glyph.X+glyph.Advance)
@@ -272,10 +331,15 @@ func Start(ctx context.Context, req LaunchRequest, clock diag.Clock, clipboard C
 		ctx = context.Background()
 	}
 	ctx, cancel := context.WithCancel(ctx)
-	resolver, err := text.NewResolver(text.Config{Scale: 1})
+	guiFont := GUIFontFromEnv(req.Env)
+	resolver, err := text.NewResolver(text.Config{GUIFont: guiFont, Scale: 1})
 	if err != nil {
-		cancel()
-		return nil, fmt.Errorf("app: create font resolver: %w", err)
+		guiFont = ""
+		resolver, err = text.NewResolver(text.Config{Scale: 1})
+		if err != nil {
+			cancel()
+			return nil, fmt.Errorf("app: create font resolver: %w", err)
+		}
 	}
 	sess, err := session.Start(ctx, req.ConnectionOptions(), clock)
 	if err != nil {
@@ -284,11 +348,14 @@ func Start(ctx context.Context, req LaunchRequest, clock diag.Clock, clipboard C
 	}
 	shell := newShell(req, clock, clipboard)
 	impl := shell.impl
+	cfg := AnimationConfigFromEnv(req.Env)
 	impl.ctx = ctx
 	impl.cancel = cancel
 	impl.lastColumns, impl.lastRows = -1, -1
 	impl.resolver = resolver
 	impl.planner = render.NewPlanner(resolver)
+	impl.animator = render.NewAnimator(impl.planner, cfg, impl.animClock)
+	impl.lastGUIFont = guiFont
 	impl.view = render.NewView()
 	impl.recorder = input.NewTraceRecorder()
 	impl.queue = input.NewQueue(sess.Nvim(), impl.recorder)
@@ -297,7 +364,7 @@ func Start(ctx context.Context, req LaunchRequest, clock diag.Clock, clipboard C
 	impl.mu.Lock()
 	impl.started = true
 	impl.mu.Unlock()
-	impl.wg.Add(4)
+	impl.wg.Add(5)
 	go func() {
 		defer impl.wg.Done()
 		impl.watchResize()
@@ -314,6 +381,10 @@ func Start(ctx context.Context, req LaunchRequest, clock diag.Clock, clipboard C
 		defer impl.wg.Done()
 		impl.watchRedraw()
 	}()
+	go func() {
+		defer impl.wg.Done()
+		impl.loadNvimAnimationConfig()
+	}()
 	if !req.Headless {
 		mygo.App.WhenReady(func() {
 			impl.mu.Lock()
@@ -323,7 +394,7 @@ func Start(ctx context.Context, req LaunchRequest, clock diag.Clock, clipboard C
 				impl.quitOnce.Do(func() { mygo.App.Quit() })
 				return
 			}
-			cell := resolver.Cell()
+			cell := impl.cell()
 			window := mygo.NewWindow(mygo.WindowOptions{
 				Title:          "nvgui",
 				Width:          windowDimension(req.Width, defaultColumns, cell.Width),
@@ -342,10 +413,8 @@ func Start(ctx context.Context, req LaunchRequest, clock diag.Clock, clipboard C
 				go func() { _ = shell.Close() }()
 			})
 			width, height := window.ContentSize()
-			if err := shell.Resize(width, height); err != nil {
-				if !isCleanSessionError(err) {
-					impl.recordCloseError(fmt.Errorf("app: initial resize: %w", err))
-				}
+			if err := shell.Resize(width, height); err != nil && !isCleanSessionError(err) {
+				impl.recordCloseError(fmt.Errorf("app: initial resize: %w", err))
 			}
 			if impl.isClosing() {
 				impl.quitOnce.Do(func() { mygo.App.Quit() })
@@ -523,16 +592,12 @@ func (impl *shellImpl) watchRedraw() {
 			return
 		case <-ticker.C:
 			state := impl.session.Latest()
-			if state == nil {
-				continue
-			}
-			if state.Seq == seenSeq {
+			if state == nil || state.Seq == seenSeq {
 				continue
 			}
 			seenSeq = state.Seq
 			impl.mu.Lock()
-			window := impl.window
-			services := impl.services
+			window, services := impl.window, impl.services
 			impl.mu.Unlock()
 			impl.handler.SetMode(state.Mode)
 			if window != nil {
@@ -545,42 +610,297 @@ func (impl *shellImpl) watchRedraw() {
 }
 
 func (impl *shellImpl) caret() ui.Rect {
-	if impl.view == nil || impl.resolver == nil || impl.session == nil || impl.handler == nil {
+	impl.mu.Lock()
+	view, resolver, session, handler := impl.view, impl.resolver, impl.session, impl.handler
+	impl.mu.Unlock()
+	if view == nil || resolver == nil || session == nil || handler == nil {
 		return ui.Rect{}
 	}
-	caret := impl.view.Caret()
+	caret := view.Caret()
 	if caret != (ui.Rect{}) {
 		return caret
 	}
-	cell := impl.resolver.Cell()
-	return impl.handler.CaretFor(impl.session.Latest(), input.CellSize{Width: cell.Width, Height: cell.Height})
+	cell := resolver.Cell()
+	return handler.CaretFor(session.Latest(), input.CellSize{Width: cell.Width, Height: cell.Height})
 }
 
 func (impl *shellImpl) refreshFrame() {
-	if impl.session == nil || impl.view == nil || impl.planner == nil {
+	impl.refreshFrameWithContext(nil, impl.animClock.Now(), false)
+}
+
+func cloneFrameMetaWithoutScroll(meta *screen.FrameMeta) *screen.FrameMeta {
+	if meta == nil {
+		return nil
+	}
+	clone := *meta
+	if meta.Viewports != nil {
+		clone.Viewports = make(map[int]screen.Viewport, len(meta.Viewports))
+		for gridID, viewport := range meta.Viewports {
+			viewport.ScrollDelta = 0
+			viewport.HasScrollDelta = false
+			clone.Viewports[gridID] = viewport
+		}
+	}
+	return &clone
+}
+
+func (impl *shellImpl) refreshFrameWithContext(c *ui.Context, now time.Time, instant bool) {
+	impl.mu.Lock()
+	session, view, planner, animator, resolver, handler := impl.session, impl.view, impl.planner, impl.animator, impl.resolver, impl.handler
+	impl.mu.Unlock()
+	if session == nil || view == nil || planner == nil || animator == nil || resolver == nil || handler == nil {
 		return
 	}
-	state := impl.session.Latest()
+	state, meta := session.LatestSnapshot()
 	if state == nil {
 		return
 	}
+	if instant {
+		meta = cloneFrameMetaWithoutScroll(meta)
+	}
+
 	impl.mu.Lock()
-	if state.Seq == impl.lastSeq {
+	snapshot := struct {
+		newSeq        bool
+		configDirty   bool
+		generation    uint64
+		lastAnimNow   time.Time
+		active        bool
+		lastGUIFont   string
+		failedGUIFont string
+		services      ui.Services
+		window        *mygo.Window
+		closed        bool
+	}{
+		newSeq:        state.Seq != impl.lastSeq,
+		configDirty:   impl.configDirty,
+		generation:    impl.configGeneration,
+		lastAnimNow:   impl.lastAnimNow,
+		active:        impl.animator.Active(),
+		lastGUIFont:   impl.lastGUIFont,
+		failedGUIFont: impl.failedGUIFont,
+		services:      impl.services,
+		window:        impl.window,
+		closed:        impl.closed,
+	}
+	impl.mu.Unlock()
+	if snapshot.closed {
+		return
+	}
+	stepOnly := !instant && !snapshot.newSeq && !snapshot.configDirty && snapshot.active && now.After(snapshot.lastAnimNow)
+	if !instant && !snapshot.newSeq && !snapshot.configDirty && (!snapshot.active || !now.After(snapshot.lastAnimNow)) {
+		if c != nil && snapshot.active {
+			c.AnimationFrame()
+		}
+		return
+	}
+
+	cellChanged := false
+	if meta != nil && meta.GUIFont != "" && meta.GUIFont != snapshot.lastGUIFont && meta.GUIFont != snapshot.failedGUIFont {
+		resolver, err := text.NewResolver(text.Config{GUIFont: meta.GUIFont, Scale: 1})
+		if err != nil {
+			impl.mu.Lock()
+			impl.failedGUIFont = meta.GUIFont
+			impl.mu.Unlock()
+		} else {
+			impl.mu.Lock()
+			oldCell := impl.resolver.Cell()
+			cfg := impl.animator.Config()
+			impl.resolver = resolver
+			impl.planner = render.NewPlanner(resolver)
+			impl.animator = render.NewAnimator(impl.planner, cfg, impl.animClock)
+			planner, animator = impl.planner, impl.animator
+			impl.lastGUIFont = meta.GUIFont
+			impl.failedGUIFont = ""
+			impl.configDirty = true
+			impl.configGeneration++
+			snapshot.configDirty = true
+			snapshot.generation = impl.configGeneration
+			cellChanged = resolver.Cell() != oldCell
+			stepOnly = false
+			impl.mu.Unlock()
+		}
+	}
+
+	savedConfig := animator.Config()
+	if instant {
+		instantConfig := savedConfig
+		instantConfig.CursorEnabled = false
+		instantConfig.ScrollEnabled = false
+		animator.SetConfig(instantConfig)
+		defer animator.SetConfig(savedConfig)
+	}
+
+	var frame renderlist.Frame
+	var active bool
+	var err error
+	if stepOnly {
+		frame, active, err = animator.Step()
+		impl.mu.Lock()
+		impl.lastAnimNow = now
+		impl.mu.Unlock()
+	} else {
+		list, buildErr := drawlist.Build(state)
+		if buildErr != nil {
+			return
+		}
+		frame, active, err = animator.Submit(state, meta, list)
+		if err != nil {
+			return
+		}
+		impl.mu.Lock()
+		impl.lastSeq = state.Seq
+		impl.lastAnimNow = now
+		if snapshot.configDirty && impl.configGeneration == snapshot.generation {
+			impl.configDirty = false
+		}
+		impl.mu.Unlock()
+	}
+	if err != nil {
+		return
+	}
+	if len(frame.Commands) != 0 {
+		view.SetFrame(frame)
+		handler.SetMode(state.Mode)
+	}
+	if instant {
+		active = false
+	}
+	if cellChanged {
+		impl.queueCellResize(true, snapshot.services, snapshot.window)
+	}
+	if c != nil && active && !instant {
+		c.AnimationFrame()
+	}
+}
+
+func (impl *shellImpl) cell() text.CellSize {
+	impl.mu.Lock()
+	resolver := impl.resolver
+	impl.mu.Unlock()
+	if resolver == nil {
+		return text.CellSize{}
+	}
+	return resolver.Cell()
+}
+
+func (impl *shellImpl) queueCellResize(cellChanged bool, services ui.Services, window *mygo.Window) {
+	cell := impl.cell()
+	if cell.Width <= 0 || cell.Height <= 0 || !cellChanged {
+		return
+	}
+	impl.mu.Lock()
+	impl.lastColumns, impl.lastRows = -1, -1
+	impl.mu.Unlock()
+	if window != nil {
+		width, height := window.ContentSize()
+		if err := (&Shell{impl: impl}).Resize(width, height); err != nil && !isCleanSessionError(err) {
+			impl.recordCloseError(fmt.Errorf("app: font resize: %w", err))
+		}
+		return
+	}
+	services.Invalidate()
+}
+
+var animationEnvKeys = []string{
+	"NVGUI_CURSOR_ANIM",
+	"NVGUI_CURSOR_ANIMATE_COMMAND_LINE",
+	"NVGUI_CURSOR_ANIMATE_INSERT",
+	"NVGUI_SCROLL_ANIM",
+	"NVGUI_LIGATURES",
+	"NVGUI_NO_ANIMATIONS",
+}
+
+func (impl *shellImpl) loadNvimAnimationConfig() {
+	select {
+	case <-impl.closing:
+		return
+	case <-impl.ctx.Done():
+		return
+	case <-impl.session.Exited():
+		return
+	default:
+	}
+	result := make(map[string]any)
+	const expression = `{'nvgui_cursor_animation': get(g:, 'nvgui_cursor_animation', v:null), ` +
+		`'nvgui_cursor_animation_length': get(g:, 'nvgui_cursor_animation_length', v:null), ` +
+		`'nvgui_cursor_animate_command_line': get(g:, 'nvgui_cursor_animate_command_line', v:null), ` +
+		`'nvgui_scroll_animation': get(g:, 'nvgui_scroll_animation', v:null), ` +
+		`'nvgui_scroll_animation_length': get(g:, 'nvgui_scroll_animation_length', v:null), ` +
+		`'nvgui_ligatures': get(g:, 'nvgui_ligatures', v:null)}`
+	if err := impl.session.Nvim().Eval(expression, &result); err != nil {
+		return
+	}
+	hasExplicitValue := false
+	for _, value := range result {
+		if value != nil {
+			hasExplicitValue = true
+			break
+		}
+	}
+	if !hasExplicitValue {
+		return
+	}
+	impl.mu.Lock()
+	if impl.closed {
 		impl.mu.Unlock()
 		return
 	}
-	impl.mu.Unlock()
-	list, err := drawlist.Build(state)
-	if err != nil {
+	explicit := impl.explicitConfig
+	explicitKeys := impl.explicitKeys
+	envKeys := impl.envConfigKeys
+	masterValue, masterSet := envBool(impl.req.Env, "NVGUI_NO_ANIMATIONS")
+	noAnimations := masterSet && masterValue
+	cfg := impl.animator.Config()
+	changed := false
+	overridden := func(envKey string) bool {
+		return explicit || explicitKeys[envKey] || envKeys[envKey] ||
+			(noAnimations && (envKey == "NVGUI_CURSOR_ANIM" || envKey == "NVGUI_SCROLL_ANIM"))
+	}
+	applyBool := func(key, envKey string, target *bool) {
+		if overridden(envKey) {
+			return
+		}
+		value, ok := result[key]
+		if !ok || value == nil {
+			return
+		}
+		parsed, ok := valueToBool(value)
+		if !ok || *target == parsed {
+			return
+		}
+		*target = parsed
+		changed = true
+	}
+	applyBool("nvgui_cursor_animation", "NVGUI_CURSOR_ANIM", &cfg.CursorEnabled)
+	applyBool("nvgui_cursor_animate_command_line", "NVGUI_CURSOR_ANIMATE_COMMAND_LINE", &cfg.CursorAnimateCommandLine)
+	applyBool("nvgui_scroll_animation", "NVGUI_SCROLL_ANIM", &cfg.ScrollEnabled)
+	applyBool("nvgui_ligatures", "NVGUI_LIGATURES", &cfg.LigaturesEnabled)
+	if !explicit && !overridden("NVGUI_SCROLL_ANIM") {
+		if value, ok := result["nvgui_scroll_animation_length"]; ok && value != nil {
+			if parsed, ok := valueToFloat(value); ok && parsed > 0 && cfg.ScrollAnimationLength != float32(parsed) {
+				cfg.ScrollAnimationLength = float32(parsed)
+				changed = true
+			}
+		}
+	}
+	if !explicit && !overridden("NVGUI_CURSOR_ANIM") {
+		if value, ok := result["nvgui_cursor_animation_length"]; ok && value != nil {
+			if parsed, ok := valueToFloat(value); ok && parsed > 0 && cfg.CursorAnimationLength != float32(parsed) {
+				cfg.CursorAnimationLength = float32(parsed)
+				changed = true
+			}
+		}
+	}
+	if !changed {
+		impl.mu.Unlock()
 		return
 	}
-	frame, err := impl.planner.Plan(list)
-	if err != nil {
-		return
-	}
-	impl.mu.Lock()
-	impl.lastSeq = state.Seq
+	impl.animator.SetConfig(cfg)
+	impl.planner.SetLigaturesEnabled(cfg.LigaturesEnabled)
+	impl.configDirty = true
+	impl.configGeneration++
+	services, window := impl.services, impl.window
 	impl.mu.Unlock()
-	impl.view.SetFrame(frame)
-	impl.handler.SetMode(state.Mode)
+	invalidate(services, window)
 }

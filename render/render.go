@@ -123,6 +123,8 @@ func (p *Planner) Plan(list *drawlist.List) (renderlist.Frame, error) {
 				attrMask:  attrMask,
 				clip:      commandClipValue,
 				cellWidth: cell.Width,
+				hasRow:    true,
+				row:       layer.ScreenRow + item.Row,
 			})
 			itemIndex = nextIndex
 		}
@@ -331,6 +333,8 @@ type rowMeta struct {
 	attrMask      uint16
 	clip          ui.Rect
 	cellWidth     float32
+	hasRow        bool
+	row           int
 	hasCursorQuad bool
 	cursorQuad    [4]ui.Point
 }
@@ -647,9 +651,13 @@ func (cache *rowCache) glyphRun(command renderlist.Command, meta rowMeta) ([]ui.
 }
 
 func rowCacheKey(command renderlist.Command, meta rowMeta) rowKey {
+	row := int(math.Round(float64(command.Y / positiveHeight(command.H))))
+	if meta.hasRow {
+		row = meta.row
+	}
 	return rowKey{
 		grid:     meta.grid,
-		row:      int(math.Round(float64(command.Y / positiveHeight(command.H)))),
+		row:      row,
 		text:     command.Text,
 		attrMask: meta.attrMask,
 		fg:       command.FG,
@@ -808,13 +816,12 @@ func drawFrame(p *ui.Painter, frame renderlist.Frame, cache *rowCache, metas []r
 			meta = metas[index]
 		}
 		end := index + 1
-		if meta.clip.W > 0 && meta.clip.H > 0 && frame.Commands[index].Op != "fill" {
-			for end < len(frame.Commands) && end < len(metas) && frame.Commands[end].Op != "fill" &&
-				metas[end].clip == meta.clip && metas[end].grid == meta.grid {
+		if meta.clip.W > 0 && meta.clip.H > 0 {
+			for end < len(frame.Commands) && end < len(metas) &&
+				metas[end].clip == meta.clip && metas[end].grid == meta.grid &&
+				(frame.Commands[end].Op != "fill" || frame.Commands[index].Op == "fill") {
 				end++
 			}
-		}
-		if meta.clip.W > 0 && meta.clip.H > 0 {
 			p.Clip(meta.clip, 0, func() { drawCommandRange(p, frame, cache, metas, index, end) })
 		} else {
 			drawCommandRange(p, frame, cache, metas, index, end)
