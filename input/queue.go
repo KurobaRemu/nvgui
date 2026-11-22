@@ -57,27 +57,22 @@ func (impl *queueImpl) keys(ev ui.InputEvent) string {
 		impl.composing = false
 		if impl.pending != nil {
 			impl.pending = nil
-			impl.swallowKey = 0
-			impl.swallowAlt = false
+			impl.clearSwallow()
 			return escapeText(ev.Text)
 		}
 		if impl.swallowKey != 0 {
-			mods := ev.Mods & (ui.Ctrl | ui.Alt | ui.Super | ui.Shift)
-			if impl.swallowAlt || mods&ui.Ctrl != 0 {
-				if impl.swallowKey == ui.KeyUnknown || ev.Key == ui.KeyUnknown || impl.swallowKey == ev.Key {
-					impl.swallowKey = 0
-					impl.swallowAlt = false
-					return ""
-				}
+			if swallowModifierTextEcho(ev, impl.swallowKey, impl.swallowAlt) {
+				impl.clearSwallow()
+				return ""
 			}
-			impl.swallowKey = 0
-			impl.swallowAlt = false
+			if !impl.swallowAlt {
+				impl.clearSwallow()
+			}
 		}
 		return escapeText(ev.Text)
 	case ui.InputCompose:
 		impl.pending = nil
-		impl.swallowKey = 0
-		impl.swallowAlt = false
+		impl.clearSwallow()
 		if ev.Canceled || ev.Text == "" {
 			impl.composing = false
 		} else {
@@ -86,8 +81,7 @@ func (impl *queueImpl) keys(ev ui.InputEvent) string {
 		return ""
 	case ui.InputKeyDown:
 		impl.pending = nil
-		impl.swallowKey = 0
-		impl.swallowAlt = false
+		impl.clearSwallow()
 		if impl.composing {
 			if endsComposition(ev) {
 				impl.composing = false
@@ -115,8 +109,7 @@ func (impl *queueImpl) keys(ev ui.InputEvent) string {
 	case ui.InputKeyUp:
 		if impl.composing {
 			impl.pending = nil
-			impl.swallowKey = 0
-			impl.swallowAlt = false
+			impl.clearSwallow()
 			return ""
 		}
 		if impl.pending != nil && impl.pending.Key == ev.Key {
@@ -125,15 +118,87 @@ func (impl *queueImpl) keys(ev ui.InputEvent) string {
 			notation, _ := Notation(down)
 			return notation
 		}
-		if impl.swallowKey != 0 && impl.swallowKey == ev.Key {
-			impl.swallowKey = 0
-			impl.swallowAlt = false
+		if impl.swallowAlt {
+			impl.clearSwallow()
+		} else if impl.swallowKey != 0 && impl.swallowKey == ev.Key {
+			impl.clearSwallow()
 		}
 		return ""
 	default:
 		return ""
 	}
 }
+
+func (impl *queueImpl) clearSwallow() {
+	impl.swallowKey = 0
+	impl.swallowAlt = false
+}
+
+func swallowModifierTextEcho(ev ui.InputEvent, key ui.Key, alt bool) bool {
+	if alt {
+		return true
+	}
+	if ev.Mods&ui.Ctrl != 0 {
+		return ev.Key == ui.KeyUnknown || ev.Key == key
+	}
+	return ev.Mods == 0 && len(ev.Text) == 1 && keyTextEcho(key, ev.Text[0])
+}
+
+type keyEcho struct {
+	plain   byte
+	control byte
+	shifted byte
+}
+
+var keyEchoes = func() map[ui.Key]keyEcho {
+	echoes := make(map[ui.Key]keyEcho)
+	for index := range 26 {
+		char := byte('a' + index)
+		echoes[ui.KeyA+ui.Key(index)] = keyEcho{plain: char, control: byte(index + 1), shifted: char}
+	}
+	for index, shifted := range []byte(")!@#$%^&*(") {
+		char := byte('0' + index)
+		echoes[ui.Key0+ui.Key(index)] = keyEcho{plain: char, control: noControlByte, shifted: shifted}
+	}
+	punctuation := map[ui.Key]keyEcho{
+		ui.KeySpace:        {plain: ' ', control: 0x00, shifted: ' '},
+		ui.KeyMinus:        {plain: '-', control: 0x1f, shifted: '_'},
+		ui.KeyEqual:        {plain: '=', control: noControlByte, shifted: '+'},
+		ui.KeyComma:        {plain: ',', control: noControlByte, shifted: '<'},
+		ui.KeyPeriod:       {plain: '.', control: noControlByte, shifted: '>'},
+		ui.KeySlash:        {plain: '/', control: noControlByte, shifted: '?'},
+		ui.KeySemicolon:    {plain: ';', control: noControlByte, shifted: ':'},
+		ui.KeyQuote:        {plain: '\'', control: noControlByte, shifted: '"'},
+		ui.KeyBracketLeft:  {plain: '[', control: 0x1b, shifted: '{'},
+		ui.KeyBracketRight: {plain: ']', control: 0x1d, shifted: '}'},
+		ui.KeyBackslash:    {plain: '\\', control: 0x1c, shifted: '|'},
+		ui.KeyBackquote:    {plain: '`', control: noControlByte, shifted: '~'},
+		ui.Key6:            {plain: '6', control: 0x1e, shifted: '^'},
+	}
+	for key, echo := range punctuation {
+		echoes[key] = echo
+	}
+	return echoes
+}()
+
+func keyTextEcho(key ui.Key, echo byte) bool {
+	candidates, ok := keyEchoes[key]
+	if !ok {
+		return false
+	}
+	if echo >= 'A' && echo <= 'Z' {
+		echo += 'a' - 'A'
+	}
+	switch {
+	case echo == candidates.plain, echo == candidates.shifted:
+		return true
+	case candidates.control != noControlByte && echo == candidates.control:
+		return true
+	}
+	return false
+}
+
+const noControlByte = 0xff
 
 func (impl *queueImpl) finish(err error) {
 	if impl.done {
