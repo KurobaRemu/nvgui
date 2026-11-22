@@ -13,5 +13,7 @@
 | `refs/neovide/neovide@c331febc97a8f9ac432991f3780076ed02625577` | `src/renderer/animation_utils.rs:67-116` | MIT | `render/spring.go`（临界阻尼弹簧解析公式） |
 | `refs/neovide/neovide@c331febc97a8f9ac432991f3780076ed02625577` | `src/renderer/cursor_renderer/mod.rs:65-215,465-598` | MIT | `render/cursor_anim.go`（四角独立弹簧光标、长短跳与方向对齐拖尾、cmdline/insert 开关与像素对齐） |
 | `refs/neovide/neovide@c331febc97a8f9ac432991f3780076ed02625577` | `src/renderer/rendered_window.rs:267-300,866-955`、`src/bridge/events.rs:969-997` | MIT | `protocol/viewport.go`、`screen/viewport.go`、`render/scroll_anim.go`（`win_viewport` `scroll_delta` / `win_viewport_margins` 解析与内视口平滑滚动） |
+| `refs/qvacua/vimr@390580113fce110600219125170b087104a443f5` | `Commons/Sources/Commons/ProcessUtils.swift:10-80`、`VimR/VimR/AppDelegate.swift:342-357` | MIT | `app/path_probe.go`、`app/handoff.go`（非终端启动登录 shell PATH 探测与 Finder Open With / 拖放打开策略参考） |
+| `refs/neovide/neovide@c331febc97a8f9ac432991f3780076ed02625577` | `src/bridge/ui_commands.rs:96-165` | MIT | `app/handoff.go`（冷启动前 Open With / 拖放文件排队至 UI attach 就绪再派发的队列模式） |
 
 `neovim v0.12.6` 的 test 树按 Apache-2.0 登记，已由 M0.2 用 `git archive` 原样引入。`v0.12.6` 的 annotated tag object 是 `022946c802832f938398dfae34b3f277ca9509d4`，解引用后的 commit 是 `779c36969e31080503be2dfccbcc3f999e289606`；本表采用 commit hash。`test/functional/ui/screen.lua` sha256 为 `1e187bfcccf623eb31b8cef2e990e5a4df4f89ca52b7d2024669bbd02af76f74`。
