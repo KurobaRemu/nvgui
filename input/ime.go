@@ -39,20 +39,30 @@ func handlerHandle(handler *Handler, ev ui.InputEvent) bool {
 	impl := handler.impl
 	impl.opMu.Lock()
 	defer impl.opMu.Unlock()
+	physicalOnly := false
 	switch ev.Kind {
 	case ui.InputKeyDown, ui.InputKeyUp:
 		if ev.Mods&ui.Super != 0 {
 			return false
 		}
 		if _, ok := Notation(ev); !ok {
-			return false
+			if ev.Key != ui.KeyUnknown || ev.Code == ui.CodeUnknown || isModifierOrLockCode(ev.Code) {
+				return false
+			}
+			physicalOnly = true
 		}
 	case ui.InputText, ui.InputCompose, ui.InputCommand:
 	default:
 		return false
 	}
 
-	if err := handler.impl.queue.Enqueue(ev); err != nil {
+	impl.mu.Lock()
+	allowed := impl.allowed
+	impl.mu.Unlock()
+	if err := impl.queue.enqueue(ev, allowed); err != nil {
+		return false
+	}
+	if physicalOnly {
 		return false
 	}
 	impl.mu.Lock()

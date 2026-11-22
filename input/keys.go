@@ -3,6 +3,7 @@ package input
 import (
 	"fmt"
 	"strings"
+	"unicode/utf8"
 
 	"github.com/egoist/mygo/ui"
 )
@@ -88,6 +89,57 @@ func Notation(ev ui.InputEvent) (string, bool) {
 	builder.WriteString(notation.inner)
 	builder.WriteByte('>')
 	return builder.String(), true
+}
+
+func isModifierOrLockCode(code ui.KeyCode) bool {
+	switch code {
+	case ui.CodeUnknown, ui.CodeCapsLock, ui.CodeNumLock, ui.CodeScrollLock,
+		ui.CodeControlLeft, ui.CodeShiftLeft, ui.CodeAltLeft, ui.CodeSuperLeft,
+		ui.CodeControlRight, ui.CodeShiftRight, ui.CodeAltRight, ui.CodeSuperRight,
+		ui.CodeKanaMode, ui.CodeConvert, ui.CodeNonConvert,
+		ui.CodeLang1, ui.CodeLang2, ui.CodeLang3, ui.CodeLang4:
+		return true
+	default:
+		return false
+	}
+}
+
+var normalModePunctuation = map[string]string{
+	"：": ":", "；": ";", "，": ",", "。": ".", "？": "?", "！": "!",
+	"【": "[", "】": "]", "「": "[", "」": "]", "『": "{", "』": "}",
+	"《": "<", "〈": "<", "》": ">", "〉": ">",
+	"（": "(", "）": ")", "“": "\"", "”": "\"", "‘": "'", "’": "'",
+	"・": "/", "ー": "-", "·": "`", "……": "^", "…": "^", "——": "_", "—": "_",
+}
+
+func normalizeNormalModeCJKPunctuation(text string, code ui.KeyCode) string {
+	if mapped, ok := normalModePunctuation[text]; ok {
+		return mapped
+	}
+	if text == "、" {
+		if code == ui.CodeComma {
+			return ","
+		}
+		return `\`
+	}
+	if text == "￥" || text == "¥" {
+		if code == ui.CodeBackslash || code == ui.CodeIntlYen {
+			return `\`
+		}
+		return "$"
+	}
+	r, size := utf8.DecodeRuneInString(text)
+	if size != len(text) || !isFullwidthASCIIPunctuation(r) {
+		return text
+	}
+	return string(r - 0xFEE0)
+}
+
+func isFullwidthASCIIPunctuation(r rune) bool {
+	return r >= 0xFF01 && r <= 0xFF0F ||
+		r >= 0xFF1A && r <= 0xFF20 ||
+		r >= 0xFF3B && r <= 0xFF40 ||
+		r >= 0xFF5B && r <= 0xFF5E
 }
 
 func isTypeableKey(key ui.Key) bool {

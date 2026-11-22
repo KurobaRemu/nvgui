@@ -19,24 +19,26 @@ type queueImpl struct {
 	sender   Sender
 	recorder *TraceRecorder
 
-	mu      sync.Mutex
-	events  [queueCapacity]ui.InputEvent
-	head    int
-	length  int
-	wakeup  *sync.Cond
-	closing chan struct{}
-	stopped chan struct{}
-	sent    []string
-	runErr  error
-	started bool
-	closed  bool
-	done    bool
-	ctx     context.Context
+	mu          sync.Mutex
+	events      [queueCapacity]ui.InputEvent
+	slotAllowed [queueCapacity]bool
+	head        int
+	length      int
+	wakeup      *sync.Cond
+	closing     chan struct{}
+	stopped     chan struct{}
+	sent        []string
+	runErr      error
+	started     bool
+	closed      bool
+	done        bool
+	ctx         context.Context
 
 	pending    *ui.InputEvent
 	swallowKey ui.Key
 	swallowAlt bool
 	composing  bool
+	lastCode   ui.KeyCode
 	resetAfter [queueCapacity]bool
 }
 
@@ -51,14 +53,20 @@ func newQueue(sender Sender, recorder *TraceRecorder) *Queue {
 	return &Queue{impl: impl}
 }
 
-func (impl *queueImpl) keys(ev ui.InputEvent) string {
+func (impl *queueImpl) keys(ev ui.InputEvent, imeAllowed bool) string {
 	switch ev.Kind {
 	case ui.InputText:
+		code := impl.lastCode
+		impl.lastCode = ui.CodeUnknown
 		impl.composing = false
+		text := ev.Text
+		if !imeAllowed {
+			text = normalizeNormalModeCJKPunctuation(text, code)
+		}
 		if impl.pending != nil {
 			impl.pending = nil
 			impl.clearSwallow()
-			return escapeText(ev.Text)
+			return escapeText(text)
 		}
 		if impl.swallowKey != 0 {
 			if swallowModifierTextEcho(ev, impl.swallowKey, impl.swallowAlt) {
@@ -69,8 +77,9 @@ func (impl *queueImpl) keys(ev ui.InputEvent) string {
 				impl.clearSwallow()
 			}
 		}
-		return escapeText(ev.Text)
+		return escapeText(text)
 	case ui.InputCompose:
+		impl.lastCode = ui.CodeUnknown
 		impl.pending = nil
 		impl.clearSwallow()
 		if ev.Canceled || ev.Text == "" {
@@ -80,6 +89,11 @@ func (impl *queueImpl) keys(ev ui.InputEvent) string {
 		}
 		return ""
 	case ui.InputKeyDown:
+		if !isModifierOrLockCode(ev.Code) {
+			impl.lastCode = ev.Code
+		} else {
+			impl.lastCode = ui.CodeUnknown
+		}
 		impl.pending = nil
 		impl.clearSwallow()
 		if impl.composing {
@@ -107,6 +121,12 @@ func (impl *queueImpl) keys(ev ui.InputEvent) string {
 		}
 		return notation
 	case ui.InputKeyUp:
+		if ev.Code != ui.CodeUnknown && impl.lastCode == ev.Code {
+			impl.lastCode = ui.CodeUnknown
+		}
+		if _, ok := Notation(ev); !ok {
+			return ""
+		}
 		if impl.composing {
 			impl.pending = nil
 			impl.clearSwallow()
@@ -210,27 +230,29 @@ func (impl *queueImpl) finish(err error) {
 	close(impl.stopped)
 }
 
-func (impl *queueImpl) pop() (ui.InputEvent, bool, bool) {
+func (impl *queueImpl) pop() (ui.InputEvent, bool, bool, bool) {
 	if impl.length == 0 {
-		return ui.InputEvent{}, false, false
+		return ui.InputEvent{}, false, false, false
 	}
 	slot := impl.head
 	ev := impl.events[impl.head]
+	imeAllowed := impl.slotAllowed[slot]
 	resetAfter := impl.resetAfter[slot]
 	impl.events[impl.head] = ui.InputEvent{}
+	impl.slotAllowed[slot] = false
 	impl.resetAfter[slot] = false
 	impl.head = (impl.head + 1) % queueCapacity
 	impl.length--
 	impl.wakeup.Broadcast()
-	return ev, true, resetAfter
+	return ev, true, imeAllowed, resetAfter
 }
 
 func (impl *queueImpl) prepareDelivery() (string, bool, error) {
-	ev, ok, resetAfter := impl.pop()
+	ev, ok, imeAllowed, resetAfter := impl.pop()
 	if !ok {
 		return "", false, nil
 	}
-	keys := impl.keys(ev)
+	keys := impl.keys(ev, imeAllowed)
 	if resetAfter {
 		impl.composing = false
 	}
@@ -397,7 +419,7 @@ func queueClose(queue *Queue) error {
 	return impl.runErr
 }
 
-func queueEnqueue(queue *Queue, ev ui.InputEvent) error {
+func (queue *Queue) enqueue(ev ui.InputEvent, imeAllowed bool) error {
 	if queue == nil || queue.impl == nil {
 		return errors.New("input: nil queue")
 	}
@@ -424,6 +446,7 @@ func queueEnqueue(queue *Queue, ev ui.InputEvent) error {
 	}
 	slot := (impl.head + impl.length) % queueCapacity
 	impl.events[slot] = ev
+	impl.slotAllowed[slot] = imeAllowed
 	impl.resetAfter[slot] = false
 	impl.length++
 	impl.wakeup.Broadcast()
@@ -432,6 +455,10 @@ func queueEnqueue(queue *Queue, ev ui.InputEvent) error {
 	}
 	impl.mu.Unlock()
 	return nil
+}
+
+func queueEnqueue(queue *Queue, ev ui.InputEvent) error {
+	return queue.enqueue(ev, true)
 }
 
 func ctxError(ctx context.Context) error {

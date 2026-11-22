@@ -2,8 +2,11 @@ package input
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"math"
+	"os"
+	"reflect"
 	"runtime"
 	"slices"
 	"strings"
@@ -12,7 +15,10 @@ import (
 	"time"
 
 	"github.com/egoist/mygo/ui"
+	"github.com/neovim/go-client/msgpack/rpc"
+	"github.com/neovim/go-client/nvim"
 
+	"nvgui/connection"
 	"nvgui/screen"
 )
 
@@ -180,6 +186,158 @@ func imeModeVariants(mode string) []string {
 		variants = append(variants, " \t"+strings.ToUpper(hyphenated)+" \n")
 	}
 	return variants
+}
+
+func imeStartNvim(test *testing.T) *nvim.Nvim {
+	test.Helper()
+	conn, err := connection.Start(context.Background(), connection.Options{
+		Args:   []string{"--clean"},
+		Env:    os.Environ(),
+		Dir:    test.TempDir(),
+		Width:  80,
+		Height: 24,
+	})
+	if err != nil {
+		test.Fatalf("connection.Start(nvim --clean): %v", err)
+	}
+	test.Cleanup(func() {
+		if err := conn.Close(); err != nil {
+			test.Errorf("connection.Close: %v", err)
+		}
+	})
+	return conn.Nvim()
+}
+
+func imeQuitNvim(test *testing.T, client *nvim.Nvim) {
+	test.Helper()
+	if err := client.Command("qa!"); err != nil && !errors.Is(err, rpc.ErrClosed) {
+		test.Fatalf("nvim quit: %v", err)
+	}
+}
+
+func imeNvimMode(test *testing.T, client *nvim.Nvim) string {
+	test.Helper()
+	mode, err := client.Mode()
+	if err != nil {
+		test.Fatalf("nvim_get_mode: %v", err)
+	}
+	return mode.Mode
+}
+
+func imeAssertNvimMode(test *testing.T, client *nvim.Nvim, want string) {
+	test.Helper()
+	if got := imeNvimMode(test, client); got != want {
+		test.Fatalf("nvim_get_mode().mode = %q, want %q", got, want)
+	}
+}
+
+func imeAssertBuffer(test *testing.T, client *nvim.Nvim, want ...string) {
+	test.Helper()
+	buffer, err := client.CurrentBuffer()
+	if err != nil {
+		test.Fatalf("CurrentBuffer: %v", err)
+	}
+	raw, err := client.BufferLines(buffer, 0, -1, true)
+	if err != nil {
+		test.Fatalf("BufferLines: %v", err)
+	}
+	lines := make([]string, len(raw))
+	for index := range raw {
+		lines[index] = string(raw[index])
+	}
+	if !reflect.DeepEqual(lines, want) {
+		test.Fatalf("headless nvim buffer = %q, want %q", lines, want)
+	}
+}
+
+func imeDrain(test *testing.T, client *nvim.Nvim) {
+	test.Helper()
+	if err := client.FeedKeys("", "x", false); err != nil {
+		test.Fatalf("drain Neovim typeahead: %v", err)
+	}
+}
+
+func imeHandleSequence(test *testing.T, handler *Handler, events []ui.InputEvent) {
+	test.Helper()
+	for _, event := range events {
+		want := true
+		if event.Kind == ui.InputKeyDown || event.Kind == ui.InputKeyUp {
+			_, known := Notation(event)
+			want = known && event.Mods&ui.Super == 0
+		}
+		if got := handler.Handle(event); got != want {
+			test.Fatalf("Handle(%+v) = %v, want %v", event, got, want)
+		}
+	}
+}
+
+func imePunctuationEvents(base time.Time) []ui.InputEvent {
+	return []ui.InputEvent{
+		{Kind: ui.InputText, Text: "：", Time: base},
+		{Kind: ui.InputText, Text: "；", Time: base.Add(time.Millisecond)},
+		{Kind: ui.InputText, Text: "，", Time: base.Add(2 * time.Millisecond)},
+		{Kind: ui.InputText, Text: "。", Time: base.Add(3 * time.Millisecond)},
+		{Kind: ui.InputText, Text: "？", Time: base.Add(4 * time.Millisecond)},
+		{Kind: ui.InputText, Text: "！", Time: base.Add(5 * time.Millisecond)},
+		{Kind: ui.InputText, Text: "【", Time: base.Add(6 * time.Millisecond)},
+		{Kind: ui.InputText, Text: "】", Time: base.Add(7 * time.Millisecond)},
+		{Kind: ui.InputText, Text: "「", Time: base.Add(8 * time.Millisecond)},
+		{Kind: ui.InputText, Text: "」", Time: base.Add(9 * time.Millisecond)},
+		{Kind: ui.InputText, Text: "『", Time: base.Add(10 * time.Millisecond)},
+		{Kind: ui.InputText, Text: "』", Time: base.Add(11 * time.Millisecond)},
+		{Kind: ui.InputText, Text: "《", Time: base.Add(12 * time.Millisecond)},
+		{Kind: ui.InputText, Text: "〈", Time: base.Add(13 * time.Millisecond)},
+		{Kind: ui.InputText, Text: "》", Time: base.Add(14 * time.Millisecond)},
+		{Kind: ui.InputText, Text: "〉", Time: base.Add(15 * time.Millisecond)},
+		{Kind: ui.InputText, Text: "（", Time: base.Add(16 * time.Millisecond)},
+		{Kind: ui.InputText, Text: "）", Time: base.Add(17 * time.Millisecond)},
+		{Kind: ui.InputText, Text: "“", Time: base.Add(18 * time.Millisecond)},
+		{Kind: ui.InputText, Text: "”", Time: base.Add(19 * time.Millisecond)},
+		{Kind: ui.InputText, Text: "‘", Time: base.Add(20 * time.Millisecond)},
+		{Kind: ui.InputText, Text: "’", Time: base.Add(21 * time.Millisecond)},
+		{Kind: ui.InputText, Text: "・", Time: base.Add(22 * time.Millisecond)},
+		{Kind: ui.InputText, Text: "ー", Time: base.Add(23 * time.Millisecond)},
+		{Kind: ui.InputText, Text: "·", Time: base.Add(24 * time.Millisecond)},
+		{Kind: ui.InputText, Text: "……", Time: base.Add(25 * time.Millisecond)},
+		{Kind: ui.InputText, Text: "…", Time: base.Add(26 * time.Millisecond)},
+		{Kind: ui.InputText, Text: "——", Time: base.Add(27 * time.Millisecond)},
+		{Kind: ui.InputText, Text: "—", Time: base.Add(28 * time.Millisecond)},
+		{Kind: ui.InputText, Text: "～", Time: base.Add(29 * time.Millisecond)},
+		{Kind: ui.InputText, Text: "＠", Time: base.Add(30 * time.Millisecond)},
+		{Kind: ui.InputText, Text: "＃", Time: base.Add(31 * time.Millisecond)},
+		{Kind: ui.InputText, Text: "＄", Time: base.Add(32 * time.Millisecond)},
+		{Kind: ui.InputText, Text: "％", Time: base.Add(33 * time.Millisecond)},
+		{Kind: ui.InputText, Text: "＾", Time: base.Add(34 * time.Millisecond)},
+		{Kind: ui.InputText, Text: "＆", Time: base.Add(35 * time.Millisecond)},
+		{Kind: ui.InputText, Text: "＊", Time: base.Add(36 * time.Millisecond)},
+		{Kind: ui.InputText, Text: "＋", Time: base.Add(37 * time.Millisecond)},
+		{Kind: ui.InputText, Text: "－", Time: base.Add(38 * time.Millisecond)},
+		{Kind: ui.InputText, Text: "＝", Time: base.Add(39 * time.Millisecond)},
+		{Kind: ui.InputText, Text: "／", Time: base.Add(40 * time.Millisecond)},
+		{Kind: ui.InputText, Text: "＜", Time: base.Add(41 * time.Millisecond)},
+		{Kind: ui.InputText, Text: "＞", Time: base.Add(42 * time.Millisecond)},
+		{Kind: ui.InputText, Text: "［", Time: base.Add(43 * time.Millisecond)},
+		{Kind: ui.InputText, Text: "＼", Time: base.Add(44 * time.Millisecond)},
+		{Kind: ui.InputText, Text: "］", Time: base.Add(45 * time.Millisecond)},
+		{Kind: ui.InputText, Text: "＿", Time: base.Add(46 * time.Millisecond)},
+		{Kind: ui.InputText, Text: "｀", Time: base.Add(47 * time.Millisecond)},
+		{Kind: ui.InputText, Text: "｛", Time: base.Add(48 * time.Millisecond)},
+		{Kind: ui.InputText, Text: "｜", Time: base.Add(49 * time.Millisecond)},
+		{Kind: ui.InputText, Text: "｝", Time: base.Add(50 * time.Millisecond)},
+		{Kind: ui.InputText, Text: "、", Time: base.Add(51 * time.Millisecond)},
+		{Kind: ui.InputText, Text: "￥", Time: base.Add(52 * time.Millisecond)},
+		{Kind: ui.InputText, Text: "¥", Time: base.Add(53 * time.Millisecond)},
+	}
+}
+
+func imePunctuationNormalWant() []string {
+	return []string{
+		":", ";", ",", ".", "?", "!", "[", "]", "[", "]", "{", "}",
+		"<lt>", "<lt>", ">", ">", "(", ")", `"`, `"`, "'", "'", "/", "-", "`",
+		"^", "^", "_", "_", "~", "@", "#", "$", "%", "^", "&", "*", "+", "-", "=",
+		"/", "<lt>", ">", "[", "<Bslash>", "]", "_", "`", "{", "|", "}",
+		"<Bslash>", "$", "$",
+	}
 }
 
 func TestIMECompositionConsumesKeysAndCommitsOnce(test *testing.T) {
@@ -451,31 +609,293 @@ func TestIMEChinesePunctuationPassThrough(test *testing.T) {
 	handler := NewHandler(queue)
 	handler.SetMode("insert")
 
-	punctuation := []string{"，", "。", "！", "？", "；", "：", "“", "”", "（", "）", "【", "】", "《", "》", "¥", ":", "/"}
 	baseTime := time.Unix(1_700_000_000, 0).UTC()
+	punctuation := imePunctuationEvents(baseTime)
 	events := make([]ui.InputEvent, 0, len(punctuation)*2)
 	wantSent := make([]string, 0, len(punctuation)*2)
-	appendText := func(text string) {
-		event := ui.InputEvent{
-			Kind: ui.InputText,
-			Text: text,
-			Time: baseTime.Add(time.Duration(len(events)) * time.Millisecond),
-		}
+	for _, event := range punctuation {
 		events = append(events, event)
-		wantSent = append(wantSent, text)
+		wantSent = append(wantSent, escapeText(event.Text))
 		imeHandle(test, handler, event)
 	}
-	for _, text := range punctuation {
-		appendText(text)
-	}
 	handler.SetMode("normal")
-	for _, text := range punctuation {
-		appendText(text)
+	normalEvents := make([]ui.InputEvent, len(punctuation))
+	for index, event := range punctuation {
+		normalEvents[index] = event
+		normalEvents[index].Time = baseTime.Add(time.Duration(len(punctuation)+index) * time.Millisecond)
+		events = append(events, normalEvents[index])
 	}
+	imeHandleSequence(test, handler, normalEvents)
+	wantSent = append(wantSent, imePunctuationNormalWant()...)
 
 	stop()
 	imeAssertTrace(test, recorder, events)
 	imeAssertSent(test, sender, wantSent)
+}
+
+func TestIMENormalModeSCIMColonReplayFromVMTrace(test *testing.T) {
+	baseTime := time.Unix(1_700_000_000, 0).UTC()
+	sequence := []ui.InputEvent{
+		{Kind: ui.InputKeyDown, Key: ui.KeyBracketLeft, Code: ui.CodeBracketLeft, Mods: ui.Ctrl, Time: baseTime},
+		{Kind: ui.InputKeyUp, Key: ui.KeyBracketLeft, Code: ui.CodeBracketLeft, Mods: ui.Ctrl, Time: baseTime.Add(time.Millisecond)},
+		{Kind: ui.InputKeyDown, Code: ui.KeyCode(51), Mods: ui.Shift, Time: baseTime.Add(2 * time.Millisecond)},
+		{Kind: ui.InputText, Text: "：", Time: baseTime.Add(3 * time.Millisecond)},
+		{Kind: ui.InputKeyUp, Code: ui.KeyCode(51), Time: baseTime.Add(4 * time.Millisecond)},
+	}
+
+	test.Run("direct", func(test *testing.T) {
+		sender := &imeTestSender{}
+		recorder := NewTraceRecorder()
+		queue, stop := imeStartQueue(test, sender, recorder)
+		defer stop()
+		handler := NewHandler(queue)
+		handler.SetMode("normal")
+		for _, event := range sequence {
+			handler.Handle(event)
+		}
+		stop()
+		imeAssertSent(test, sender, []string{"<C-[>", ":"})
+		imeAssertTrace(test, recorder, sequence)
+	})
+	test.Run("trace round trip", func(test *testing.T) {
+		recorder := NewTraceRecorder()
+		for _, event := range sequence {
+			recorder.Observe(event)
+		}
+		imeAssertTrace(test, recorder, sequence)
+		for _, event := range recorder.Events() {
+			if event.Code == 51 && (event.Kind == KeyDown || event.Kind == KeyUp) &&
+				(event.Key != 0 || event.Kind == KeyDown && event.Mods != uint8(ui.Shift)) {
+				test.Fatalf("recorded physical event = %+v, want Key:0 Code:51 Mods:Shift", event)
+			}
+		}
+		raw, err := MarshalTrace(recorder.Events())
+		if err != nil {
+			test.Fatalf("MarshalTrace: %v", err)
+		}
+		decoded, err := UnmarshalTrace(raw)
+		if err != nil {
+			test.Fatalf("UnmarshalTrace: %v", err)
+		}
+		sender := &imeTestSender{}
+		queue, stop := imeStartQueue(test, sender, nil)
+		defer stop()
+		handler := NewHandler(queue)
+		handler.SetMode("normal")
+		if err := Replay(decoded, func(event ui.InputEvent) { handler.Handle(event) }); err != nil {
+			test.Fatalf("Replay: %v", err)
+		}
+		stop()
+		imeAssertSent(test, sender, []string{"<C-[>", ":"})
+	})
+
+	client := imeStartNvim(test)
+	queue, stop := imeStartQueue(test, client, nil)
+	handler := NewHandler(queue)
+	handler.SetMode("normal")
+	for _, event := range sequence {
+		handler.Handle(event)
+	}
+	stop()
+	imeDrain(test, client)
+	imeAssertNvimMode(test, client, "c")
+	if _, err := client.Input("<Esc>"); err != nil {
+		test.Fatalf("leave cmdline: %v", err)
+	}
+	imeDrain(test, client)
+	imeAssertNvimMode(test, client, "n")
+	imeQuitNvim(test, client)
+}
+
+func TestIMENormalModeCJKPunctuationDisambiguationAndModes(test *testing.T) {
+	test.Run("mode mapping matrix", func(test *testing.T) {
+		for _, mode := range []string{"normal", "visual", "operator-pending"} {
+			test.Run(mode, func(test *testing.T) {
+				sender := &imeTestSender{}
+				queue, stop := imeStartQueue(test, sender, nil)
+				defer stop()
+				handler := NewHandler(queue)
+				handler.SetMode(mode)
+				imeHandleSequence(test, handler, imePunctuationEvents(time.Unix(1_700_000_000, 0).UTC()))
+				stop()
+				imeAssertSent(test, sender, imePunctuationNormalWant())
+			})
+		}
+	})
+
+	test.Run("physical code disambiguation", func(test *testing.T) {
+		cases := []struct {
+			name string
+			down ui.KeyCode
+			text string
+			want string
+		}{
+			{"SCIM ideographic comma", ui.CodeBackslash, "、", "<Bslash>"},
+			{"Kotoeri ideographic comma", ui.CodeComma, "、", ","},
+			{"SCIM Shift+4 yen", ui.CodeDigit4, "￥", "$"},
+			{"SCIM Shift+4 yen sign", ui.CodeDigit4, "¥", "$"},
+			{"SCIM backslash yen", ui.CodeBackslash, "￥", "<Bslash>"},
+			{"JIS yen", ui.CodeIntlYen, "¥", "<Bslash>"},
+			{"default yen", ui.CodeUnknown, "￥", "$"},
+		}
+		for _, testCase := range cases {
+			test.Run(testCase.name, func(test *testing.T) {
+				sender := &imeTestSender{}
+				queue, stop := imeStartQueue(test, sender, nil)
+				defer stop()
+				handler := NewHandler(queue)
+				handler.SetMode("normal")
+				base := time.Unix(1_700_000_000, 0).UTC()
+				events := []ui.InputEvent{
+					{Kind: ui.InputKeyDown, Code: testCase.down, Time: base},
+					{Kind: ui.InputText, Text: testCase.text, Time: base.Add(time.Millisecond)},
+					{Kind: ui.InputKeyUp, Code: testCase.down, Time: base.Add(2 * time.Millisecond)},
+					{Kind: ui.InputText, Text: "、", Time: base.Add(3 * time.Millisecond)},
+					{Kind: ui.InputText, Text: "￥", Time: base.Add(4 * time.Millisecond)},
+					{Kind: ui.InputKeyDown, Key: ui.KeyA, Code: ui.CodeKeyA, Time: base.Add(5 * time.Millisecond)},
+					{Kind: ui.InputText, Text: "、", Time: base.Add(6 * time.Millisecond)},
+					{Kind: ui.InputCompose, Text: "ni", Caret: 2, Time: base.Add(7 * time.Millisecond)},
+					{Kind: ui.InputText, Text: "￥", Time: base.Add(8 * time.Millisecond)},
+				}
+				imeHandleSequence(test, handler, events)
+				stop()
+				imeAssertSent(test, sender, []string{testCase.want, "<Bslash>", "$", "<Bslash>", "$"})
+			})
+		}
+	})
+
+	test.Run("IME modes pass through", func(test *testing.T) {
+		texts := []string{"：", "，", "。", "、", "￥", "！", "？"}
+		for _, mode := range []string{"insert", "cmdline_normal", "replace", "terminal"} {
+			test.Run(mode, func(test *testing.T) {
+				sender := &imeTestSender{}
+				queue, stop := imeStartQueue(test, sender, nil)
+				defer stop()
+				handler := NewHandler(queue)
+				handler.SetMode(mode)
+				events := make([]ui.InputEvent, 0, len(texts))
+				want := make([]string, 0, len(texts))
+				for index, text := range texts {
+					events = append(events, ui.InputEvent{Kind: ui.InputText, Text: text, Time: time.Unix(1_700_000_000, int64(index)*int64(time.Millisecond)).UTC()})
+					want = append(want, text)
+				}
+				imeHandleSequence(test, handler, events)
+				stop()
+				imeAssertSent(test, sender, want)
+			})
+		}
+	})
+
+	test.Run("unrelated text stays unchanged", func(test *testing.T) {
+		sender := &imeTestSender{}
+		queue, stop := imeStartQueue(test, sender, nil)
+		defer stop()
+		handler := NewHandler(queue)
+		handler.SetMode("normal")
+		texts := []string{"ä", "ö", "ü", "ß", "â", "^", "~", "´", "你", "好", "日本語", "你好，世界！"}
+		events := make([]ui.InputEvent, 0, len(texts))
+		want := make([]string, 0, len(texts))
+		for index, text := range texts {
+			events = append(events, ui.InputEvent{Kind: ui.InputText, Text: text, Time: time.Unix(1_700_000_000, int64(index)*int64(time.Millisecond)).UTC()})
+			want = append(want, text)
+		}
+		imeHandleSequence(test, handler, events)
+		stop()
+		imeAssertSent(test, sender, want)
+	})
+
+	test.Run("per slot IME snapshot under backpressure", func(test *testing.T) {
+		sender := &imeTestSender{started: make(chan struct{}), release: make(chan struct{})}
+		queue, stop := imeStartQueue(test, sender, nil)
+		defer func() {
+			sender.unblock()
+			stop()
+		}()
+		handler := NewHandler(queue)
+		handler.SetMode("insert")
+		base := time.Unix(1_700_000_000, 0).UTC()
+		imeHandle(test, handler, ui.InputEvent{Kind: ui.InputText, Text: "，", Time: base})
+		imeWaitSignal(test, sender.started, "first sender delivery")
+		imeHandle(test, handler, ui.InputEvent{Kind: ui.InputText, Text: "：", Time: base.Add(time.Millisecond)})
+		imeWaitQueueState(test, queue, "queued second insert punctuation", func(impl *queueImpl) bool { return impl.length == 1 })
+		handler.SetMode("normal")
+		for _, text := range []string{"，", "："} {
+			event := ui.InputEvent{Kind: ui.InputText, Text: text, Time: base.Add(2 * time.Millisecond)}
+			imeHandle(test, handler, event)
+		}
+		sender.unblock()
+		stop()
+		imeAssertSent(test, sender, []string{"，", "：", ",", ":"})
+	})
+}
+
+func TestIMENormalModeCJKPunctuationHeadlessNvim(test *testing.T) {
+	client := imeStartNvim(test)
+	if _, err := client.Input("i"); err != nil {
+		test.Fatalf("enter insert mode: %v", err)
+	}
+	imeDrain(test, client)
+	queue, stop := imeStartQueue(test, client, nil)
+	handler := NewHandler(queue)
+	handler.SetMode("insert")
+	base := time.Unix(1_700_000_000, 0).UTC()
+	event := func(index int, ev ui.InputEvent) ui.InputEvent {
+		ev.Time = base.Add(time.Duration(index) * time.Millisecond)
+		return ev
+	}
+	events := []ui.InputEvent{
+		event(0, ui.InputEvent{Kind: ui.InputText, Text: "你好，世界。"}),
+		event(6, ui.InputEvent{Kind: ui.InputKeyDown, Key: ui.KeyBracketLeft, Code: ui.CodeBracketLeft, Mods: ui.Ctrl}),
+		event(7, ui.InputEvent{Kind: ui.InputKeyUp, Key: ui.KeyBracketLeft, Code: ui.CodeBracketLeft, Mods: ui.Ctrl}),
+	}
+	imeHandleSequence(test, handler, events)
+	stop()
+	imeDrain(test, client)
+	imeAssertNvimMode(test, client, "n")
+	imeAssertBuffer(test, client, "你好，世界。")
+
+	queue, stop = imeStartQueue(test, client, nil)
+	handler = NewHandler(queue)
+	handler.SetMode("normal")
+	normalEvents := []ui.InputEvent{
+		event(10, ui.InputEvent{Kind: ui.InputText, Text: "："}),
+		event(11, ui.InputEvent{Kind: ui.InputText, Text: "％"}),
+		event(12, ui.InputEvent{Kind: ui.InputText, Text: "s"}),
+		event(13, ui.InputEvent{Kind: ui.InputText, Text: "/"}),
+		event(14, ui.InputEvent{Kind: ui.InputText, Text: "世界"}),
+		event(15, ui.InputEvent{Kind: ui.InputText, Text: "/"}),
+		event(16, ui.InputEvent{Kind: ui.InputText, Text: "nvim"}),
+		event(17, ui.InputEvent{Kind: ui.InputText, Text: "／"}),
+		event(18, ui.InputEvent{Kind: ui.InputKeyDown, Key: ui.KeyEnter, Code: ui.CodeEnter}),
+		event(19, ui.InputEvent{Kind: ui.InputKeyUp, Key: ui.KeyEnter, Code: ui.CodeEnter}),
+	}
+	imeHandleSequence(test, handler, normalEvents)
+	stop()
+	imeDrain(test, client)
+	imeAssertNvimMode(test, client, "n")
+	imeAssertBuffer(test, client, "你好，nvim。")
+
+	queue, stop = imeStartQueue(test, client, nil)
+	handler = NewHandler(queue)
+	handler.SetMode("normal")
+	endEvents := []ui.InputEvent{
+		event(20, ui.InputEvent{Kind: ui.InputKeyDown, Code: ui.CodeDigit4, Mods: ui.Shift}),
+		event(21, ui.InputEvent{Kind: ui.InputText, Text: "￥"}),
+		event(22, ui.InputEvent{Kind: ui.InputKeyUp, Code: ui.CodeDigit4}),
+		event(23, ui.InputEvent{Kind: ui.InputText, Text: "a"}),
+		event(24, ui.InputEvent{Kind: ui.InputText, Text: "！"}),
+	}
+	imeHandleSequence(test, handler, endEvents)
+	stop()
+	imeDrain(test, client)
+	imeAssertNvimMode(test, client, "i")
+	if _, err := client.Input("<Esc>"); err != nil {
+		test.Fatalf("leave insert mode: %v", err)
+	}
+	imeDrain(test, client)
+	imeAssertNvimMode(test, client, "n")
+	imeAssertBuffer(test, client, "你好，nvim。!")
+	imeQuitNvim(test, client)
 }
 
 func TestIMECaretAndCaretForBoundaries(test *testing.T) {
