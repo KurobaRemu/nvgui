@@ -160,7 +160,7 @@ func ReadMessages(data []byte) ([]Message, error) {
 		var fields []any
 		if err := decoder.Decode(&fields); err != nil {
 			if errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF) {
-				return nil, fmt.Errorf("incomplete message at byte %d: %w", start, err)
+				return messages, fmt.Errorf("incomplete message at byte %d: %w", start, err)
 			}
 			return nil, fmt.Errorf("decode message at byte %d: %w", start, err)
 		}
