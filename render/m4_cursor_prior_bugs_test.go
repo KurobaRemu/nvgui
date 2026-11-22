@@ -110,7 +110,10 @@ func TestPriorBug_Neovide850_CursorAnimSettledEqualsDisabledAndNoScreenMutation(
 	}
 	m4PriorSettle(t, animator, clock)
 	settled := animatorStepLastFrame(t, animator)
-	disabledAnimator := render.NewAnimator(planner, render.DisabledAnimationConfig(), clock)
+	disabledCfg := render.DefaultAnimationConfig()
+	disabledCfg.CursorEnabled = false
+	disabledCfg.ScrollEnabled = false
+	disabledAnimator := render.NewAnimator(planner, disabledCfg, clock)
 	disabled, active, err := disabledAnimator.Submit(states[len(states)-1], &screen.FrameMeta{Seq: uint64(len(states))}, lists[len(lists)-1])
 	if err != nil || active {
 		t.Fatalf("disabled Submit = (active=%v, err=%v)", active, err)

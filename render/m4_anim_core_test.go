@@ -40,7 +40,12 @@ func TestAnimatorSetConfigRecomputesSettledFrame(t *testing.T) {
 	if impl.lastList == nil {
 		t.Fatal("Submit did not cache a deep copy of the draw list")
 	}
-	wantFrame, err := planner.Plan(impl.lastList)
+	beforeLigatures := planner.LigaturesEnabled()
+	beforeFrame := cloneFrame(impl.settledFrame)
+	wantCfg := DefaultAnimationConfig()
+	wantPlanner := NewPlanner(resolver)
+	wantPlanner.SetLigaturesEnabled(wantCfg.LigaturesEnabled)
+	wantFrame, err := wantPlanner.Plan(impl.lastList)
 	if err != nil {
 		t.Fatalf("Plan cached list: %v", err)
 	}
@@ -48,7 +53,10 @@ func TestAnimatorSetConfigRecomputesSettledFrame(t *testing.T) {
 	impl.settledFrame = renderlist.Frame{}
 	impl.settledMetas = nil
 
-	animator.SetConfig(DefaultAnimationConfig())
+	animator.SetConfig(wantCfg)
+	if beforeLigatures != planner.LigaturesEnabled() && reflect.DeepEqual(impl.settledFrame, beforeFrame) {
+		t.Fatalf("SetConfig did not recompute settledFrame after ligature change: %+v", impl.settledFrame)
+	}
 	if !reflect.DeepEqual(impl.settledFrame, wantFrame) {
 		t.Fatalf("SetConfig settledFrame = %+v, want %+v", impl.settledFrame, wantFrame)
 	}
