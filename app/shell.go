@@ -42,11 +42,18 @@ type shellImpl struct {
 	mu                sync.Mutex
 	inputSyncMu       sync.Mutex
 	services          ui.Services
+	resizeCh          chan struct{}
 	closed            bool
 	closeErr          error
 	lastSeq           uint64
 	lastColumns       int
 	lastRows          int
+	pendingColumns    int
+	pendingRows       int
+	resizePending     bool
+	inFlightColumns   int
+	inFlightRows      int
+	resizeInFlight    bool
 	forwardedInputSeq uint64
 
 	closeOnce sync.Once
@@ -63,6 +70,7 @@ func newShell(req LaunchRequest, _ diag.Clock, clipboard Clipboard) *Shell {
 		clipboard: clipboard,
 		closing:   make(chan struct{}),
 		closeDone: make(chan struct{}),
+		resizeCh:  make(chan struct{}, 1),
 	}}
 }
 
@@ -142,18 +150,23 @@ func shellClose(shell *Shell) error {
 }
 
 func (s *Shell) Resize(width, height int) error {
-	if s == nil || s.impl == nil || !s.impl.started || s.impl.session == nil {
+	if s == nil || s.impl == nil {
 		return errShellClosed
 	}
-	if err := s.impl.checkOpen(); err != nil {
-		return err
+	impl := s.impl
+	impl.mu.Lock()
+	if !impl.started || impl.closed || impl.session == nil {
+		impl.mu.Unlock()
+		return errShellClosed
 	}
 	select {
-	case <-s.impl.session.Exited():
+	case <-impl.session.Exited():
+		impl.mu.Unlock()
 		return errShellClosed
 	default:
 	}
-	cell := s.impl.resolver.Cell()
+	impl.mu.Unlock()
+	cell := impl.resolver.Cell()
 	cols := cellsFor(width, cell.Width)
 	rows := cellsFor(height, cell.Height)
 	if cols < 1 {
@@ -162,18 +175,44 @@ func (s *Shell) Resize(width, height int) error {
 	if rows < 1 {
 		rows = 1
 	}
-	s.impl.mu.Lock()
-	same := cols == s.impl.lastColumns && rows == s.impl.lastRows
-	s.impl.mu.Unlock()
-	if same {
-		return nil
+	impl.mu.Lock()
+	if impl.closed {
+		impl.mu.Unlock()
+		return errShellClosed
 	}
-	if err := s.impl.session.Nvim().TryResizeUI(cols, rows); err != nil {
-		return fmt.Errorf("app: resize UI %dx%d: %w", cols, rows, err)
+	select {
+	case <-impl.session.Exited():
+		impl.mu.Unlock()
+		return errShellClosed
+	default:
 	}
-	s.impl.mu.Lock()
-	s.impl.lastColumns, s.impl.lastRows = cols, rows
-	s.impl.mu.Unlock()
+	switch {
+	case impl.resizePending:
+		if cols == impl.pendingColumns && rows == impl.pendingRows {
+			impl.mu.Unlock()
+			return nil
+		}
+		impl.pendingColumns, impl.pendingRows = cols, rows
+	case impl.resizeInFlight:
+		if cols == impl.inFlightColumns && rows == impl.inFlightRows {
+			impl.mu.Unlock()
+			return nil
+		}
+		impl.pendingColumns, impl.pendingRows = cols, rows
+		impl.resizePending = true
+	default:
+		if cols == impl.lastColumns && rows == impl.lastRows {
+			impl.mu.Unlock()
+			return nil
+		}
+		impl.pendingColumns, impl.pendingRows = cols, rows
+		impl.resizePending = true
+	}
+	impl.mu.Unlock()
+	select {
+	case impl.resizeCh <- struct{}{}:
+	default:
+	}
 	return nil
 }
 
@@ -258,7 +297,11 @@ func Start(ctx context.Context, req LaunchRequest, clock diag.Clock, clipboard C
 	impl.mu.Lock()
 	impl.started = true
 	impl.mu.Unlock()
-	impl.wg.Add(3)
+	impl.wg.Add(4)
+	go func() {
+		defer impl.wg.Done()
+		impl.watchResize()
+	}()
 	go func() {
 		defer impl.wg.Done()
 		_ = impl.queue.Run(ctx)
@@ -296,14 +339,13 @@ func Start(ctx context.Context, req LaunchRequest, clock diag.Clock, clipboard C
 				_ = shell.Resize(width, height)
 			})
 			window.OnClose(func(*mygo.CloseEvent) {
-				_ = shell.Close()
+				go func() { _ = shell.Close() }()
 			})
 			width, height := window.ContentSize()
 			if err := shell.Resize(width, height); err != nil {
 				if !isCleanSessionError(err) {
 					impl.recordCloseError(fmt.Errorf("app: initial resize: %w", err))
 				}
-				return
 			}
 			if impl.isClosing() {
 				impl.quitOnce.Do(func() { mygo.App.Quit() })
@@ -338,6 +380,73 @@ func (impl *shellImpl) isClosing() bool {
 		return true
 	default:
 		return false
+	}
+}
+
+func (impl *shellImpl) takePendingResize() (int, int, bool) {
+	impl.mu.Lock()
+	defer impl.mu.Unlock()
+	if impl.closed || !impl.resizePending {
+		return 0, 0, false
+	}
+	cols, rows := impl.pendingColumns, impl.pendingRows
+	impl.resizePending = false
+	if cols == impl.lastColumns && rows == impl.lastRows {
+		return 0, 0, false
+	}
+	impl.resizeInFlight = true
+	impl.inFlightColumns, impl.inFlightRows = cols, rows
+	return cols, rows, true
+}
+
+func (impl *shellImpl) watchResize() {
+	for {
+		cols, rows, ok := impl.takePendingResize()
+		if !ok {
+			select {
+			case <-impl.closing:
+				return
+			case <-impl.ctx.Done():
+				return
+			case <-impl.session.Exited():
+				return
+			case <-impl.resizeCh:
+				continue
+			}
+		}
+		select {
+		case <-impl.closing:
+			impl.mu.Lock()
+			impl.resizeInFlight = false
+			impl.mu.Unlock()
+			return
+		case <-impl.session.Exited():
+			impl.mu.Lock()
+			impl.resizeInFlight = false
+			impl.mu.Unlock()
+			return
+		default:
+		}
+		err := impl.session.Nvim().TryResizeUI(cols, rows)
+		impl.mu.Lock()
+		impl.resizeInFlight = false
+		if err == nil {
+			impl.lastColumns, impl.lastRows = cols, rows
+		}
+		impl.mu.Unlock()
+		if err != nil {
+			select {
+			case <-impl.closing:
+				return
+			case <-impl.session.Exited():
+				return
+			default:
+			}
+			if isCleanSessionError(err) {
+				return
+			}
+			impl.recordCloseError(fmt.Errorf("app: resize UI %dx%d: %w", cols, rows, err))
+		}
 	}
 }
 
@@ -388,6 +497,7 @@ func isCleanSessionError(err error) bool {
 	}
 	return errors.Is(err, io.EOF) || errors.Is(err, io.ErrClosedPipe) ||
 		errors.Is(err, rpc.ErrClosed) || errors.Is(err, context.Canceled) ||
+		errors.Is(err, errShellClosed) ||
 		strings.Contains(err.Error(), "exit status") || strings.Contains(err.Error(), "signal:") ||
 		strings.Contains(err.Error(), "session closed")
 }

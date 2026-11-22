@@ -500,12 +500,11 @@ func TestResizeClampAndClose(test *testing.T) {
 	if err := shell.Resize(0, 0); err != nil {
 		test.Fatalf("Resize(0, 0): %v", err)
 	}
-	shell.impl.mu.Lock()
-	lastColumns, lastRows := shell.impl.lastColumns, shell.impl.lastRows
-	shell.impl.mu.Unlock()
-	if lastColumns != 1 || lastRows != 1 {
-		test.Errorf("Resize(0, 0) sent %dx%d, want 1x1", lastColumns, lastRows)
-	}
+	waitUntil(test, 5*time.Second, "clamped resize", func() bool {
+		shell.impl.mu.Lock()
+		defer shell.impl.mu.Unlock()
+		return shell.impl.lastColumns == 1 && shell.impl.lastRows == 1
+	})
 	var columns int
 	if err := shell.impl.session.Nvim().Eval("&columns", &columns); err != nil {
 		test.Fatalf("Eval(&columns): %v", err)
