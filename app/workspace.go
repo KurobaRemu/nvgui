@@ -254,13 +254,20 @@ func workspaceNewWindow(w *Workspace, ctx context.Context, req LaunchRequest) (u
 				return
 			}
 			impl.mu.Unlock()
-			window := newWorkspaceWindow(shell, launch, id, impl)
+			window, offs := newWorkspaceWindow(shell, launch, id, impl)
 			impl.mu.Lock()
 			alive := impl.windows[id] == current && !impl.closed && current.window == nil
 			if alive {
 				current.window = window
 			}
 			impl.mu.Unlock()
+			for _, off := range offs {
+				if alive {
+					registerDisplayCleanup(shell, []func(){off})
+				} else {
+					off()
+				}
+			}
 			if !alive {
 				window.Destroy()
 			}
@@ -355,7 +362,7 @@ func cleanBaseNvimArgs(args []string) []string {
 	return cleaned
 }
 
-func newWorkspaceWindow(shell *Shell, req LaunchRequest, id uint64, impl *workspaceImpl) *mygo.Window {
+func newWorkspaceWindow(shell *Shell, req LaunchRequest, id uint64, impl *workspaceImpl) (*mygo.Window, []func()) {
 	cell := shell.impl.cell()
 	window := mygo.NewWindow(mygo.WindowOptions{
 		Title:          "nvgui",
@@ -367,13 +374,9 @@ func newWorkspaceWindow(shell *Shell, req LaunchRequest, id uint64, impl *worksp
 	shell.impl.mu.Lock()
 	shell.impl.window = window
 	shell.impl.mu.Unlock()
-	window.OnFocus(func() { impl.recordFocus(id) })
+	offs := attachDisplayWindow(shell, window, func() { impl.recordFocus(id) })
 	window.OnClose(func(*mygo.CloseEvent) {
 		impl.asyncTask(func() { _ = workspaceCloseWindow(&Workspace{impl: impl}, id) })
-	})
-	window.OnResize(func() {
-		width, height := window.ContentSize()
-		_ = shell.Resize(width, height)
 	})
 	window.OnFileDrop(func(event *mygo.FileDropEvent) {
 		if event == nil || len(event.Paths) == 0 {
@@ -391,7 +394,7 @@ func newWorkspaceWindow(shell *Shell, req LaunchRequest, id uint64, impl *worksp
 	if err := shell.Resize(width, height); err != nil && !isCleanSessionError(err) {
 		shell.impl.recordCloseError(fmt.Errorf("app: initial resize: %w", err))
 	}
-	return window
+	return window, offs
 }
 
 func workspaceOpenInPolicy(w *Workspace) OpenInPolicy {

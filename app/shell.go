@@ -51,7 +51,9 @@ type shellImpl struct {
 	onDrop         func([]string)
 	workspace      *Workspace
 	explicitOpenIn bool
+	displayOffs    []func()
 
+	animSnapMu            sync.Mutex
 	mu                    sync.Mutex
 	inputSyncMu           sync.Mutex
 	services              ui.Services
@@ -70,6 +72,17 @@ type shellImpl struct {
 	forwardedInputSeq     uint64
 	lastGUIFont           string
 	failedGUIFont         string
+	scale                 float32
+	fullScreen            bool
+	scaleRebuildCount     uint64
+	repaintCount          uint64
+	forceFullRepaint      bool
+	snapNextFrame         bool
+	lastContentWidth      int
+	lastContentHeight     int
+	sawWindowState        bool
+	lastWindowHidden      bool
+	lastWindowActive      bool
 	envGUIFontOverride    bool
 	sawInitialNvimGUIFont bool
 	initialNvimGUIFont    string
@@ -82,6 +95,8 @@ type shellImpl struct {
 	nvimConfig            nvimConfigState
 	syncCh                chan struct{}
 	syncSem               chan struct{}
+	snappingAnim          bool
+	preSnapAnimConfig     render.AnimationConfig
 
 	closeOnce sync.Once
 	quitOnce  sync.Once
@@ -149,6 +164,7 @@ func newShell(req LaunchRequest, clock diag.Clock, clipboard Clipboard) *Shell {
 	return &Shell{impl: &shellImpl{
 		req:           req,
 		clipboard:     clipboard,
+		scale:         1,
 		animClock:     newAnimClock(clock),
 		envConfigKeys: envConfigKeys(req.Env),
 		explicitKeys:  make(map[string]bool),
@@ -172,6 +188,7 @@ func shellView(shell *Shell, c *ui.Context) {
 	}
 	impl := shell.impl
 	if c != nil {
+		observeWindowState(shell, c)
 		if impl.onShortcut != nil {
 			impl.onShortcut(c)
 		}
@@ -264,6 +281,7 @@ func (s *Shell) Resize(width, height int) error {
 		return errShellClosed
 	default:
 	}
+	impl.recordResize(width, height)
 	impl.mu.Unlock()
 	cell := impl.cell()
 	cols := cellsFor(width, cell.Width)
@@ -332,6 +350,7 @@ func (s *Shell) AttachInput(c *ui.Context) ui.Element {
 		impl.syncInputTrace()
 		return handled
 	}).TextCaret(impl.caret()).InputMethod(impl.handler.IMEAllowed())
+	inputBox.Draw(func(p *ui.Painter, _ ui.Rect) { observePainterScale(s, p) })
 	inputBox.Children(func() {
 		impl.mu.Lock()
 		view := impl.view
@@ -619,13 +638,11 @@ func startShell(ctx context.Context, req LaunchRequest, clock diag.Clock, clipbo
 			impl.mu.Lock()
 			impl.window = window
 			impl.mu.Unlock()
-			window.OnResize(func() {
-				width, height := window.ContentSize()
-				_ = shell.Resize(width, height)
-			})
+			offs := attachDisplayWindow(shell, window, nil)
 			window.OnClose(func(*mygo.CloseEvent) {
 				go func() { _ = shell.Close() }()
 			})
+			registerDisplayCleanup(shell, offs)
 			width, height := window.ContentSize()
 			if err := shell.Resize(width, height); err != nil && !isCleanSessionError(err) {
 				impl.recordCloseError(fmt.Errorf("app: initial resize: %w", err))
@@ -752,7 +769,11 @@ func (impl *shellImpl) finishClose() {
 	impl.closed = true
 	close(impl.closing)
 	started := impl.started
+	offs := detachDisplayCleanup(impl)
 	impl.mu.Unlock()
+	for _, off := range offs {
+		off()
+	}
 	if !started {
 		return
 	}
@@ -860,15 +881,50 @@ func cloneFrameMetaWithoutScroll(meta *screen.FrameMeta) *screen.FrameMeta {
 	return &clone
 }
 
+func sameAnimConfigSnapshot(a, b NvimConfigSnapshot) bool {
+	return a.CursorAnimation == b.CursorAnimation &&
+		a.CursorAnimationLength == b.CursorAnimationLength &&
+		a.CursorAnimateCommandLine == b.CursorAnimateCommandLine &&
+		a.CursorAnimateInsertMode == b.CursorAnimateInsertMode &&
+		a.ScrollAnimation == b.ScrollAnimation &&
+		a.ScrollAnimationLength == b.ScrollAnimationLength &&
+		a.Ligatures == b.Ligatures
+}
+
 func (impl *shellImpl) refreshFrameWithContext(c *ui.Context, now time.Time, instant bool) {
+	displayFrameComplete := false
+	var forceFullRepaint, snapNextFrame bool
+	restoreDisplayFlags := func() {
+		impl.mu.Lock()
+		impl.forceFullRepaint = impl.forceFullRepaint || forceFullRepaint
+		impl.snapNextFrame = impl.snapNextFrame || snapNextFrame
+		impl.mu.Unlock()
+	}
+	impl.mu.Lock()
+	if impl.session == nil || impl.view == nil || impl.planner == nil || impl.animator == nil || impl.resolver == nil || impl.handler == nil {
+		impl.mu.Unlock()
+		return
+	}
+	forceFullRepaint, snapNextFrame = impl.consumeDisplayFlags()
+	impl.mu.Unlock()
+	if forceFullRepaint || snapNextFrame {
+		defer func() {
+			if !displayFrameComplete {
+				restoreDisplayFlags()
+			}
+		}()
+	}
+	if snapNextFrame {
+		instant = true
+	}
+	state, meta := impl.session.LatestSnapshot()
+	if state == nil {
+		return
+	}
 	impl.mu.Lock()
 	session, view, planner, animator, resolver, handler := impl.session, impl.view, impl.planner, impl.animator, impl.resolver, impl.handler
 	impl.mu.Unlock()
 	if session == nil || view == nil || planner == nil || animator == nil || resolver == nil || handler == nil {
-		return
-	}
-	state, meta := session.LatestSnapshot()
-	if state == nil {
 		return
 	}
 	if instant {
@@ -909,8 +965,8 @@ func (impl *shellImpl) refreshFrameWithContext(c *ui.Context, now time.Time, ins
 	if snapshot.closed {
 		return
 	}
-	stepOnly := !instant && !snapshot.newSeq && !snapshot.configDirty && snapshot.active && now.After(snapshot.lastAnimNow)
-	if !instant && !snapshot.newSeq && !snapshot.configDirty && (!snapshot.active || !now.After(snapshot.lastAnimNow)) {
+	stepOnly := !instant && !forceFullRepaint && !snapshot.newSeq && !snapshot.configDirty && snapshot.active && now.After(snapshot.lastAnimNow)
+	if !instant && !forceFullRepaint && !snapshot.newSeq && !snapshot.configDirty && (!snapshot.active || !now.After(snapshot.lastAnimNow)) {
 		if c != nil && snapshot.active {
 			c.AnimationFrame()
 		}
@@ -941,82 +997,147 @@ func (impl *shellImpl) refreshFrameWithContext(c *ui.Context, now time.Time, ins
 			impl.mu.Unlock()
 		}
 	}
-	if fontGUIFont != "" && fontGUIFont != snapshot.lastGUIFont && fontGUIFont != snapshot.failedGUIFont {
-		resolver, err := text.NewResolver(text.Config{GUIFont: fontGUIFont, Scale: 1})
+	for fontGUIFont != "" && fontGUIFont != snapshot.failedGUIFont {
+		impl.mu.Lock()
+		if impl.closed || impl.lastGUIFont == fontGUIFont {
+			impl.mu.Unlock()
+			break
+		}
+		scale := impl.scale
+		impl.mu.Unlock()
+		if scale <= 0 {
+			scale = 1
+		}
+		resolver, err := text.NewResolver(text.Config{GUIFont: fontGUIFont, Scale: scale})
 		if err != nil {
 			impl.mu.Lock()
-			impl.failedGUIFont = fontGUIFont
+			if !impl.closed {
+				impl.failedGUIFont = fontGUIFont
+			}
 			impl.mu.Unlock()
-		} else {
-			impl.mu.Lock()
-			oldCell := impl.resolver.Cell()
-			cfg := impl.animator.Config()
-			impl.resolver = resolver
-			impl.planner = render.NewPlanner(resolver)
-			impl.animator = render.NewAnimator(impl.planner, cfg, impl.animClock)
-			planner, animator = impl.planner, impl.animator
-			impl.lastGUIFont = fontGUIFont
-			impl.failedGUIFont = ""
+			break
+		}
+		impl.animSnapMu.Lock()
+		impl.mu.Lock()
+		if impl.closed {
+			impl.mu.Unlock()
+			impl.animSnapMu.Unlock()
+			return
+		}
+		if scaleChanged(impl.scale, scale) {
+			impl.forceFullRepaint = true
 			impl.configDirty = true
 			impl.configGeneration++
-			snapshot.configDirty = true
-			snapshot.generation = impl.configGeneration
-			cellChanged = resolver.Cell() != oldCell
-			stepOnly = false
 			impl.mu.Unlock()
+			impl.animSnapMu.Unlock()
+			invalidate(snapshot.services, snapshot.window)
+			break
 		}
+		oldCell := impl.resolver.Cell()
+		cfg := impl.currentAnimConfigLocked()
+		nextPlanner := render.NewPlanner(resolver)
+		nextPlanner.SetLigaturesEnabled(cfg.LigaturesEnabled)
+		nextAnimator := render.NewAnimator(nextPlanner, cfg, impl.animClock)
+		impl.resolver = resolver
+		impl.planner = nextPlanner
+		impl.animator = nextAnimator
+		planner, animator = impl.planner, impl.animator
+		impl.lastGUIFont = fontGUIFont
+		impl.failedGUIFont = ""
+		impl.configDirty = true
+		impl.configGeneration++
+		snapshot.configDirty = true
+		snapshot.generation = impl.configGeneration
+		cellChanged = resolver.Cell() != oldCell
+		stepOnly = false
+		impl.mu.Unlock()
+		impl.animSnapMu.Unlock()
+		break
 	}
 
-	savedConfig := animator.Config()
-	if instant {
-		instantConfig := savedConfig
-		instantConfig.CursorEnabled = false
-		instantConfig.ScrollEnabled = false
-		animator.SetConfig(instantConfig)
-		defer animator.SetConfig(savedConfig)
+	if stepOnly {
+		frame, active, err := animator.Step()
+		if err != nil {
+			return
+		}
+		impl.mu.Lock()
+		impl.lastAnimNow = now
+		impl.mu.Unlock()
+		applyFrame(view, handler, state, frame, &displayFrameComplete)
+		if cellChanged {
+			impl.queueCellResize(true, snapshot.services, snapshot.window)
+		}
+		if c != nil && active {
+			c.AnimationFrame()
+		}
+		return
+	}
+	list, err := drawlist.Build(state)
+	if err != nil {
+		return
 	}
 
 	var frame renderlist.Frame
 	var active bool
-	var err error
-	if stepOnly {
-		frame, active, err = animator.Step()
-		impl.mu.Lock()
-		impl.lastAnimNow = now
-		impl.mu.Unlock()
+	if instant {
+		frame, active, err = func() (renderlist.Frame, bool, error) {
+			impl.animSnapMu.Lock()
+			defer impl.animSnapMu.Unlock()
+			impl.mu.Lock()
+			if impl.animator != nil {
+				animator = impl.animator
+			}
+			savedCfg := animator.Config()
+			instantCfg := savedCfg
+			instantCfg.CursorEnabled = false
+			instantCfg.ScrollEnabled = false
+			animator.SetConfig(instantCfg)
+			impl.snappingAnim = true
+			impl.preSnapAnimConfig = savedCfg
+			snapAnim := impl.nvimConfig.snapshot
+			impl.mu.Unlock()
+			defer func() {
+				impl.mu.Lock()
+				impl.snappingAnim = false
+				if impl.animator == animator && animator.Config() == instantCfg && sameAnimConfigSnapshot(impl.nvimConfig.snapshot, snapAnim) {
+					animator.SetConfig(savedCfg)
+				}
+				impl.mu.Unlock()
+			}()
+			return animator.Submit(state, meta, list)
+		}()
 	} else {
-		list, buildErr := drawlist.Build(state)
-		if buildErr != nil {
-			return
-		}
 		frame, active, err = animator.Submit(state, meta, list)
-		if err != nil {
-			return
-		}
-		impl.mu.Lock()
-		impl.lastSeq = state.Seq
-		impl.lastAnimNow = now
-		if snapshot.configDirty && impl.configGeneration == snapshot.generation {
-			impl.configDirty = false
-		}
-		impl.mu.Unlock()
 	}
 	if err != nil {
 		return
 	}
-	if len(frame.Commands) != 0 {
-		view.SetFrame(frame)
-		handler.SetMode(state.Mode)
+	impl.mu.Lock()
+	impl.lastSeq = state.Seq
+	impl.lastAnimNow = now
+	if snapshot.configDirty && impl.configGeneration == snapshot.generation {
+		impl.configDirty = false
 	}
-	if instant {
+	impl.mu.Unlock()
+	applyFrame(view, handler, state, frame, &displayFrameComplete)
+	if instant || snapNextFrame {
 		active = false
 	}
 	if cellChanged {
 		impl.queueCellResize(true, snapshot.services, snapshot.window)
 	}
-	if c != nil && active && !instant {
+	if c != nil && active && !instant && !snapNextFrame {
 		c.AnimationFrame()
 	}
+}
+
+func applyFrame(view *render.View, handler *input.Handler, state *screen.State, frame renderlist.Frame, complete *bool) {
+	if len(frame.Commands) == 0 {
+		return
+	}
+	view.SetFrame(frame)
+	handler.SetMode(state.Mode)
+	*complete = true
 }
 
 func (impl *shellImpl) cell() text.CellSize {
