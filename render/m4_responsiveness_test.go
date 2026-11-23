@@ -15,6 +15,7 @@ import (
 	"nvgui/drawlist"
 	"nvgui/renderlist"
 	"nvgui/screen"
+	"nvgui/text"
 )
 
 func m4ResponsivenessResolver(t *testing.T) *Planner {
@@ -284,6 +285,229 @@ func TestM4Responsiveness_ScrollCursorMatchesCursorLineOffsetAndSettles(t *testi
 	marginCursorY, found := m4ResponsivenessCursorY(frame)
 	if !found || math.Abs(float64(marginCursorY-staticMarginCursorY)) > 0.001 {
 		t.Fatalf("margin cursor moved: got %v, want %v", marginCursorY, staticMarginCursorY)
+	}
+}
+
+func m4ResponsivenessAssertTopAndBottomRowsCovered(t *testing.T, frame renderlist.Frame, img *image.RGBA, cell text.CellSize, rows int, step int) {
+	t.Helper()
+	const rowCoverLimit = 4
+	metas := metadataFor(frame).rows
+	rowHasGlyph := func(row int) bool {
+		rowTop := float32(row) * cell.Height
+		rowBottom := rowTop + cell.Height
+		for index, command := range frame.Commands {
+			if command.Op != "glyphs" || command.Text == "" || command.W <= 0 || command.H <= 0 {
+				continue
+			}
+			visible := commandRect(command)
+			if index < len(metas) && metas[index].clip.W > 0 && metas[index].clip.H > 0 {
+				visible = intersectRects(visible, metas[index].clip)
+			}
+			if visible.W > 0 && visible.H > 0 && visible.Y < rowBottom && visible.Y+visible.H > rowTop {
+				return true
+			}
+		}
+		return false
+	}
+	rowHasPixels := func(row int) bool {
+		top := int(math.Floor(float64(row) * float64(cell.Height)))
+		bottom := min(img.Rect.Max.Y, int(math.Ceil(float64(row+1)*float64(cell.Height))))
+		for y := max(img.Rect.Min.Y, top); y < bottom; y++ {
+			for x := img.Rect.Min.X; x < img.Rect.Max.X; x++ {
+				pixel := img.RGBAAt(x, y)
+				if pixel.R != 0x10 || pixel.G != 0x10 || pixel.B != 0x18 {
+					return true
+				}
+			}
+		}
+		return false
+	}
+	for _, row := range append([]int{0, 1, 2, 3}, rows-rowCoverLimit, rows-3, rows-2, rows-1) {
+		if !rowHasGlyph(row) {
+			t.Fatalf("scroll frame %d row %d has no visible glyphs command", step, row)
+		}
+		if !rowHasPixels(row) {
+			t.Fatalf("scroll frame %d row %d rendered only background pixels", step, row)
+		}
+	}
+}
+
+func TestM4Responsiveness_SubmitAdvancesActiveScrollWithoutStutter(t *testing.T) {
+	planner := m4ResponsivenessResolver(t)
+	cell := planner.resolver.Cell()
+	clock, _ := m4ResponsivenessClock()
+	cfg := DefaultAnimationConfig()
+	cfg.CursorEnabled = false
+	cfg.ScrollAnimationLength = 1.5
+	animator := NewAnimator(planner, cfg, clock)
+	const rows = 16
+	state, list := m4ResponsivenessScrollList(1, rows, 0, "stutter", 0, 0, false)
+	baseline, _, err := animator.Submit(state, &screen.FrameMeta{Seq: 1}, list)
+	if err != nil {
+		t.Fatalf("baseline Submit: %v", err)
+	}
+	view := NewView()
+	view.SetFrame(baseline)
+	width := int(math.Ceil(40 * float64(cell.Width)))
+	height := int(math.Ceil(rows * float64(cell.Height)))
+	tester := ui.NewTester(func(c *ui.Context) { view.Draw(c) }, width, height)
+	if tester.Image() == nil {
+		t.Fatal("warm-up image unavailable")
+	}
+	observe := func(label string, frame renderlist.Frame, step int) {
+		view.SetFrame(frame)
+		tester.Frame()
+		img := tester.Image()
+		if img == nil {
+			t.Fatalf("%s %d rendered nil image", label, step)
+		}
+		m4ResponsivenessAssertScreenHalvesNonBlank(t, img, step)
+		m4ResponsivenessAssertTopAndBottomRowsCovered(t, frame, img, cell, rows, step)
+	}
+	var lastPosition float32
+	var maxPosition float32
+	var submitDeltas []float32
+	totalTravel := float32(0)
+	for step := 0; step < 20; step++ {
+		if step == 0 {
+			state, list = m4ResponsivenessScrollList(2, rows, 2, "stutter", 0, 0, false)
+			initial, _, err := animator.Submit(state, m4ResponsivenessScrollMeta(2, 1, false), list)
+			if err != nil {
+				t.Fatalf("initial scroll Submit: %v", err)
+			}
+			lastPosition = animator.impl.scroll[1].spring.Position
+			observe("Submit", initial, 0)
+			continue
+		}
+		for inner := 0; inner < 3; inner++ {
+			clock.Advance(8 * time.Millisecond)
+			frame, _, err := animator.Step()
+			if err != nil {
+				t.Fatalf("Step %d.%d: %v", step, inner, err)
+			}
+			position := animator.impl.scroll[1].spring.Position
+			if step > 0 && math.Abs(float64(position-lastPosition)) < 1e-4 {
+				t.Fatalf("Step %d.%d froze scroll position at %v", step, inner, position)
+			}
+			lastPosition = position
+			observe("Step", frame, step)
+		}
+		clock.Advance(8 * time.Millisecond)
+		frozen := animator.impl.scroll[1].spring
+		expected := frozen
+		expected.Update(float32((8 * time.Millisecond).Seconds()), cfg.ScrollAnimationLength)
+		state, list = m4ResponsivenessScrollList(uint64(step+2), rows, step+2, "stutter", 0, 0, false)
+		frame, _, err := animator.Submit(state, m4ResponsivenessScrollMeta(uint64(step+2), 1, false), list)
+		if err != nil {
+			t.Fatalf("Submit %d: %v", step, err)
+		}
+		position := animator.impl.scroll[1].spring.Position
+		if position != expected.Position+1 {
+			t.Fatalf("Submit %d spring position = %.6f, want dt-advanced %.6f + injected 1", step, position, expected.Position)
+		}
+		submitDeltas = append(submitDeltas, position-expected.Position)
+		totalTravel += math_Abs32(position - lastPosition)
+		lastPosition = position
+		maxPosition = max(maxPosition, position)
+		observe("Submit", frame, step)
+	}
+	if maxPosition <= 12 {
+		t.Fatalf("continuous scroll accumulated %.2f lines, want > 12", maxPosition)
+	}
+	for index, delta := range submitDeltas {
+		if delta <= 0.99 || delta > 1.01 {
+			t.Fatalf("Submit %d effective injected delta = %.6f, want dt-stepped 1 line", index, delta)
+		}
+	}
+	if totalTravel <= 12 {
+		t.Fatalf("continuous scroll accumulated %.2f lines of travel, want > 12", totalTravel)
+	}
+}
+
+func math_Abs32(value float32) float32 {
+	if value < 0 {
+		return -value
+	}
+	return value
+}
+
+func TestM4Responsiveness_ScrollClampDoesNotTearGapBetweenCurrentAndHistory(t *testing.T) {
+	planner := m4ResponsivenessResolver(t)
+	cell := planner.resolver.Cell()
+	clock, _ := m4ResponsivenessClock()
+	cfg := DefaultAnimationConfig()
+	cfg.CursorEnabled = false
+	cfg.ScrollFarLines = 10
+	animator := NewAnimator(planner, cfg, clock)
+	const rows = 16
+	const injected = float32(6)
+	state, list := m4ResponsivenessScrollList(1, rows, 0, "clamp", 0, 0, false)
+	if _, _, err := animator.Submit(state, &screen.FrameMeta{Seq: 1}, list); err != nil {
+		t.Fatalf("baseline Submit: %v", err)
+	}
+	view := NewView()
+	width := int(math.Ceil(40 * float64(cell.Width)))
+	height := int(math.Ceil(rows * float64(cell.Height)))
+	tester := ui.NewTester(func(c *ui.Context) { view.Draw(c) }, width, height)
+	visibleText := func(frame renderlist.Frame) string {
+		var builder strings.Builder
+		for _, command := range frame.Commands {
+			if command.Op == "glyphs" && command.Text != "" {
+				builder.WriteString(command.Text)
+				builder.WriteByte('\n')
+			}
+		}
+		return builder.String()
+	}
+	previousText := ""
+	previousLatest := float32(0)
+	sawClamped := false
+	for step := 0; step < 12; step++ {
+		clock.Advance(8 * time.Millisecond)
+		startRow := (step + 1) * int(injected)
+		state, list = m4ResponsivenessScrollList(uint64(step+2), rows, startRow, "clamp", 0, 0, false)
+		frame, _, err := animator.Submit(state, m4ResponsivenessScrollMeta(uint64(step+2), float64(injected), false), list)
+		if err != nil {
+			t.Fatalf("Submit %d: %v", step, err)
+		}
+		gridState := animator.impl.scroll[1]
+		if len(gridState.snapshots) == 0 {
+			t.Fatalf("Submit %d recorded no history snapshot", step)
+		}
+		snapshotCount := len(gridState.snapshots)
+		latest := gridState.snapshots[snapshotCount-1].lineOffset
+		if latest != -injected {
+			t.Fatalf("Submit %d latest snapshot lineOffset = %.4f, want %.4f", step, latest, -injected)
+		}
+		if snapshotCount >= 2 {
+			gap := latest - gridState.snapshots[snapshotCount-2].lineOffset
+			if gap != injected {
+				t.Fatalf("Submit %d adjacent snapshot gap = %.4f, want %.4f", step, gap, injected)
+			}
+		}
+		if math.Abs(float64(gridState.spring.Position)) >= float64(rows)-1e-3 {
+			sawClamped = true
+		}
+		text := visibleText(frame)
+		if text == previousText {
+			t.Fatalf("Submit %d visible text stalled while scrolling", step)
+		}
+		view.SetFrame(frame)
+		tester.Frame()
+		img := tester.Image()
+		if img == nil {
+			t.Fatalf("Submit %d rendered nil image", step)
+		}
+		m4ResponsivenessAssertScreenHalvesNonBlank(t, img, step)
+		m4ResponsivenessAssertTopAndBottomRowsCovered(t, frame, img, cell, rows, step)
+		previousText = text
+		previousLatest = latest
+	}
+	if !sawClamped {
+		t.Fatal("continuous large-step scroll never reached maxClamp")
+	}
+	if previousLatest != -injected {
+		t.Fatalf("last snapshot lineOffset = %.4f, want %.4f after clamp", previousLatest, -injected)
 	}
 }
 

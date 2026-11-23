@@ -346,9 +346,7 @@ func (s *Shell) AttachInput(c *ui.Context) ui.Element {
 	}
 	impl := s.impl
 	inputBox := ui.Box(c).Fill().Focusable().AutoFocus().Label("nvgui-input").HandleInput(func(ev ui.InputEvent) bool {
-		handled := s.HandleEditCommand(c, ev) || impl.handler.Handle(ev)
-		impl.syncInputTrace()
-		return handled
+		return s.HandleEditCommand(c, ev) || impl.handler.Handle(ev)
 	}).TextCaret(impl.caret()).InputMethod(impl.handler.IMEAllowed())
 	inputBox.Draw(func(p *ui.Painter, _ ui.Rect) { observePainterScale(s, p) })
 	inputBox.Children(func() {

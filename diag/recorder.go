@@ -6,13 +6,10 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"io"
 	"os"
 	"path/filepath"
 	"sync"
 	"time"
-
-	"github.com/neovim/go-client/msgpack"
 
 	"nvgui/drawlist"
 	"nvgui/protocol"
@@ -83,83 +80,187 @@ func (r *Recorder) Write(p []byte) (int, error) {
 }
 
 func (r *Recorder) ingest(now time.Time) {
-	if len(r.pending) == 0 {
-		return
-	}
-	complete, err := completeMessageBoundary(r.pending)
-	if err != nil && len(complete) == 0 {
-		return
-	}
-	if len(complete) > 0 {
-		messages, readErr := protocol.ReadMessages(complete)
-		if readErr == nil {
-			for _, message := range messages {
-				r.messages = append(r.messages, recordedMessage{
-					raw:      append([]byte(nil), message.Raw...),
-					at:       now,
-					sequence: r.nextSeq,
-				})
-				r.nextSeq++
-			}
-		}
-	}
-	if len(complete) == len(r.pending) {
-		r.pending = nil
-	} else {
-		r.pending = append([]byte(nil), r.pending[len(complete):]...)
-	}
-}
-
-func completeMessageBoundary(buffer []byte) ([]byte, error) {
 	position := 0
-	for position < len(buffer) {
-		consumed, err := messageLength(buffer[position:])
-		if err != nil {
-			return buffer[:position], err
+	for position < len(r.pending) {
+		consumed, complete, err := msgpackValueLen(r.pending[position:])
+		if err != nil || !complete {
+			break
 		}
-		if consumed <= 0 {
-			return buffer[:position], io.ErrUnexpectedEOF
+		raw := r.pending[position : position+consumed]
+		if isValidMsgpackRPCHeader(raw) {
+			r.messages = append(r.messages, recordedMessage{
+				raw:      append([]byte(nil), raw...),
+				at:       now,
+				sequence: r.nextSeq,
+			})
+			r.nextSeq++
 		}
 		position += consumed
-		if position > len(buffer) {
-			return nil, fmt.Errorf("msgpack decoder consumed past buffer")
+	}
+	if position > 0 {
+		r.pending = append(r.pending[:0], r.pending[position:]...)
+	}
+}
+
+func isValidMsgpackRPCHeader(message []byte) bool {
+	if len(message) == 0 {
+		return false
+	}
+	fields := uint64(0)
+	width := 0
+	switch {
+	case message[0] == 0x93 || message[0] == 0x94:
+		fields = uint64(message[0] - 0x90)
+		width = 0
+	case message[0] == 0xdc || message[0] == 0xdd:
+		width = 2
+		if message[0] == 0xdd {
+			width = 4
+		}
+		if len(message) < 1+width {
+			return false
+		}
+		for _, value := range message[1 : 1+width] {
+			fields = fields<<8 | uint64(value)
+		}
+	default:
+		return false
+	}
+	if fields != 3 && fields != 4 {
+		return false
+	}
+	offset := 1 + width
+	if offset >= len(message) {
+		return false
+	}
+	messageType := message[offset]
+	if messageType != 0x00 && messageType != 0x01 && messageType != 0x02 {
+		return false
+	}
+	if offset+1 >= len(message) {
+		return false
+	}
+	nextTag := message[offset+1]
+	if fields == 3 && messageType == 2 {
+		return msgpackStringHeader(nextTag)
+	}
+	return fields == 4
+}
+
+func msgpackStringHeader(tag byte) bool {
+	return (tag >= 0xa0 && tag <= 0xbf) || (tag >= 0xd9 && tag <= 0xdb)
+}
+
+func msgpackArrayHeader(tag byte) bool {
+	return (tag >= 0x90 && tag <= 0x9f) || tag == 0xdc || tag == 0xdd
+}
+
+func msgpackValueLen(buf []byte) (int, bool, error) {
+	return msgpackValueLenFrame(buf, 0)
+}
+
+func msgpackValueLenFrame(buf []byte, depth int) (int, bool, error) {
+	if len(buf) == 0 {
+		return 0, false, nil
+	}
+	const maxMsgpackDepth = 64
+	if depth > maxMsgpackDepth {
+		return 0, false, fmt.Errorf("diag: msgpack nesting exceeds %d levels", maxMsgpackDepth)
+	}
+	tag := buf[0]
+	switch {
+	case tag <= 0x7f || tag >= 0xe0 || tag == 0xc0 || tag == 0xc2 || tag == 0xc3:
+		return 1, true, nil
+	case tag >= 0x80 && tag <= 0x8f:
+		return msgpackContainerLenFrame(buf, 0, uint64(tag&0x0f), 2, depth)
+	case tag >= 0x90 && tag <= 0x9f:
+		return msgpackContainerLenFrame(buf, 0, uint64(tag&0x0f), 1, depth)
+	case tag >= 0xa0 && tag <= 0xbf:
+		return msgpackPayloadLen(buf, 0, uint64(tag&0x1f), 0)
+	case tag == 0xc1:
+		return 0, false, fmt.Errorf("diag: illegal msgpack format byte 0xc1")
+	case tag == 0xca:
+		return msgpackFixedLen(buf, 5)
+	case tag == 0xcb:
+		return msgpackFixedLen(buf, 9)
+	case tag >= 0xcc && tag <= 0xcf:
+		return msgpackFixedLen(buf, 1+(1<<(tag-0xcc)))
+	case tag >= 0xd0 && tag <= 0xd3:
+		return msgpackFixedLen(buf, 1+(1<<(tag-0xd0)))
+	case tag >= 0xc4 && tag <= 0xc6:
+		return msgpackPayloadLen(buf, 1<<(tag-0xc4), 0, 0)
+	case tag >= 0xc7 && tag <= 0xc9:
+		return msgpackPayloadLen(buf, 1<<(tag-0xc7), 0, 1)
+	case tag >= 0xd4 && tag <= 0xd8:
+		return msgpackFixedLen(buf, 2+(1<<(tag-0xd4)))
+	case tag >= 0xd9 && tag <= 0xdb:
+		return msgpackPayloadLen(buf, 1<<(tag-0xd9), 0, 0)
+	case tag == 0xdc:
+		return msgpackContainerLenFrame(buf, 2, 0, 1, depth)
+	case tag == 0xdd:
+		return msgpackContainerLenFrame(buf, 4, 0, 1, depth)
+	case tag == 0xde:
+		return msgpackContainerLenFrame(buf, 2, 0, 2, depth)
+	case tag == 0xdf:
+		return msgpackContainerLenFrame(buf, 4, 0, 2, depth)
+	default:
+		return 0, false, fmt.Errorf("diag: unsupported msgpack format byte %#x", tag)
+	}
+}
+
+func msgpackFixedLen(buf []byte, length int) (int, bool, error) {
+	if len(buf) < length {
+		return 0, false, nil
+	}
+	return length, true, nil
+}
+
+func msgpackPayloadLen(buf []byte, width int, length uint64, extra int) (int, bool, error) {
+	if width > 0 {
+		if len(buf) < 1+width {
+			return 0, false, nil
+		}
+		length = 0
+		for _, value := range buf[1 : 1+width] {
+			length = length<<8 | uint64(value)
 		}
 	}
-	return buffer, nil
-}
-
-func messageLength(buffer []byte) (int, error) {
-	reader := &countingReader{source: bytes.NewReader(buffer)}
-	decoder := msgpack.NewDecoder(reader)
-	var fields []any
-	err := decodeCompleteValue(decoder, &fields)
-	if err != nil {
-		return 0, err
+	prefix := 1 + width + extra
+	if len(buf) < prefix || length > uint64(len(buf)-prefix) {
+		return 0, false, nil
 	}
-	return reader.count, nil
+	return prefix + int(length), true, nil
 }
 
-func decodeCompleteValue(decoder *msgpack.Decoder, target *[]any) (err error) {
-	defer func() {
-		if recovered := recover(); recovered != nil {
-			err = io.ErrUnexpectedEOF
+func msgpackContainerLenFrame(buf []byte, width int, count uint64, valuesPerItem uint64, depth int) (int, bool, error) {
+	prefix := 1 + width
+	if width > 0 {
+		if len(buf) < prefix {
+			return 0, false, nil
 		}
-	}()
-	return decoder.Decode(target)
-}
-
-type countingReader struct {
-	source *bytes.Reader
-	count  int
-}
-
-func (reader *countingReader) Read(buffer []byte) (int, error) {
-	if len(buffer) > 1 {
-		buffer = buffer[:1]
+		count = 0
+		for _, value := range buf[1:prefix] {
+			count = count<<8 | uint64(value)
+		}
 	}
-	count, err := reader.source.Read(buffer)
-	reader.count += count
-	return count, err
+	if len(buf) < prefix || count > uint64(len(buf)-prefix)/valuesPerItem {
+		return 0, false, nil
+	}
+	offset := prefix
+	for remaining := count * valuesPerItem; remaining > 0; remaining-- {
+		if offset >= len(buf) {
+			return 0, false, nil
+		}
+		childLength, complete, err := msgpackValueLenFrame(buf[offset:], depth+1)
+		if err != nil {
+			return 0, false, err
+		}
+		if !complete {
+			return 0, false, nil
+		}
+		offset += childLength
+	}
+	return offset, true, nil
 }
 
 func (r *Recorder) trim(now time.Time) {

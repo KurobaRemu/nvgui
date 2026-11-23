@@ -118,12 +118,12 @@ func animatorSetConfig(a *Animator, cfg AnimationConfig) {
 	}
 	animationsDisabled := !impl.active && !impl.scrollActive() && (impl.cursor == nil || !impl.cursor.active)
 	if impl.initialized && impl.planner != nil && impl.lastList != nil {
-		settledFrame, err := impl.planner.Plan(impl.lastList)
+		settledFrame, settledMeta, err := impl.planner.planWithMeta(impl.lastList)
 		if err == nil {
 			refreshBaseline := ligaturesChanged || baselineExpired || animationsDisabled
 			if refreshBaseline {
 				impl.settledFrame = cloneFrame(settledFrame)
-				impl.settledMetas = metadataFor(impl.settledFrame).rows
+				impl.settledMetas = settledMeta.rows
 			}
 			storeMetadata(impl.settledFrame, frameMetadata{rows: impl.settledMetas})
 			settled, settledMetas := impl.composedFrame(impl.settledFrame, impl.settledMetas)
@@ -149,8 +149,10 @@ func cloneDrawList(source *drawlist.List) *drawlist.List {
 		layerClone.Items = make([]drawlist.Item, len(layer.Items))
 		for itemIndex, item := range layer.Items {
 			itemClone := item
-			if item.Attrs != nil {
+			if len(item.Attrs) > 0 {
 				itemClone.Attrs = append([]string(nil), item.Attrs...)
+			} else {
+				itemClone.Attrs = nil
 			}
 			layerClone.Items[itemIndex] = itemClone
 		}
@@ -234,6 +236,13 @@ func (impl *animatorImpl) scrollDelta(cfg AnimationConfig, state *screen.State, 
 			farLimit := min(float32(innerHeight), float32(far))
 			injected = float32(math.Copysign(float64(farLimit), float64(delta)))
 		}
+		previousPosition := gridState.spring.Position
+		headroom := max(float32(0), maxClamp-float32(math.Abs(float64(injected))))
+		clampedPrev := previousPosition
+		if math.Abs(float64(clampedPrev)) > float64(headroom) {
+			clampedPrev = float32(math.Copysign(float64(headroom), float64(clampedPrev)))
+		}
+		newPosition := clampedPrev + injected
 		for index := range gridState.snapshots {
 			gridState.snapshots[index].lineOffset -= injected
 		}
@@ -251,10 +260,8 @@ func (impl *animatorImpl) scrollDelta(cfg AnimationConfig, state *screen.State, 
 				}
 			}
 		}
-		previousPosition := gridState.spring.Position
 		wasActive := gridState.spring.Active()
-		position := float64(previousPosition + injected)
-		gridState.spring.Position = float32(math.Copysign(math.Min(math.Abs(position), float64(maxClamp)), position))
+		gridState.spring.Position = newPosition
 		if !wasActive || previousPosition == 0 || (previousPosition > 0) != (injected > 0) {
 			gridState.spring.Velocity = 0
 		}
@@ -291,6 +298,14 @@ func animatorSubmit(a *Animator, state *screen.State, meta *screen.FrameMeta, li
 	impl.mu.Lock()
 	defer impl.mu.Unlock()
 	now := impl.clock.Now()
+	if impl.initialized && (impl.active || impl.cursor.active || impl.scrollActive()) {
+		dt := now.Sub(impl.lastTime)
+		if dt > 0 {
+			impl.cursor.update(float32(dt.Seconds()))
+			impl.updateScroll(float32(dt.Seconds()))
+		}
+		impl.lastTime = now
+	}
 	cachedList := cloneDrawList(list)
 	var previous *previousScrollFrame
 	if impl.initialized && impl.lastList != nil && len(impl.settledFrame.Commands) > 0 &&
@@ -308,7 +323,7 @@ func animatorSubmit(a *Animator, state *screen.State, meta *screen.FrameMeta, li
 		impl.lastTime = now
 	}
 	impl.initialized = true
-	settledFrame, err := impl.planner.Plan(cachedList)
+	settledFrame, settledMeta, err := impl.planner.planWithMeta(cachedList)
 	if err != nil {
 		return renderlist.Frame{}, false, err
 	}
@@ -316,7 +331,7 @@ func animatorSubmit(a *Animator, state *screen.State, meta *screen.FrameMeta, li
 	impl.lastState = state
 	impl.lastMeta = cloneFrameMeta(meta)
 	impl.settledFrame = cloneFrame(settledFrame)
-	impl.settledMetas = metadataFor(impl.settledFrame).rows
+	impl.settledMetas = settledMeta.rows
 	impl.scrollDelta(impl.cfg, state, impl.lastMeta, cachedList, previous)
 	cell := impl.planner.resolver.Cell()
 	busy := meta != nil && meta.Busy

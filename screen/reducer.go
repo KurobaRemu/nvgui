@@ -30,6 +30,9 @@ func NewReducer() *Reducer {
 }
 
 func (r *Reducer) Apply(events []protocol.Event) ([]*State, error) {
+	if len(events) == 0 {
+		return nil, nil
+	}
 	committed := make([]*State, 0)
 	checkpoint := cloneState(r.working)
 	r.metaMu.Lock()
@@ -47,7 +50,7 @@ func (r *Reducer) Apply(events []protocol.Event) ([]*State, error) {
 		r.latest.Store(committedLatest)
 		r.latestMeta.Store(committedMeta)
 	}
-	for _, event := range events {
+	for index, event := range events {
 		switch typed := event.(type) {
 		case protocol.Flush:
 			r.metaMu.Lock()
@@ -64,8 +67,10 @@ func (r *Reducer) Apply(events []protocol.Event) ([]*State, error) {
 				viewport.HasScrollDelta = false
 				r.workingMeta.Viewports[gridID] = viewport
 			}
-			metaCheckpoint = cloneFrameMeta(r.workingMeta)
-			checkpoint = cloneState(r.working)
+			if index+1 < len(events) {
+				metaCheckpoint = cloneFrameMeta(r.workingMeta)
+				checkpoint = cloneState(r.working)
+			}
 			committedLatest = published
 			committedSeq = r.seq
 			r.latest.Store(published)

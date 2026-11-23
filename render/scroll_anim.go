@@ -12,7 +12,7 @@ import (
 	"nvgui/text"
 )
 
-const maxScrollSnapshots = 8
+const maxScrollSnapshots = 64
 
 type scrollSnapshot struct {
 	commands   []renderlist.Command
@@ -510,12 +510,13 @@ func trimScrollSnapshots(state *gridScrollState, position float32, innerHeight i
 	if state == nil || innerHeight <= 0 {
 		return
 	}
+	limit := max(maxScrollSnapshots, innerHeight+4)
 	snapshots := slices.DeleteFunc(state.snapshots, func(snapshot scrollSnapshot) bool {
 		return max(0, position)+snapshot.lineOffset <= -float32(innerHeight) ||
 			min(0, position)+snapshot.lineOffset >= float32(innerHeight)
 	})
-	if len(snapshots) > maxScrollSnapshots {
-		snapshots = append([]scrollSnapshot(nil), snapshots[len(snapshots)-maxScrollSnapshots:]...)
+	if len(snapshots) > limit {
+		snapshots = append([]scrollSnapshot(nil), snapshots[len(snapshots)-limit:]...)
 	}
 	state.snapshots = snapshots
 }

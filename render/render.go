@@ -61,15 +61,24 @@ func plannerLigaturesEnabled(p *Planner) bool {
 }
 
 func (p *Planner) Plan(list *drawlist.List) (renderlist.Frame, error) {
+	frame, meta, err := p.planWithMeta(list)
+	if err != nil {
+		return renderlist.Frame{}, err
+	}
+	storeMetadataOwned(frame, meta)
+	return frame, nil
+}
+
+func (p *Planner) planWithMeta(list *drawlist.List) (renderlist.Frame, frameMetadata, error) {
 	if list == nil {
-		return renderlist.Frame{}, fmt.Errorf("render: nil Draw List")
+		return renderlist.Frame{}, frameMetadata{}, fmt.Errorf("render: nil Draw List")
 	}
 	if p == nil || p.resolver == nil {
-		return renderlist.Frame{}, fmt.Errorf("render: nil font resolver")
+		return renderlist.Frame{}, frameMetadata{}, fmt.Errorf("render: nil font resolver")
 	}
 	cell := p.resolver.Cell()
 	if cell.Width <= 0 || cell.Height <= 0 {
-		return renderlist.Frame{}, fmt.Errorf("render: invalid cell size %+v", cell)
+		return renderlist.Frame{}, frameMetadata{}, fmt.Errorf("render: invalid cell size %+v", cell)
 	}
 
 	fonts, config, ligaturesEnabled := p.refreshCache()
@@ -87,7 +96,7 @@ func (p *Planner) Plan(list *drawlist.List) (renderlist.Frame, error) {
 	runBuf := make([]byte, 0, 256)
 	for layerIndex, layer := range list.Layers {
 		if layer.Clip.W < 0 || layer.Clip.H < 0 {
-			return renderlist.Frame{}, fmt.Errorf("render: layer %d has negative clip %+v", layerIndex, layer.Clip)
+			return renderlist.Frame{}, frameMetadata{}, fmt.Errorf("render: layer %d has negative clip %+v", layerIndex, layer.Clip)
 		}
 		clipping := layer.Clip != (drawlist.Rect{}) || layer.Width > 0 || layer.Height > 0 || list.Width > 0 || list.Height > 0
 		if clipping && (layer.Clip.W == 0 || layer.Clip.H == 0) {
@@ -98,7 +107,7 @@ func (p *Planner) Plan(list *drawlist.List) (renderlist.Frame, error) {
 			item := layer.Items[itemIndex]
 			command, ok, err := p.planItem(layer, item, cell, fonts, config, ligaturesEnabled)
 			if err != nil {
-				return renderlist.Frame{}, fmt.Errorf("render: layer %d item %d: %w", layerIndex, itemIndex, err)
+				return renderlist.Frame{}, frameMetadata{}, fmt.Errorf("render: layer %d item %d: %w", layerIndex, itemIndex, err)
 			}
 			if !ok {
 				itemIndex++
@@ -152,8 +161,7 @@ func (p *Planner) Plan(list *drawlist.List) (renderlist.Frame, error) {
 			itemIndex = nextIndex
 		}
 	}
-	storeMetadataOwned(frame, frameMetadata{rows: metas})
-	return frame, nil
+	return frame, frameMetadata{rows: metas}, nil
 }
 
 func mergeCandidate(item drawlist.Item, clipping bool) bool {

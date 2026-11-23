@@ -11,6 +11,7 @@ import (
 
 	"github.com/neovim/go-client/msgpack"
 
+	"nvgui/oracle"
 	"nvgui/protocol"
 	"nvgui/screen"
 )
@@ -252,6 +253,173 @@ func TestRecorderPartialWriteTrimsWindow(t *testing.T) {
 	}
 	if gotPending != len(partial) {
 		t.Fatalf("retained pending bytes = %d, want %d", gotPending, len(partial))
+	}
+}
+
+func TestRecorderMsgpackValueLenFormats(t *testing.T) {
+	values := [][]byte{
+		{0x00}, {0x7f}, {0xe0}, {0xff}, {0xc0}, {0xc2}, {0xc3},
+		{0xa0}, {0xa3, 'a', 'b', 'c'},
+		{0x90}, {0x92, 0x01, 0xa1, 'x'},
+		{0x80}, {0x81, 0x01, 0x02},
+		{0xca, 0, 0, 0, 0}, {0xcb, 0, 0, 0, 0, 0, 0, 0, 0},
+		{0xcc, 7}, {0xcd, 0, 7}, {0xce, 0, 0, 0, 7}, {0xcf, 0, 0, 0, 0, 0, 0, 0, 7},
+		{0xd0, 0xff}, {0xd1, 0xff, 0xff}, {0xd2, 0xff, 0xff, 0xff, 0xff}, {0xd3, 0, 0, 0, 0, 0, 0, 0, 0},
+		{0xc4, 0}, {0xc4, 2, 1, 2}, {0xc5, 0, 2, 1, 2}, {0xc6, 0, 0, 0, 2, 1, 2},
+		{0xc7, 2, 0, 1, 2}, {0xc8, 0, 2, 0, 1, 2}, {0xc9, 0, 0, 0, 2, 0, 1, 2},
+		{0xd4, 0, 1}, {0xd5, 0, 1, 2}, {0xd6, 0, 1, 2, 3, 4}, {0xd7, 0, 1, 2, 3, 4, 5, 6, 7, 8},
+		{0xd8, 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16},
+		{0xd9, 0}, {0xd9, 2, 'a', 'b'}, {0xda, 0, 2, 'a', 'b'}, {0xdb, 0, 0, 0, 2, 'a', 'b'},
+		{0xdc, 0, 2, 0x01, 0xa1, 'x'}, {0xdd, 0, 0, 0, 2, 0x01, 0xa1, 'x'},
+		{0xde, 0, 1, 0xa1, 'k', 0x92, 0x01, 0x02},
+		{0xdf, 0, 0, 0, 1, 0xa1, 'k', 0x92, 0x01, 0x02},
+	}
+	for index, value := range values {
+		length, complete, err := msgpackValueLen(value)
+		if err != nil || !complete || length != len(value) {
+			t.Fatalf("msgpack value %d = (%d,%v,%v), want (%d,true,nil)", index, length, complete, err, len(value))
+		}
+		for cut := 0; cut < len(value); cut++ {
+			length, complete, err := msgpackValueLen(value[:cut])
+			if err != nil || complete || length != 0 {
+				t.Fatalf("partial msgpack value %d cut %d = (%d,%v,%v), want incomplete", index, cut, length, complete, err)
+			}
+		}
+	}
+	if _, complete, err := msgpackValueLen([]byte{0xc1}); err == nil || complete {
+		t.Fatalf("0xc1 = (%v,%v), want error", complete, err)
+	}
+}
+
+func TestRecorderWriteFastBoundaryMatchesReadMessages(t *testing.T) {
+	largeRedraw := testRedrawMessage(t, string(bytes.Repeat([]byte("payload"), 4096)))
+	message1 := testMessage(t)
+	message2 := testRedrawMessage(t, "x")
+	stream := bytes.Join([][]byte{message1, message2, largeRedraw, message1}, nil)
+	boundaryMessage := func(payload any) []byte {
+		var buffer bytesBuffer
+		if err := msgpack.NewEncoder(&buffer).Encode([]any{2, "redraw", []any{payload}}); err != nil {
+			t.Fatalf("encode boundary message: %v", err)
+		}
+		return buffer.Bytes()
+	}
+	boundaryMessages := [][]byte{
+		boundaryMessage(nil),
+		boundaryMessage(true),
+		boundaryMessage(int8(-7)),
+		boundaryMessage(uint8(7)),
+		boundaryMessage(int64(-70000)),
+		boundaryMessage(uint64(70000)),
+		boundaryMessage(float32(1.25)),
+		boundaryMessage(float64(2.5)),
+		boundaryMessage("fixedstr"),
+		boundaryMessage(bytes.Repeat([]byte("s8"), 40)),
+		boundaryMessage(bytes.Repeat([]byte("s16"), 300)),
+		boundaryMessage([]any{1, "two", []any{true, nil}, map[string]any{"key": 42}}),
+		boundaryMessage(map[string]any{"nested": []any{1, 2, 3}, "text": "widechars世界"}),
+	}
+	stream = bytes.Join(append([][]byte{message1, message2, largeRedraw}, append(boundaryMessages, message1)...), nil)
+	want, err := protocol.ReadMessages(stream)
+	if err != nil {
+		t.Fatalf("ReadMessages: %v", err)
+	}
+	for _, chunkSize := range []int{1, 2, 7, 97, 1024, len(stream)} {
+		clock := &testClock{now: time.Unix(0, 0)}
+		recorder := NewRecorder(time.Hour, clock)
+		for offset := 0; offset < len(stream); offset += chunkSize {
+			end := min(offset+chunkSize, len(stream))
+			if _, err := recorder.Write(stream[offset:end]); err != nil {
+				t.Fatalf("chunk %d Write: %v", offset, err)
+			}
+		}
+		recorder.mu.Lock()
+		got := make([][]byte, len(recorder.messages))
+		for index := range recorder.messages {
+			got[index] = append([]byte(nil), recorder.messages[index].raw...)
+		}
+		pending := len(recorder.pending)
+		recorder.mu.Unlock()
+		if pending != 0 {
+			t.Fatalf("chunk size %d retained %d pending bytes", chunkSize, pending)
+		}
+		if len(got) != len(want) {
+			t.Fatalf("chunk size %d messages = %d, want %d", chunkSize, len(got), len(want))
+		}
+		joined := []byte{}
+		for index, message := range got {
+			if !bytes.Equal(message, want[index].Raw) {
+				t.Fatalf("chunk size %d message %d raw differs from protocol.ReadMessages", chunkSize, index)
+			}
+			joined = append(joined, message...)
+		}
+		if !bytes.Equal(joined, stream) {
+			t.Fatalf("chunk size %d concatenated messages differ from stream", chunkSize)
+		}
+	}
+	for _, golden := range oracle.List() {
+		want, err := protocol.ReadMessages(golden.Inbound)
+		if err != nil {
+			t.Fatalf("%s ReadMessages: %v", golden.Name, err)
+		}
+		recorder := NewRecorder(time.Hour, &testClock{now: time.Unix(0, 0)})
+		for offset := 0; offset < len(golden.Inbound); offset += 61 {
+			end := min(offset+61, len(golden.Inbound))
+			if _, err := recorder.Write(golden.Inbound[offset:end]); err != nil {
+				t.Fatalf("%s chunk %d Write: %v", golden.Name, offset, err)
+			}
+		}
+		recorder.mu.Lock()
+		got := make([][]byte, len(recorder.messages))
+		for index := range recorder.messages {
+			got[index] = recorder.messages[index].raw
+		}
+		recorder.mu.Unlock()
+		if len(got) != len(want) {
+			t.Fatalf("%s messages = %d, want %d", golden.Name, len(got), len(want))
+		}
+		for index := range got {
+			if !bytes.Equal(got[index], want[index].Raw) {
+				t.Fatalf("%s message %d differs from protocol.ReadMessages", golden.Name, index)
+			}
+		}
+	}
+}
+
+func TestRecorderWriteIgnoresIllegalMsgpackBoundary(t *testing.T) {
+	clock := &testClock{now: time.Unix(0, 0)}
+	recorder := NewRecorder(time.Hour, clock)
+	if _, err := recorder.Write([]byte{0xc1}); err != nil {
+		t.Fatalf("Write illegal byte: %v", err)
+	}
+	recorder.mu.Lock()
+	messages, pending := len(recorder.messages), append([]byte(nil), recorder.pending...)
+	recorder.mu.Unlock()
+	if messages != 0 || !bytes.Equal(pending, []byte{0xc1}) {
+		t.Fatalf("illegal byte produced messages=%d pending=%x, want 0 and 0xc1", messages, pending)
+	}
+}
+
+func TestRecorderWriteDiscardsNonRPCValueWithoutBlocking(t *testing.T) {
+	clock := &testClock{now: time.Unix(0, 0)}
+	recorder := NewRecorder(time.Hour, clock)
+	nonRPC := []byte{0xa3, 'n', 'o', 'p', 'e'}
+	message := testMessage(t)
+	if _, err := recorder.Write(nonRPC); err != nil {
+		t.Fatalf("Write non-RPC: %v", err)
+	}
+	if _, err := recorder.Write(message); err != nil {
+		t.Fatalf("Write RPC: %v", err)
+	}
+	recorder.mu.Lock()
+	count := len(recorder.messages)
+	messages := []byte(nil)
+	if count > 0 {
+		messages = append([]byte(nil), recorder.messages[0].raw...)
+	}
+	pending := len(recorder.pending)
+	recorder.mu.Unlock()
+	if count != 1 || !bytes.Equal(messages, message) || pending != 0 {
+		t.Fatalf("recorder retained messages=%d pending=%d raw=%x, want one RPC message and empty pending", count, pending, messages)
 	}
 }
 
