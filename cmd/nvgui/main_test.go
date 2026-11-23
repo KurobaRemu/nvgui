@@ -1,15 +1,48 @@
 package main
 
 import (
+	"context"
+	"errors"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
 	"nvgui/app"
 )
+
+type fakeWorkspace struct {
+	mu    sync.Mutex
+	calls [][]string
+	gate  chan struct{}
+}
+
+func (workspace *fakeWorkspace) OpenFiles(_ context.Context, paths []string, _ string, _ app.LaunchSource) (app.HandoffResult, error) {
+	workspace.mu.Lock()
+	workspace.calls = append(workspace.calls, append([]string(nil), paths...))
+	gate := workspace.gate
+	workspace.mu.Unlock()
+	if gate != nil {
+		select {
+		case <-gate:
+		case <-time.After(2 * time.Second):
+		}
+	}
+	return app.HandoffResult{Opened: len(paths)}, nil
+}
+
+func (workspace *fakeWorkspace) snapshot() [][]string {
+	workspace.mu.Lock()
+	defer workspace.mu.Unlock()
+	calls := make([][]string, len(workspace.calls))
+	for index, paths := range workspace.calls {
+		calls[index] = append([]string(nil), paths...)
+	}
+	return calls
+}
 
 func embedNvimPIDs(test *testing.T) map[string]bool {
 	test.Helper()
@@ -146,5 +179,163 @@ func TestMainDoesNotDiscardExitCode(test *testing.T) {
 	}
 	if strings.Contains(source, "head"+"lessLaunch") {
 		test.Error("main.go still derives headless state outside ParseLaunch")
+	}
+}
+
+func TestOpenFileDispatcherWaitsForFirstWindow(test *testing.T) {
+	workspace := &fakeWorkspace{}
+	dispatcher := newOpenFileDispatcher(workspace, "", func(error) {})
+	test.Cleanup(dispatcher.close)
+	dispatcher.onOpenFile("cold start.txt")
+	dispatcher.onOpenFile("queued file.txt")
+	if paths := dispatcher.queue.pending(); len(paths) != 2 {
+		test.Fatalf("cold-start queue = %v, want both paths retained", paths)
+	}
+	if calls := workspace.snapshot(); len(calls) != 0 {
+		test.Fatalf("OpenFiles before first window = %v, want none", calls)
+	}
+	dispatcher.onWindowAdded()
+	dispatcher.onAppReady()
+	if !testWaitUntil(2*time.Second, func() bool { return len(workspace.snapshot()) == 1 }) {
+		test.Fatal("background worker did not flush queued Open With files")
+	}
+	calls := workspace.snapshot()
+	if len(calls) != 1 || strings.Join(calls[0], "\x00") != "cold start.txt\x00queued file.txt" {
+		test.Fatalf("OpenFiles after first window = %v, want one batched call", calls)
+	}
+	dispatcher.onOpenFile("running app.txt")
+	if !testWaitUntil(2*time.Second, func() bool { return len(workspace.snapshot()) == 2 }) {
+		test.Fatal("background worker did not process running-app Open With file")
+	}
+	calls = workspace.snapshot()
+	if len(calls) != 2 || len(calls[1]) != 1 || calls[1][0] != "running app.txt" {
+		test.Fatalf("OpenFiles after ready = %v, want immediate second call", calls)
+	}
+}
+
+func TestOpenFileDispatcherCallbacksNeverBlock(test *testing.T) {
+	workspace := &fakeWorkspace{gate: make(chan struct{})}
+	reported := make(chan error, 1)
+	dispatcher := newOpenFileDispatcher(workspace, "", func(err error) { reported <- err })
+	var release sync.Once
+	releaseGate := func() { release.Do(func() { close(workspace.gate) }) }
+	test.Cleanup(func() {
+		releaseGate()
+		dispatcher.close()
+	})
+	dispatcher.onWindowAdded()
+	dispatcher.onAppReady()
+	dispatcher.onOpenFile("first.txt")
+	if !testWaitUntil(2*time.Second, func() bool { return len(workspace.snapshot()) == 1 }) {
+		test.Fatal("worker did not start first OpenFiles call")
+	}
+	callbackDone := make(chan struct{})
+	go func() {
+		dispatcher.onOpenFile("second.txt")
+		dispatcher.onAppReady()
+		close(callbackDone)
+	}()
+	select {
+	case <-callbackDone:
+	case <-time.After(time.Second):
+		test.Fatal("OnOpenFile callback blocked behind a running OpenFiles RPC")
+	}
+	releaseGate()
+	if !testWaitUntil(2*time.Second, func() bool { return len(workspace.snapshot()) == 2 }) {
+		test.Fatal("worker did not process queued callback after RPC release")
+	}
+	select {
+	case err := <-reported:
+		test.Fatalf("unexpected OpenFiles error: %v", err)
+	default:
+	}
+}
+
+func TestOpenFileDispatcherReportsErrorsAndRecovers(test *testing.T) {
+	workspace := &failingWorkspace{}
+	reported := make(chan error, 1)
+	dispatcher := newOpenFileDispatcher(workspace, "", func(err error) { reported <- err })
+	test.Cleanup(dispatcher.close)
+	dispatcher.onWindowAdded()
+	dispatcher.onAppReady()
+	dispatcher.onOpenFile("fails.txt")
+	select {
+	case err := <-reported:
+		if !errors.Is(err, errWorkspaceOpenFiles) {
+			test.Fatalf("reported error = %v, want %v", err, errWorkspaceOpenFiles)
+		}
+	case <-time.After(2 * time.Second):
+		test.Fatal("worker did not report OpenFiles error")
+	}
+}
+
+type failingWorkspace struct{}
+
+var errWorkspaceOpenFiles = errors.New("open files failed")
+
+func (workspace *failingWorkspace) OpenFiles(context.Context, []string, string, app.LaunchSource) (app.HandoffResult, error) {
+	return app.HandoffResult{}, errWorkspaceOpenFiles
+}
+
+func TestNoSingleInstanceSkipsListenConflict(test *testing.T) {
+	dir, err := os.MkdirTemp("/tmp", "nvgui-s-*")
+	if err != nil {
+		test.Fatalf("MkdirTemp: %v", err)
+	}
+	test.Cleanup(func() { _ = os.RemoveAll(dir) })
+	socketPath := filepath.Join(dir, "i.sock")
+	server, err := app.ListenInstance(socketPath, func(context.Context, app.HandoffRequest) (app.HandoffResult, error) {
+		return app.HandoffResult{WindowID: 41}, nil
+	})
+	if err != nil {
+		test.Fatalf("ListenInstance(active owner): %v", err)
+	}
+	test.Cleanup(func() { _ = server.Close() })
+
+	source, err := os.ReadFile("main.go")
+	if err != nil {
+		test.Fatalf("read main.go: %v", err)
+	}
+	text := string(source)
+	if !strings.Contains(text, "if !cli.Request.Headless && !cli.NoSingleInstance {") {
+		test.Fatal("main.go forwards single-instance requests without guarding --no-single-instance")
+	}
+	if !strings.Contains(text, "if !cli.NoSingleInstance {") || !strings.Contains(text, "app.ListenInstance(socketPath, ws.HandleHandoff)") {
+		test.Fatal("main.go does not guard ListenInstance with --no-single-instance")
+	}
+	if strings.Count(text, "app.ListenInstance(socketPath, ws.HandleHandoff)") != 1 {
+		test.Fatal("main.go must listen on exactly one guarded path")
+	}
+	env := append(withoutNVGUIHeadless(os.Environ()), "NVGUI_HEADLESS=0", "NVGUI_SOCKET="+socketPath)
+	before := embedNvimPIDs(test)
+	exitCode := assertNoNewNvimPIDs(test, before, func() int {
+		return mainWith([]string{"--headless", "--no-single-instance"}, env, test.TempDir())
+	})
+	if exitCode != 0 {
+		test.Fatalf("mainWith(--no-single-instance) with active owner = %d, want 0", exitCode)
+	}
+	result, forwarded, err := app.ForwardInstance(context.Background(), socketPath, app.HandoffRequest{})
+	if err != nil || !forwarded || result.WindowID != 41 {
+		test.Fatalf("active owner ForwardInstance = (%+v, %v, %v), want WindowID=41", result, forwarded, err)
+	}
+}
+
+func testWaitUntil(timeout time.Duration, condition func() bool) bool {
+	if condition() {
+		return true
+	}
+	timer := time.NewTimer(timeout)
+	defer timer.Stop()
+	ticker := time.NewTicker(time.Millisecond)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-timer.C:
+			return condition()
+		case <-ticker.C:
+			if condition() {
+				return true
+			}
+		}
 	}
 }

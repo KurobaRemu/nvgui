@@ -1,6 +1,7 @@
 package app
 
 import (
+	"errors"
 	"fmt"
 	"os"
 	"os/exec"
@@ -52,6 +53,143 @@ func parseLaunch(argv []string, env []string, cwd string) (LaunchRequest, error)
 		Height:     defaultRows,
 		Headless:   headless,
 	}, nil
+}
+
+var cliValueOptions = map[string]bool{
+	"-u":       true,
+	"-i":       true,
+	"-c":       true,
+	"--cmd":    true,
+	"-S":       true,
+	"-s":       true,
+	"--listen": true,
+	"--server": true,
+}
+
+const defaultSystemPATH = "/usr/bin:/bin:/usr/sbin:/sbin"
+
+func parseCLILaunch(argv []string, env []string, cwd string) (CLILaunch, error) {
+	request, err := parseLaunch(nvimArgsForCLILaunch(argv), env, cwd)
+	if err != nil {
+		return CLILaunch{}, err
+	}
+	if env == nil {
+		env = os.Environ()
+	}
+	launch := CLILaunch{
+		Request:    request,
+		SocketPath: envValue(env, "NVGUI_SOCKET"),
+	}
+	files := make([]string, 0)
+	for index := 0; index < len(argv); index++ {
+		arg := argv[index]
+		if arg == "--" {
+			break
+		}
+		switch {
+		case arg == "--new-window":
+			launch.NewWindow = true
+		case arg == "--doctor":
+			launch.Doctor = true
+		case arg == "--doctor-json":
+			launch.DoctorJSON = true
+		case arg == "--no-single-instance":
+			launch.NoSingleInstance = true
+		case arg == "--headless":
+			launch.Request.Headless = true
+		case arg == "--socket":
+			if index+1 >= len(argv) || argv[index+1] == "" {
+				return CLILaunch{}, errors.New("app: --socket requires a non-empty path")
+			}
+			index++
+			launch.SocketPath = argv[index]
+		case strings.HasPrefix(arg, "--socket="):
+			value := strings.TrimPrefix(arg, "--socket=")
+			if value == "" {
+				return CLILaunch{}, errors.New("app: --socket requires a non-empty path")
+			}
+			launch.SocketPath = value
+		case !strings.HasPrefix(arg, "-"):
+			files = append(files, arg)
+		default:
+			if cliValueOptions[arg] && index+1 < len(argv) {
+				index++
+			}
+		}
+	}
+	for _, file := range files {
+		if file == "" {
+			continue
+		}
+		if !filepath.IsAbs(file) && request.WorkingDir != "" {
+			file = filepath.Join(request.WorkingDir, file)
+		}
+		launch.Files = append(launch.Files, file)
+	}
+	launch.Source = cliLaunchSource(argv, env, launch.Request, files)
+	return launch, nil
+}
+
+func nvimArgsForCLILaunch(argv []string) []string {
+	args := make([]string, 0, len(argv))
+	for index := 0; index < len(argv); index++ {
+		arg := argv[index]
+		if arg == "--" {
+			args = append(args, argv[index:]...)
+			break
+		}
+		switch arg {
+		case "--new-window", "--doctor", "--doctor-json", "--no-single-instance":
+			continue
+		case "--socket":
+			if index+1 < len(argv) {
+				index++
+			}
+			continue
+		default:
+			if strings.HasPrefix(arg, "--socket=") {
+				continue
+			}
+		}
+		args = append(args, arg)
+	}
+	return args
+}
+
+func cliLaunchSource(argv []string, env []string, request LaunchRequest, files []string) LaunchSource {
+	if request.Headless {
+		return LaunchSourceHeadless
+	}
+	if len(argv) == 0 && cliLooksLikeDock(env) {
+		return LaunchSourceDock
+	}
+	if len(files) > 0 {
+		return LaunchSourceFile
+	}
+	return LaunchSourceCLI
+}
+
+func cliLooksLikeDock(env []string) bool {
+	path := envValue(env, "PATH")
+	if path != defaultSystemPATH {
+		return false
+	}
+	for _, key := range []string{"TERM", "SHLVL", "SSH_TTY"} {
+		if envHasKey(env, key) {
+			return false
+		}
+	}
+	return true
+}
+
+func envHasKey(env []string, key string) bool {
+	prefix := key + "="
+	for _, entry := range env {
+		if strings.HasPrefix(entry, prefix) {
+			return true
+		}
+	}
+	return false
 }
 
 func launchConnectionOptions(req LaunchRequest) connection.Options {

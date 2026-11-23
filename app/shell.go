@@ -2,10 +2,13 @@ package app
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
 	"math"
+	"os"
+	"path/filepath"
 	"sort"
 	"strings"
 	"sync"
@@ -45,6 +48,7 @@ type shellImpl struct {
 	quitOnExit bool
 	onExit     func(*Shell)
 	onShortcut func(*ui.Context) bool
+	onDrop     func([]string)
 
 	mu                    sync.Mutex
 	inputSyncMu           sync.Mutex
@@ -82,6 +86,20 @@ type shellImpl struct {
 	started   bool
 }
 
+func (impl *shellImpl) asyncTask(task func()) {
+	impl.mu.Lock()
+	if impl.closed {
+		impl.mu.Unlock()
+		return
+	}
+	impl.wg.Add(1)
+	impl.mu.Unlock()
+	go func() {
+		defer impl.wg.Done()
+		task()
+	}()
+}
+
 type animClock struct {
 	mu       sync.RWMutex
 	fallback diag.Clock
@@ -93,6 +111,7 @@ type shellHooks struct {
 	workspaceGUI bool
 	onExit       func(*Shell)
 	onShortcut   func(*ui.Context) bool
+	onDrop       func([]string)
 }
 
 func newAnimClock(clock diag.Clock) *animClock {
@@ -308,7 +327,148 @@ func (s *Shell) AttachInput(c *ui.Context) ui.Element {
 			impl.preeditLayer(c, preedit)
 		}
 	})
+	if dropped := inputBox.DroppedFiles(); len(dropped) > 0 {
+		paths := append([]string(nil), dropped...)
+		impl.mu.Lock()
+		onDrop := impl.onDrop
+		impl.mu.Unlock()
+		if onDrop != nil {
+			impl.asyncTask(func() { onDrop(paths) })
+		} else {
+			impl.asyncTask(func() {
+				if err := shellDropFiles(s, impl.ctx, paths); err != nil {
+					fmt.Fprintln(os.Stderr, "nvgui: drop files:", err)
+				}
+			})
+		}
+	}
 	return inputBox
+}
+
+func shellDropFiles(shell *Shell, ctx context.Context, paths []string) error {
+	if shell == nil || shell.impl == nil {
+		return errShellClosed
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if _, err := formatDropCommand(paths); err != nil {
+		return err
+	}
+	absolute := make([]string, 0, len(paths))
+	for _, path := range paths {
+		if !filepath.IsAbs(path) {
+			path = filepath.Join(shell.impl.req.WorkingDir, path)
+		}
+		absolute = append(absolute, path)
+	}
+	impl := shell.impl
+	impl.mu.Lock()
+	session := impl.session
+	window := impl.window
+	services := impl.services
+	closed := impl.closed
+	impl.mu.Unlock()
+	if closed || session == nil {
+		return errShellClosed
+	}
+	if err := dismissBlockingPrompt(ctx, impl, session); err != nil {
+		return fmt.Errorf("app: drop files dismiss blocking prompt: %w", err)
+	}
+	payload, err := json.Marshal(absolute)
+	if err != nil {
+		return fmt.Errorf("app: encode drop paths: %w", err)
+	}
+	const code = `local paths = vim.json.decode(...)
+local initial = vim.api.nvim_get_current_buf()
+local removeInitial = vim.api.nvim_buf_get_name(initial) == '' and vim.api.nvim_buf_line_count(initial) == 1 and vim.api.nvim_buf_get_lines(initial, 0, -1, false)[1] == '' and vim.bo[initial].buftype == '' and not vim.bo[initial].modified
+for _, path in ipairs(paths) do
+  local target = vim.fn.bufadd(path)
+  vim.api.nvim_set_option_value('buflisted', true, { buf = target })
+  local windows = vim.fn.win_findbuf(target)
+  if #windows > 0 then
+    vim.api.nvim_set_current_win(windows[1])
+  elseif target ~= vim.api.nvim_get_current_buf() then
+    vim.api.nvim_set_current_buf(target)
+  end
+end
+if removeInitial and vim.api.nvim_buf_is_valid(initial) and vim.bo[initial].buftype == '' and not vim.bo[initial].modified and vim.api.nvim_buf_get_name(initial) == '' and initial ~= vim.api.nvim_get_current_buf() then
+  vim.api.nvim_buf_delete(initial, { force = true })
+end`
+	if err := execLuaBounded(ctx, impl, session, code, string(payload)); err != nil {
+		return fmt.Errorf("app: drop files: %w", err)
+	}
+	invalidate(services, window)
+	return nil
+}
+
+func dismissBlockingPrompt(ctx context.Context, impl *shellImpl, sess *session.Session) error {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	result := make(chan struct {
+		blocking bool
+		err      error
+	}, 1)
+	go func() {
+		mode, err := sess.Nvim().Mode()
+		result <- struct {
+			blocking bool
+			err      error
+		}{blocking: mode != nil && mode.Blocking, err: err}
+	}()
+	select {
+	case probe := <-result:
+		if probe.err != nil || !probe.blocking {
+			return probe.err
+		}
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-impl.closing:
+		return errShellClosed
+	case <-sess.Exited():
+		return errShellClosed
+	}
+	return inputBounded(ctx, impl, sess, "\x1b")
+}
+
+func inputBounded(ctx context.Context, impl *shellImpl, sess *session.Session, keys string) error {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	result := make(chan error, 1)
+	go func() {
+		_, err := sess.Nvim().Input(keys)
+		result <- err
+	}()
+	select {
+	case err := <-result:
+		return err
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-impl.closing:
+		return errShellClosed
+	case <-sess.Exited():
+		return errShellClosed
+	}
+}
+
+func execLuaBounded(ctx context.Context, impl *shellImpl, sess *session.Session, code string, args any) error {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	result := make(chan error, 1)
+	go func() { result <- sess.Nvim().ExecLua(code, nil, args) }()
+	select {
+	case err := <-result:
+		return err
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-impl.closing:
+		return errShellClosed
+	case <-sess.Exited():
+		return errShellClosed
+	}
 }
 
 func (impl *shellImpl) preeditLayer(c *ui.Context, preedit string) {
@@ -389,6 +549,9 @@ func startShell(ctx context.Context, req LaunchRequest, clock diag.Clock, clipbo
 	impl.started = true
 	impl.mu.Unlock()
 	impl.wg.Add(5)
+	if hooks.onDrop != nil {
+		impl.onDrop = hooks.onDrop
+	}
 	go func() {
 		defer impl.wg.Done()
 		impl.watchResize()

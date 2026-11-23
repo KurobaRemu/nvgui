@@ -4,6 +4,8 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 
@@ -26,12 +28,13 @@ type windowEntry struct {
 type workspaceImpl struct {
 	opts WorkspaceOptions
 
-	mu      sync.Mutex
-	windows map[uint64]*windowEntry
-	nextID  uint64
-	mru     []uint64
-	wg      sync.WaitGroup
-	closed  bool
+	mu           sync.Mutex
+	windows      map[uint64]*windowEntry
+	nextID       uint64
+	mru          []uint64
+	wg           sync.WaitGroup
+	closed       bool
+	openInPolicy OpenInPolicy
 
 	allClosedOnce sync.Once
 	allClosed     chan struct{}
@@ -41,12 +44,26 @@ type workspaceImpl struct {
 }
 
 func newWorkspace(opts WorkspaceOptions) *Workspace {
-	return &Workspace{impl: &workspaceImpl{
-		opts:      opts,
-		windows:   make(map[uint64]*windowEntry),
-		allClosed: make(chan struct{}),
-		closeDone: make(chan struct{}),
-	}}
+	impl := &workspaceImpl{
+		opts:         opts,
+		windows:      make(map[uint64]*windowEntry),
+		openInPolicy: OpenInFront,
+		allClosed:    make(chan struct{}),
+		closeDone:    make(chan struct{}),
+	}
+	if policy, ok := parseOpenInPolicy(envValue(opts.BaseRequest.Env, "NVGUI_OPEN_IN")); ok {
+		impl.openInPolicy = policy
+	}
+	return &Workspace{impl: impl}
+}
+
+func (impl *workspaceImpl) currentOpenInPolicy() OpenInPolicy {
+	impl.mu.Lock()
+	defer impl.mu.Unlock()
+	if impl.openInPolicy == "" {
+		return OpenInFront
+	}
+	return impl.openInPolicy
 }
 
 func workspaceImplOf(w *Workspace) *workspaceImpl {
@@ -184,9 +201,15 @@ func workspaceNewWindow(w *Workspace, ctx context.Context, req LaunchRequest) (u
 	launch := deriveWorkspaceRequest(impl.opts.BaseRequest, req)
 	headless := impl.opts.Headless || launch.Headless
 	launch.Headless = headless
+	workspace := &Workspace{impl: impl}
 	shell, err := startShell(ctx, launch, impl.opts.Clock, impl.opts.Clipboard, shellHooks{
 		quitOnExit:   false,
 		workspaceGUI: false,
+		onDrop: func(paths []string) {
+			if _, err := workspaceOpenFiles(workspace, context.Background(), paths, launch.WorkingDir, LaunchSourceDrop); err != nil {
+				fmt.Fprintln(os.Stderr, "nvgui: drop files:", err)
+			}
+		},
 	})
 	if err != nil {
 		return 0, nil, err
@@ -343,11 +366,128 @@ func newWorkspaceWindow(shell *Shell, req LaunchRequest, id uint64, impl *worksp
 		width, height := window.ContentSize()
 		_ = shell.Resize(width, height)
 	})
+	window.OnFileDrop(func(event *mygo.FileDropEvent) {
+		if event == nil || len(event.Paths) == 0 {
+			return
+		}
+		paths := append([]string(nil), event.Paths...)
+		workingDir := req.WorkingDir
+		impl.asyncTask(func() {
+			if _, err := workspaceOpenFiles(&Workspace{impl: impl}, context.Background(), paths, workingDir, LaunchSourceDrop); err != nil {
+				fmt.Fprintln(os.Stderr, "nvgui: drop files:", err)
+			}
+		})
+	})
 	width, height := window.ContentSize()
 	if err := shell.Resize(width, height); err != nil && !isCleanSessionError(err) {
 		shell.impl.recordCloseError(fmt.Errorf("app: initial resize: %w", err))
 	}
 	return window
+}
+
+func workspaceOpenInPolicy(w *Workspace) OpenInPolicy {
+	impl := workspaceImplOf(w)
+	if impl == nil {
+		return OpenInFront
+	}
+	return impl.currentOpenInPolicy()
+}
+
+func workspaceSetOpenInPolicy(w *Workspace, policy OpenInPolicy) {
+	impl := workspaceImplOf(w)
+	if impl == nil {
+		return
+	}
+	parsed, ok := parseOpenInPolicy(string(policy))
+	if !ok {
+		policy = OpenInFront
+	} else {
+		policy = parsed
+	}
+	impl.mu.Lock()
+	impl.openInPolicy = policy
+	impl.mu.Unlock()
+}
+
+func workspaceHandleHandoff(w *Workspace, ctx context.Context, req HandoffRequest) (HandoffResult, error) {
+	impl := workspaceImplOf(w)
+	if impl == nil {
+		return HandoffResult{}, errors.New("app: workspace is nil")
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	workingDir := req.WorkingDir
+	if workingDir == "" {
+		workingDir = impl.opts.BaseRequest.WorkingDir
+	}
+	files := handoffFiles(req, workingDir)
+	frontID, frontShell := workspaceFront(w)
+	if impl.currentOpenInPolicy() == OpenInNew || req.NewWindow || workspaceWindowCount(w) == 0 || frontShell == nil {
+		baseArgs := cleanBaseNvimArgs(impl.opts.BaseRequest.Args)
+		child := LaunchRequest{Args: append(baseArgs, "--"), WorkingDir: workingDir}
+		if len(files) > 0 {
+			child.Args = append(child.Args, files...)
+		}
+		if len(req.Env) > 0 {
+			child.Env = append([]string(nil), req.Env...)
+		}
+		id, _, err := workspaceNewWindow(w, ctx, child)
+		if err != nil {
+			return HandoffResult{}, err
+		}
+		return HandoffResult{WindowID: id, NewWindow: true, Opened: len(files)}, nil
+	}
+	if len(files) > 0 {
+		if err := frontShell.DropFiles(ctx, files); err != nil {
+			return HandoffResult{}, err
+		}
+	}
+	workspaceFocusWindow(w, frontID)
+	return HandoffResult{WindowID: frontID, NewWindow: false, Opened: len(files)}, nil
+}
+
+func workspaceOpenFiles(w *Workspace, ctx context.Context, paths []string, workingDir string, source LaunchSource) (HandoffResult, error) {
+	return workspaceHandleHandoff(w, ctx, HandoffRequest{
+		Files:      append([]string(nil), paths...),
+		WorkingDir: workingDir,
+		Source:     source,
+	})
+}
+
+func handoffFiles(req HandoffRequest, workingDir string) []string {
+	raw := append([]string(nil), req.Files...)
+	for index := 0; index < len(req.Args); index++ {
+		arg := req.Args[index]
+		if arg == "--" {
+			break
+		}
+		if cliValueOptions[arg] && index+1 < len(req.Args) {
+			index++
+			continue
+		}
+		if strings.HasPrefix(arg, "-") {
+			continue
+		}
+		raw = append(raw, arg)
+	}
+	files := make([]string, 0, len(raw))
+	seen := make(map[string]bool, len(raw))
+	for _, candidate := range raw {
+		if candidate == "" {
+			continue
+		}
+		if !filepath.IsAbs(candidate) && workingDir != "" {
+			candidate = filepath.Join(workingDir, candidate)
+		}
+		candidate = filepath.Clean(candidate)
+		if seen[candidate] {
+			continue
+		}
+		seen[candidate] = true
+		files = append(files, candidate)
+	}
+	return files
 }
 
 func (impl *workspaceImpl) recordFocus(id uint64) {
