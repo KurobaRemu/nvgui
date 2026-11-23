@@ -93,10 +93,7 @@ func shellSetAnimationConfig(shell *Shell, cfg render.AnimationConfig) {
 	}
 	impl := shell.impl
 	impl.mu.Lock()
-	if impl.animator == nil || impl.planner == nil {
-		impl.mu.Unlock()
-		return
-	}
+	valid := validAnimationConfig(cfg)
 	impl.explicitConfig = true
 	if impl.explicitKeys == nil {
 		impl.explicitKeys = make(map[string]bool)
@@ -105,10 +102,25 @@ func shellSetAnimationConfig(shell *Shell, cfg render.AnimationConfig) {
 	for _, key := range animationEnvKeys {
 		impl.explicitKeys[key] = true
 	}
+	next := nvimConfigSnapshotFrom(valid, impl.nvimConfig.snapshot.OpenIn).normalized()
+	snapshotUnchanged := impl.nvimConfig.snapshot.normalized() == next
+	impl.nvimConfig.snapshot = next
+	if !snapshotUnchanged {
+		impl.markSyncPendingLocked()
+	}
+	if impl.animator == nil || impl.planner == nil {
+		impl.mu.Unlock()
+		return
+	}
+	animatorUnchanged := impl.animator.Config() == valid
+	if snapshotUnchanged && animatorUnchanged {
+		impl.mu.Unlock()
+		return
+	}
 	impl.configDirty = true
 	impl.configGeneration++
-	impl.animator.SetConfig(cfg)
-	impl.planner.SetLigaturesEnabled(cfg.LigaturesEnabled)
+	impl.animator.SetConfig(valid)
+	impl.planner.SetLigaturesEnabled(valid.LigaturesEnabled)
 	services := impl.services
 	window := impl.window
 	closed := impl.closed
@@ -116,6 +128,17 @@ func shellSetAnimationConfig(shell *Shell, cfg render.AnimationConfig) {
 	if !closed {
 		invalidate(services, window)
 	}
+}
+
+func validAnimationConfig(cfg render.AnimationConfig) render.AnimationConfig {
+	defaults := render.DefaultAnimationConfig()
+	if cfg.CursorAnimationLength <= 0 || math.IsNaN(float64(cfg.CursorAnimationLength)) || math.IsInf(float64(cfg.CursorAnimationLength), 0) {
+		cfg.CursorAnimationLength = defaults.CursorAnimationLength
+	}
+	if cfg.ScrollAnimationLength <= 0 || math.IsNaN(float64(cfg.ScrollAnimationLength)) || math.IsInf(float64(cfg.ScrollAnimationLength), 0) {
+		cfg.ScrollAnimationLength = defaults.ScrollAnimationLength
+	}
+	return cfg
 }
 
 func invalidate(services ui.Services, window *mygo.Window) {

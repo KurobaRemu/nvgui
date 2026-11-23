@@ -1,7 +1,9 @@
 package main
 
 import (
+	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"os"
 	"os/exec"
@@ -118,6 +120,41 @@ func withoutNVGUIHeadless(env []string) []string {
 		result = append(result, entry)
 	}
 	return result
+}
+
+func TestMainWithDoctorTextAndJSONNoNvimSpawn(test *testing.T) {
+	env := withoutNVGUIHeadless(os.Environ())
+	env = append(env, "HOME="+test.TempDir())
+	workDir := test.TempDir()
+	for _, args := range [][]string{{"--doctor"}, {"--doctor-json"}} {
+		before := embedNvimPIDs(test)
+		var stdout, stderr bytes.Buffer
+		got := mainWithIO(args, env, workDir, &stdout, &stderr)
+		after := waitForNewNvimPIDsGone(test, before)
+		assertNoLeakedNvim(test, before, after)
+		if got != 0 {
+			test.Fatalf("mainWithIO(%v) = %d, want 0; stderr=%q", args, got, stderr.String())
+		}
+		output := stdout.String()
+		if output == "" {
+			test.Fatalf("mainWithIO(%v) produced no stdout", args)
+		}
+		if args[0] == "--doctor-json" {
+			var report app.DoctorReport
+			if err := json.Unmarshal([]byte(output), &report); err != nil {
+				test.Fatalf("--doctor-json stdout is invalid JSON: %v\n%s", err, output)
+			}
+			if !strings.Contains(output, "nvim_path") || !strings.Contains(output, "launch_source") || !strings.Contains(output, "active_windows") {
+				test.Fatalf("--doctor-json is missing report fields:\n%s", output)
+			}
+			continue
+		}
+		for _, needle := range []string{"nvgui:", "nvim:", "PATH:", "WorkingDir:", "LaunchSource:", "BundleID:", "ActiveWindows:", "Squirrel:", "Config:"} {
+			if !strings.Contains(output, needle) {
+				test.Fatalf("--doctor text missing %q:\n%s", needle, output)
+			}
+		}
+	}
 }
 
 func TestMainWithHeadlessNoGUI(test *testing.T) {

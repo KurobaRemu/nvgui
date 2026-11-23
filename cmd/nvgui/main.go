@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"fmt"
+	"io"
 	"os"
 	"sync"
 	"time"
@@ -158,24 +159,52 @@ func (dispatcher *openFileDispatcher) close() {
 }
 
 func mainWith(argv []string, env []string, cwd string) int {
+	return mainWithIO(argv, env, cwd, os.Stdout, os.Stderr)
+}
+
+func mainWithIO(argv []string, env []string, cwd string, stdout, stderr io.Writer) int {
 	if argv == nil {
 		argv = os.Args[1:]
 	}
 	if env == nil {
 		env = os.Environ()
 	}
+	if stdout == nil {
+		stdout = os.Stdout
+	}
+	if stderr == nil {
+		stderr = os.Stderr
+	}
 	if cwd == "" {
 		dir, err := os.Getwd()
 		if err != nil {
-			fmt.Fprintln(os.Stderr, "nvgui: resolve working directory:", err)
+			fmt.Fprintln(stderr, "nvgui: resolve working directory:", err)
 			return 1
 		}
 		cwd = dir
 	}
 	cli, err := app.ParseCLILaunch(argv, env, cwd)
 	if err != nil {
-		fmt.Fprintln(os.Stderr, "nvgui: parse launch:", err)
+		fmt.Fprintln(stderr, "nvgui: parse launch:", err)
 		return 1
+	}
+	if cli.Doctor || cli.DoctorJSON {
+		report := app.CollectDoctor(context.Background(), app.DoctorOptions{
+			Launch:     cli.Request,
+			Source:     cli.Source,
+			SocketPath: cli.SocketPath,
+		})
+		if cli.DoctorJSON {
+			raw, err := report.FormatJSON()
+			if err != nil {
+				fmt.Fprintln(stderr, "nvgui: format doctor report:", err)
+				return 1
+			}
+			fmt.Fprintln(stdout, string(raw))
+			return 0
+		}
+		fmt.Fprint(stdout, report.FormatText())
+		return 0
 	}
 	if !cli.Request.Headless {
 		merged, _ := app.ResolveLoginPATH(context.Background(), env, app.PathProbeOptions{})
@@ -196,7 +225,7 @@ func mainWith(argv []string, env []string, cwd string) int {
 			Source:     app.LaunchSourceSingleInstance,
 		})
 		if err != nil {
-			fmt.Fprintln(os.Stderr, "nvgui: forward instance:", err)
+			fmt.Fprintln(stderr, "nvgui: forward instance:", err)
 			return 1
 		}
 		if forwarded {
@@ -215,7 +244,7 @@ func mainWith(argv []string, env []string, cwd string) int {
 	}
 	ws := app.NewWorkspace(opts)
 	dispatcher := newOpenFileDispatcher(ws, cli.Request.WorkingDir, func(err error) {
-		fmt.Fprintln(os.Stderr, "nvgui: open files:", err)
+		fmt.Fprintln(stderr, "nvgui: open files:", err)
 	})
 	defer dispatcher.close()
 	onWindowAdded = dispatcher.onWindowAdded
@@ -223,17 +252,17 @@ func mainWith(argv []string, env []string, cwd string) int {
 		mygo.App.OnOpenFile(dispatcher.onOpenFile)
 	}
 	if _, _, err := ws.NewWindow(context.Background(), cli.Request); err != nil {
-		fmt.Fprintln(os.Stderr, "nvgui: start:", err)
+		fmt.Fprintln(stderr, "nvgui: start:", err)
 		return 1
 	}
 	defer func() {
 		if err := ws.Close(); err != nil {
-			fmt.Fprintln(os.Stderr, "nvgui: close:", err)
+			fmt.Fprintln(stderr, "nvgui: close:", err)
 		}
 	}()
 	if cli.Request.Headless {
 		if err := ws.Close(); err != nil {
-			fmt.Fprintln(os.Stderr, "nvgui: close:", err)
+			fmt.Fprintln(stderr, "nvgui: close:", err)
 			return 1
 		}
 		return 0
@@ -242,7 +271,7 @@ func mainWith(argv []string, env []string, cwd string) int {
 	if !cli.NoSingleInstance {
 		server, err := app.ListenInstance(socketPath, ws.HandleHandoff)
 		if err != nil {
-			fmt.Fprintln(os.Stderr, "nvgui: listen instance:", err)
+			fmt.Fprintln(stderr, "nvgui: listen instance:", err)
 			return 1
 		}
 		defer func() { _ = server.Close() }()
@@ -252,7 +281,7 @@ func mainWith(argv []string, env []string, cwd string) int {
 		dispatcher.onAppReady()
 	})
 	if err := mygo.App.Run(); err != nil {
-		fmt.Fprintln(os.Stderr, "nvgui: run:", err)
+		fmt.Fprintln(stderr, "nvgui: run:", err)
 		return 1
 	}
 	return 0

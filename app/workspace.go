@@ -28,13 +28,14 @@ type windowEntry struct {
 type workspaceImpl struct {
 	opts WorkspaceOptions
 
-	mu           sync.Mutex
-	windows      map[uint64]*windowEntry
-	nextID       uint64
-	mru          []uint64
-	wg           sync.WaitGroup
-	closed       bool
-	openInPolicy OpenInPolicy
+	mu             sync.Mutex
+	windows        map[uint64]*windowEntry
+	nextID         uint64
+	mru            []uint64
+	wg             sync.WaitGroup
+	closed         bool
+	openInPolicy   OpenInPolicy
+	openInExplicit bool
 
 	allClosedOnce sync.Once
 	allClosed     chan struct{}
@@ -53,6 +54,7 @@ func newWorkspace(opts WorkspaceOptions) *Workspace {
 	}
 	if policy, ok := parseOpenInPolicy(envValue(opts.BaseRequest.Env, "NVGUI_OPEN_IN")); ok {
 		impl.openInPolicy = policy
+		impl.openInExplicit = true
 	}
 	return &Workspace{impl: impl}
 }
@@ -202,9 +204,16 @@ func workspaceNewWindow(w *Workspace, ctx context.Context, req LaunchRequest) (u
 	headless := impl.opts.Headless || launch.Headless
 	launch.Headless = headless
 	workspace := &Workspace{impl: impl}
+	impl.mu.Lock()
+	policy := impl.openInPolicy
+	explicitOpenIn := impl.openInExplicit
+	impl.mu.Unlock()
 	shell, err := startShell(ctx, launch, impl.opts.Clock, impl.opts.Clipboard, shellHooks{
-		quitOnExit:   false,
-		workspaceGUI: false,
+		quitOnExit:     false,
+		workspaceGUI:   false,
+		workspace:      workspace,
+		openInPolicy:   policy,
+		explicitOpenIn: explicitOpenIn,
 		onDrop: func(paths []string) {
 			if _, err := workspaceOpenFiles(workspace, context.Background(), paths, launch.WorkingDir, LaunchSourceDrop); err != nil {
 				fmt.Fprintln(os.Stderr, "nvgui: drop files:", err)
@@ -232,8 +241,8 @@ func workspaceNewWindow(w *Workspace, ctx context.Context, req LaunchRequest) (u
 	}
 	impl.windows[id] = entry
 	impl.promote(id)
-	shell.impl.onShortcut = func(c *ui.Context) bool { return workspaceHandleShortcut(w, c, id) }
 	impl.wg.Add(1)
+	shell.impl.onShortcut = func(c *ui.Context) bool { return workspaceHandleShortcut(w, c, id) }
 	impl.mu.Unlock()
 
 	if !headless {
@@ -406,6 +415,7 @@ func workspaceSetOpenInPolicy(w *Workspace, policy OpenInPolicy) {
 	}
 	impl.mu.Lock()
 	impl.openInPolicy = policy
+	impl.openInExplicit = true
 	impl.mu.Unlock()
 }
 

@@ -31,24 +31,26 @@ import (
 var errShellClosed = errors.New("app: shell is closed")
 
 type shellImpl struct {
-	req        LaunchRequest
-	clipboard  Clipboard
-	ctx        context.Context
-	cancel     context.CancelFunc
-	session    *session.Session
-	queue      *input.Queue
-	handler    *input.Handler
-	recorder   *input.TraceRecorder
-	resolver   *text.Resolver
-	planner    *render.Planner
-	animator   *render.Animator
-	animClock  *animClock
-	view       *render.View
-	window     *mygo.Window
-	quitOnExit bool
-	onExit     func(*Shell)
-	onShortcut func(*ui.Context) bool
-	onDrop     func([]string)
+	req            LaunchRequest
+	clipboard      Clipboard
+	ctx            context.Context
+	cancel         context.CancelFunc
+	session        *session.Session
+	queue          *input.Queue
+	handler        *input.Handler
+	recorder       *input.TraceRecorder
+	resolver       *text.Resolver
+	planner        *render.Planner
+	animator       *render.Animator
+	animClock      *animClock
+	view           *render.View
+	window         *mygo.Window
+	quitOnExit     bool
+	onExit         func(*Shell)
+	onShortcut     func(*ui.Context) bool
+	onDrop         func([]string)
+	workspace      *Workspace
+	explicitOpenIn bool
 
 	mu                    sync.Mutex
 	inputSyncMu           sync.Mutex
@@ -77,6 +79,9 @@ type shellImpl struct {
 	configGeneration      uint64
 	envConfigKeys         map[string]bool
 	explicitKeys          map[string]bool
+	nvimConfig            nvimConfigState
+	syncCh                chan struct{}
+	syncSem               chan struct{}
 
 	closeOnce sync.Once
 	quitOnce  sync.Once
@@ -107,11 +112,14 @@ type animClock struct {
 }
 
 type shellHooks struct {
-	quitOnExit   bool
-	workspaceGUI bool
-	onExit       func(*Shell)
-	onShortcut   func(*ui.Context) bool
-	onDrop       func([]string)
+	quitOnExit     bool
+	workspaceGUI   bool
+	workspace      *Workspace
+	openInPolicy   OpenInPolicy
+	explicitOpenIn bool
+	onExit         func(*Shell)
+	onShortcut     func(*ui.Context) bool
+	onDrop         func([]string)
 }
 
 func newAnimClock(clock diag.Clock) *animClock {
@@ -144,10 +152,18 @@ func newShell(req LaunchRequest, clock diag.Clock, clipboard Clipboard) *Shell {
 		animClock:     newAnimClock(clock),
 		envConfigKeys: envConfigKeys(req.Env),
 		explicitKeys:  make(map[string]bool),
+		syncCh:        make(chan struct{}, 1),
+		syncSem:       newSyncSemaphore(),
 		closing:       make(chan struct{}),
 		closeDone:     make(chan struct{}),
 		resizeCh:      make(chan struct{}, 1),
 	}}
+}
+
+func newSyncSemaphore() chan struct{} {
+	semaphore := make(chan struct{}, 1)
+	semaphore <- struct{}{}
+	return semaphore
 }
 
 func shellView(shell *Shell, c *ui.Context) {
@@ -531,7 +547,18 @@ func startShell(ctx context.Context, req LaunchRequest, clock diag.Clock, clipbo
 	impl.quitOnExit = hooks.quitOnExit
 	impl.onExit = hooks.onExit
 	impl.onShortcut = hooks.onShortcut
+	impl.workspace = hooks.workspace
 	cfg := AnimationConfigFromEnv(req.Env)
+	if policy, ok := parseOpenInPolicy(envValue(req.Env, "NVGUI_OPEN_IN")); ok {
+		impl.nvimConfig.snapshot = nvimConfigSnapshotFrom(cfg, policy)
+		impl.explicitOpenIn = true
+	} else {
+		impl.nvimConfig.snapshot = nvimConfigSnapshotFrom(cfg, defaultOpenInPolicy(req.Env))
+		impl.explicitOpenIn = hooks.explicitOpenIn
+		if hooksPolicy, ok := parseOpenInPolicy(string(hooks.openInPolicy)); ok {
+			impl.nvimConfig.snapshot.OpenIn = hooksPolicy
+		}
+	}
 	impl.ctx = ctx
 	impl.cancel = cancel
 	impl.lastColumns, impl.lastRows = -1, -1
@@ -570,7 +597,7 @@ func startShell(ctx context.Context, req LaunchRequest, clock diag.Clock, clipbo
 	}()
 	go func() {
 		defer impl.wg.Done()
-		impl.loadNvimAnimationConfig()
+		impl.watchNvimConfig()
 	}()
 	if hooks.workspaceGUI {
 		mygo.App.WhenReady(func() {
@@ -1027,98 +1054,4 @@ var animationEnvKeys = []string{
 	"NVGUI_SCROLL_ANIM",
 	"NVGUI_LIGATURES",
 	"NVGUI_NO_ANIMATIONS",
-}
-
-func (impl *shellImpl) loadNvimAnimationConfig() {
-	select {
-	case <-impl.closing:
-		return
-	case <-impl.ctx.Done():
-		return
-	case <-impl.session.Exited():
-		return
-	default:
-	}
-	result := make(map[string]any)
-	const expression = `{'nvgui_cursor_animation': get(g:, 'nvgui_cursor_animation', v:null), ` +
-		`'nvgui_cursor_animation_length': get(g:, 'nvgui_cursor_animation_length', v:null), ` +
-		`'nvgui_cursor_animate_command_line': get(g:, 'nvgui_cursor_animate_command_line', v:null), ` +
-		`'nvgui_scroll_animation': get(g:, 'nvgui_scroll_animation', v:null), ` +
-		`'nvgui_scroll_animation_length': get(g:, 'nvgui_scroll_animation_length', v:null), ` +
-		`'nvgui_ligatures': get(g:, 'nvgui_ligatures', v:null)}`
-	if err := impl.session.Nvim().Eval(expression, &result); err != nil {
-		return
-	}
-	hasExplicitValue := false
-	for _, value := range result {
-		if value != nil {
-			hasExplicitValue = true
-			break
-		}
-	}
-	if !hasExplicitValue {
-		return
-	}
-	impl.mu.Lock()
-	if impl.closed {
-		impl.mu.Unlock()
-		return
-	}
-	explicit := impl.explicitConfig
-	explicitKeys := impl.explicitKeys
-	envKeys := impl.envConfigKeys
-	masterValue, masterSet := envBool(impl.req.Env, "NVGUI_NO_ANIMATIONS")
-	noAnimations := masterSet && masterValue
-	cfg := impl.animator.Config()
-	changed := false
-	overridden := func(envKey string) bool {
-		return explicit || explicitKeys[envKey] || envKeys[envKey] ||
-			(noAnimations && (envKey == "NVGUI_CURSOR_ANIM" || envKey == "NVGUI_SCROLL_ANIM"))
-	}
-	applyBool := func(key, envKey string, target *bool) {
-		if overridden(envKey) {
-			return
-		}
-		value, ok := result[key]
-		if !ok || value == nil {
-			return
-		}
-		parsed, ok := valueToBool(value)
-		if !ok || *target == parsed {
-			return
-		}
-		*target = parsed
-		changed = true
-	}
-	applyBool("nvgui_cursor_animation", "NVGUI_CURSOR_ANIM", &cfg.CursorEnabled)
-	applyBool("nvgui_cursor_animate_command_line", "NVGUI_CURSOR_ANIMATE_COMMAND_LINE", &cfg.CursorAnimateCommandLine)
-	applyBool("nvgui_scroll_animation", "NVGUI_SCROLL_ANIM", &cfg.ScrollEnabled)
-	applyBool("nvgui_ligatures", "NVGUI_LIGATURES", &cfg.LigaturesEnabled)
-	if !explicit && !overridden("NVGUI_SCROLL_ANIM") {
-		if value, ok := result["nvgui_scroll_animation_length"]; ok && value != nil {
-			if parsed, ok := valueToFloat(value); ok && parsed > 0 && cfg.ScrollAnimationLength != float32(parsed) {
-				cfg.ScrollAnimationLength = float32(parsed)
-				changed = true
-			}
-		}
-	}
-	if !explicit && !overridden("NVGUI_CURSOR_ANIM") {
-		if value, ok := result["nvgui_cursor_animation_length"]; ok && value != nil {
-			if parsed, ok := valueToFloat(value); ok && parsed > 0 && cfg.CursorAnimationLength != float32(parsed) {
-				cfg.CursorAnimationLength = float32(parsed)
-				changed = true
-			}
-		}
-	}
-	if !changed {
-		impl.mu.Unlock()
-		return
-	}
-	impl.animator.SetConfig(cfg)
-	impl.planner.SetLigaturesEnabled(cfg.LigaturesEnabled)
-	impl.configDirty = true
-	impl.configGeneration++
-	services, window := impl.services, impl.window
-	impl.mu.Unlock()
-	invalidate(services, window)
 }
