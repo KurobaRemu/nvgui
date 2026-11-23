@@ -8,7 +8,7 @@ func defaultAnimationConfig() AnimationConfig {
 		CursorAnimationLength:    0.080,
 		CursorShortLength:        0.030,
 		CursorTrailSize:          0.25,
-		CursorAnimateInsertMode:  true,
+		CursorAnimateInsertMode:  false,
 		CursorAnimateCommandLine: false,
 		ScrollEnabled:            true,
 		ScrollAnimationLength:    0.180,

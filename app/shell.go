@@ -817,9 +817,28 @@ func (impl *shellImpl) watchSession() {
 }
 
 func (impl *shellImpl) watchRedraw() {
-	ticker := time.NewTicker(16 * time.Millisecond)
-	defer ticker.Stop()
+	if impl.session == nil {
+		return
+	}
 	var seenSeq uint64
+	redraw := func() {
+		state := impl.session.Latest()
+		if state == nil || state.Seq == seenSeq {
+			return
+		}
+		seenSeq = state.Seq
+		impl.mu.Lock()
+		window, services := impl.window, impl.services
+		impl.mu.Unlock()
+		impl.handler.SetMode(state.Mode)
+		if window != nil {
+			window.Invalidate()
+		} else {
+			services.Invalidate()
+		}
+	}
+	redraw()
+	redraws := impl.session.Redraws()
 	for {
 		select {
 		case <-impl.closing:
@@ -827,21 +846,8 @@ func (impl *shellImpl) watchRedraw() {
 		case <-impl.ctx.Done():
 			impl.closeOnce.Do(impl.finishClose)
 			return
-		case <-ticker.C:
-			state := impl.session.Latest()
-			if state == nil || state.Seq == seenSeq {
-				continue
-			}
-			seenSeq = state.Seq
-			impl.mu.Lock()
-			window, services := impl.window, impl.services
-			impl.mu.Unlock()
-			impl.handler.SetMode(state.Mode)
-			if window != nil {
-				window.Invalidate()
-			} else {
-				services.Invalidate()
-			}
+		case <-redraws:
+			redraw()
 		}
 	}
 }

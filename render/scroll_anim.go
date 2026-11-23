@@ -41,6 +41,11 @@ type scrollLayer struct {
 	offsetPixels float32
 }
 
+type verticalSpan struct {
+	top    float32
+	bottom float32
+}
+
 func validMargins(margins screen.ViewportMargins, width, height int) screen.ViewportMargins {
 	if margins.Top < 0 || margins.Bottom < 0 || margins.Left < 0 || margins.Right < 0 ||
 		margins.Top+margins.Bottom >= height || margins.Left+margins.Right >= width {
@@ -136,9 +141,32 @@ func marginsKeepCommandStatic(command renderlist.Command, layer scrollLayer, cel
 		command.Op == "cursor"
 }
 
+func scrollInnerCommand(command renderlist.Command, layer scrollLayer, cellWidth, cellHeight float32) bool {
+	cmdRow, cmdEndRow, cmdCol, cmdEndCol := scrollCommandCellRange(command, layer, cellWidth, cellHeight)
+	return cmdRow >= layer.margins.Top && cmdEndRow <= layer.height-layer.margins.Bottom &&
+		cmdCol >= layer.margins.Left && cmdEndCol <= layer.width-layer.margins.Right
+}
+
 func rectsOverlap(left, right ui.Rect) bool {
 	return left.X < right.X+right.W && right.X < left.X+left.W &&
 		left.Y < right.Y+right.H && right.Y < left.Y+left.H
+}
+
+func subtractVerticalSpan(spans []verticalSpan, cut verticalSpan) []verticalSpan {
+	result := make([]verticalSpan, 0, len(spans)+1)
+	for _, span := range spans {
+		if cut.bottom <= span.top || cut.top >= span.bottom {
+			result = append(result, span)
+			continue
+		}
+		if span.top < cut.top {
+			result = append(result, verticalSpan{top: span.top, bottom: cut.top})
+		}
+		if cut.bottom < span.bottom {
+			result = append(result, verticalSpan{top: cut.bottom, bottom: span.bottom})
+		}
+	}
+	return result
 }
 
 func scrollInnerBackground(frame renderlist.Frame, metas []rowMeta, layer scrollLayer) (uint32, bool) {
@@ -229,29 +257,71 @@ func scrollHistoryCommands(layer scrollLayer, cellWidth, cellHeight float32) ([]
 	if len(layer.snapshots) == 0 {
 		return nil, nil
 	}
+	clipTop := layer.innerClip.Y
+	clipBottom := layer.innerClip.Y + layer.innerClip.H
 	commands := make([]renderlist.Command, 0)
 	metas := make([]rowMeta, 0)
-	for _, snapshot := range layer.snapshots {
+	uncovered := []verticalSpan{{top: clipTop, bottom: clipBottom}}
+	currentTop := max(clipTop, clipTop+layer.offsetPixels)
+	currentBottom := min(clipBottom, clipBottom+layer.offsetPixels)
+	if currentTop < currentBottom {
+		uncovered = subtractVerticalSpan(uncovered, verticalSpan{top: currentTop, bottom: currentBottom})
+	}
+	for snapshotIndex := len(layer.snapshots) - 1; snapshotIndex >= 0; snapshotIndex-- {
+		snapshot := layer.snapshots[snapshotIndex]
 		snapOffsetPixels := layer.offsetPixels + snapshot.lineOffset*cellHeight
-		if snapOffsetPixels <= -layer.innerClip.H || snapOffsetPixels >= layer.innerClip.H {
+		snapTop := max(clipTop, clipTop+snapOffsetPixels)
+		snapBottom := min(clipBottom, clipBottom+snapOffsetPixels)
+		snapSpan := verticalSpan{top: snapTop, bottom: snapBottom}
+		if snapSpan.top >= snapSpan.bottom {
 			continue
 		}
-		for index, command := range snapshot.commands {
-			meta := rowMeta{}
-			if index < len(snapshot.metas) {
-				meta = snapshot.metas[index]
+		emit := func(strip ui.Rect) {
+			valid := intersectRects(strip, layer.innerClip)
+			if valid.W <= 0 || valid.H <= 0 {
+				return
 			}
-			if int(meta.grid) != layer.grid {
+			for index, command := range snapshot.commands {
+				meta := rowMeta{}
+				if index < len(snapshot.metas) {
+					meta = snapshot.metas[index]
+				}
+				if int(meta.grid) != layer.grid {
+					continue
+				}
+				shifted := command
+				shifted.Y += snapOffsetPixels
+				clipped := intersectRects(commandRect(shifted), valid)
+				if clipped.W <= 0 || clipped.H <= 0 {
+					continue
+				}
+				if command.Op == "fill" {
+					shifted.X, shifted.Y, shifted.W, shifted.H = clipped.X, clipped.Y, clipped.W, clipped.H
+				}
+				meta.clip = valid
+				commands = append(commands, shifted)
+				metas = append(metas, meta)
+			}
+		}
+		for _, span := range uncovered {
+			emitSpan := verticalSpan{
+				top:    max(span.top, snapSpan.top),
+				bottom: min(span.bottom, snapSpan.bottom),
+			}
+			if emitSpan.top >= emitSpan.bottom {
 				continue
 			}
-			shifted := command
-			shifted.Y += snapOffsetPixels
-			if shifted.Y+shifted.H <= layer.innerClip.Y || shifted.Y >= layer.innerClip.Y+layer.innerClip.H {
-				continue
+			strip := ui.Rect{
+				X: layer.innerClip.X,
+				Y: emitSpan.top,
+				W: layer.innerClip.W,
+				H: emitSpan.bottom - emitSpan.top,
 			}
-			meta.clip = layer.innerClip
-			commands = append(commands, shifted)
-			metas = append(metas, meta)
+			emit(strip)
+		}
+		uncovered = subtractVerticalSpan(uncovered, snapSpan)
+		if len(uncovered) == 0 {
+			break
 		}
 	}
 	return commands, metas
@@ -269,6 +339,13 @@ func scrollVisibleCommands(commands []renderlist.Command, metas []rowMeta, layer
 		shifted.Y += offsetPixels
 		if shifted.Y+shifted.H <= layer.innerClip.Y || shifted.Y >= layer.innerClip.Y+layer.innerClip.H {
 			continue
+		}
+		if command.Op == "fill" {
+			clipped := intersectRects(commandRect(shifted), layer.innerClip)
+			if clipped.W <= 0 || clipped.H <= 0 {
+				continue
+			}
+			shifted.X, shifted.Y, shifted.W, shifted.H = clipped.X, clipped.Y, clipped.W, clipped.H
 		}
 		meta.clip = layer.innerClip
 		result = append(result, shifted)
@@ -294,8 +371,18 @@ func scrollSegmentCommands(gridID int, commands []renderlist.Command, metas []ro
 			meta = metas[index]
 		}
 		if command.Op == "cursor" {
-			cursorCommands = append(cursorCommands, command)
-			cursorMetas = append(cursorMetas, meta)
+			if scrollInnerCommand(command, layer, cellWidth, cellHeight) {
+				shifted := command
+				shifted.Y += layer.offsetPixels
+				if clipped := intersectRects(commandRect(shifted), layer.innerClip); clipped.W > 0 && clipped.H > 0 {
+					meta.clip = layer.innerClip
+					cursorCommands = append(cursorCommands, shifted)
+					cursorMetas = append(cursorMetas, meta)
+				}
+			} else {
+				cursorCommands = append(cursorCommands, command)
+				cursorMetas = append(cursorMetas, meta)
+			}
 			continue
 		}
 		static := layer.margins != (screen.ViewportMargins{}) &&

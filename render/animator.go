@@ -251,9 +251,13 @@ func (impl *animatorImpl) scrollDelta(cfg AnimationConfig, state *screen.State, 
 				}
 			}
 		}
-		position := float64(gridState.spring.Position + injected)
+		previousPosition := gridState.spring.Position
+		wasActive := gridState.spring.Active()
+		position := float64(previousPosition + injected)
 		gridState.spring.Position = float32(math.Copysign(math.Min(math.Abs(position), float64(maxClamp)), position))
-		gridState.spring.Velocity = 0
+		if !wasActive || previousPosition == 0 || (previousPosition > 0) != (injected > 0) {
+			gridState.spring.Velocity = 0
+		}
 		trimScrollSnapshots(gridState, gridState.spring.Position, innerHeight)
 	}
 }
@@ -333,12 +337,14 @@ func animatorSubmit(a *Animator, state *screen.State, meta *screen.FrameMeta, li
 	if gridState := impl.scroll[int(cursorGrid)]; gridState != nil && gridState.spring.Active() {
 		scrolling = true
 	}
-	input := cursorInput{state: state, meta: meta, list: cachedList, frame: impl.settledFrame, metas: impl.settledMetas, cfg: impl.cfg, cell: cell, scrolling: scrolling}
+	input := cursorInput{state: state, meta: meta, list: cachedList, frame: impl.settledFrame, metas: impl.settledMetas, cfg: impl.cfg, cell: cell, now: now, scrolling: scrolling}
 	if busy || index < 0 {
 		impl.cursor.active = false
 		impl.cursor.suppressed = true
 		impl.cursor.visible = false
 		impl.active = false
+		impl.cursor.lastMoveTime = time.Time{}
+		impl.cursor.lastMoveStep = false
 		if busy {
 			impl.cursor.prevBusy = true
 			impl.cursor.hasPrev = true

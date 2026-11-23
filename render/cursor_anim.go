@@ -2,6 +2,7 @@ package render
 
 import (
 	"math"
+	"time"
 
 	"github.com/egoist/mygo/ui"
 
@@ -22,24 +23,27 @@ type cursorCorner struct {
 }
 
 type cursorAnimation struct {
-	corners    [4]cursorCorner
-	dest       ui.Point
-	frac       ui.Point
-	dim        ui.Point
-	cell       text.CellSize
-	prevCenter ui.Point
-	rawRect    ui.Rect
-	shape      uint16
-	target     [4]ui.Point
-	hasTarget  bool
-	visible    bool
-	prevMode   string
-	prevInMsg  bool
-	prevBusy   bool
-	prevHeight float32
-	hasPrev    bool
-	active     bool
-	suppressed bool
+	corners      [4]cursorCorner
+	dest         ui.Point
+	frac         ui.Point
+	dim          ui.Point
+	cell         text.CellSize
+	prevCenter   ui.Point
+	lastCenter   ui.Point
+	rawRect      ui.Rect
+	shape        uint16
+	target       [4]ui.Point
+	hasTarget    bool
+	visible      bool
+	prevMode     string
+	prevInMsg    bool
+	prevBusy     bool
+	prevHeight   float32
+	hasPrev      bool
+	active       bool
+	suppressed   bool
+	lastMoveTime time.Time
+	lastMoveStep bool
 }
 
 type cursorInput struct {
@@ -50,6 +54,7 @@ type cursorInput struct {
 	metas     []rowMeta
 	cfg       AnimationConfig
 	cell      text.CellSize
+	now       time.Time
 	scrolling bool
 }
 
@@ -245,6 +250,35 @@ func cursorInMsgGrid(state *screen.State) bool {
 
 func (animation *cursorAnimation) immediate(input cursorInput, index int, busy bool) bool {
 	cfg := input.cfg
+	lastDelta := ui.Point{X: animation.dest.X - animation.lastCenter.X, Y: animation.dest.Y - animation.lastCenter.Y}
+	moved := lastDelta.X != 0 || lastDelta.Y != 0
+	isStep := false
+	if animation.cell.Width > 0 && animation.cell.Height > 0 {
+		dRow := math.Abs(float64(lastDelta.Y)) / float64(animation.cell.Height)
+		dCol := math.Abs(float64(lastDelta.X)) / float64(animation.cell.Width)
+		isStep = (dRow > 0.001 && dRow <= 1.001) ||
+			(dRow <= 0.001 && dCol > 0.001 && dCol <= 2.001)
+	}
+	fastRepeat := false
+	if !busy && !animation.prevBusy && animation.hasPrev && moved && isStep &&
+		animation.lastMoveStep && !animation.lastMoveTime.IsZero() &&
+		!input.now.Before(animation.lastMoveTime) && input.now.Sub(animation.lastMoveTime) <= 100*time.Millisecond {
+		fastRepeat = true
+	}
+	if busy || animation.prevBusy {
+		animation.lastMoveTime = time.Time{}
+		animation.lastMoveStep = false
+	} else if !animation.hasPrev {
+		animation.lastMoveTime = input.now
+		animation.lastMoveStep = false
+	} else if !moved {
+	} else if isStep {
+		animation.lastMoveTime = input.now
+		animation.lastMoveStep = true
+	} else {
+		animation.lastMoveTime = time.Time{}
+		animation.lastMoveStep = false
+	}
 	if input.scrolling {
 		return true
 	}
@@ -255,6 +289,9 @@ func (animation *cursorAnimation) immediate(input cursorInput, index int, busy b
 		return true
 	}
 	if busy {
+		return true
+	}
+	if fastRepeat {
 		return true
 	}
 	if animation.prevBusy {
@@ -295,7 +332,7 @@ func (animation *cursorAnimation) jump(cfg AnimationConfig) {
 		return
 	}
 	shortJump := math.Abs(float64(centerDelta.X))/float64(animation.cell.Width) <= 2.001 &&
-		math.Abs(float64(centerDelta.Y))/float64(animation.cell.Height) <= 0.001
+		math.Abs(float64(centerDelta.Y))/float64(animation.cell.Height) <= 1.001
 	if shortJump {
 		length := min(cfg.CursorAnimationLength, cfg.CursorShortLength)
 		for index := range animation.corners {
@@ -455,6 +492,11 @@ func (animation *cursorAnimation) remember(input cursorInput, index int, busy bo
 		animation.prevInMsg = cursorInMsgGrid(state)
 	}
 	animation.prevBusy = busy
+	animation.lastCenter = animation.dest
+	if !animation.hasTarget || animation.prevBusy {
+		animation.lastMoveTime = time.Time{}
+		animation.lastMoveStep = false
+	}
 	rawRect := cursorRawRect(input.frame, index)
 	if cursorFiniteRect(rawRect) {
 		animation.prevHeight = rawRect.H

@@ -68,7 +68,7 @@ func TestM4Anim_EnvOverridesAndInvalidValues(t *testing.T) {
 			name: "explicit values apply",
 			env: []string{
 				"NVGUI_CURSOR_ANIM=off",
-				"NVGUI_CURSOR_ANIMATE_INSERT=false",
+				"NVGUI_CURSOR_ANIMATE_INSERT=true",
 				"NVGUI_CURSOR_ANIMATE_COMMAND_LINE=true",
 				"NVGUI_SCROLL_ANIM=0",
 				"NVGUI_LIGATURES=off",
@@ -76,7 +76,7 @@ func TestM4Anim_EnvOverridesAndInvalidValues(t *testing.T) {
 			want: func() render.AnimationConfig {
 				cfg := render.DefaultAnimationConfig()
 				cfg.CursorEnabled = false
-				cfg.CursorAnimateInsertMode = false
+				cfg.CursorAnimateInsertMode = true
 				cfg.CursorAnimateCommandLine = true
 				cfg.ScrollEnabled = false
 				cfg.LigaturesEnabled = false

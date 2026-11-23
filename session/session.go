@@ -22,20 +22,21 @@ const stallTimeout = 2 * time.Second
 const stallBuffer = 16
 
 type Session struct {
-	conn      *connection.Conn
-	recorder  *diag.Recorder
-	watchdog  *diag.Watchdog
-	reducer   *screen.Reducer
-	meta      diag.Meta
-	stalls    chan int
-	redraws   chan []any
-	done      chan struct{}
-	wg        sync.WaitGroup
-	closeOnce sync.Once
-	closeMu   sync.Mutex
-	closeErr  error
-	metaMu    sync.Mutex
-	metaReady bool
+	conn         *connection.Conn
+	recorder     *diag.Recorder
+	watchdog     *diag.Watchdog
+	reducer      *screen.Reducer
+	meta         diag.Meta
+	stalls       chan int
+	redraws      chan []any
+	redrawNotify chan struct{}
+	done         chan struct{}
+	wg           sync.WaitGroup
+	closeOnce    sync.Once
+	closeMu      sync.Mutex
+	closeErr     error
+	metaMu       sync.Mutex
+	metaReady    bool
 }
 
 func Start(ctx context.Context, opt connection.Options, clock diag.Clock) (*Session, error) {
@@ -48,11 +49,12 @@ func Start(ctx context.Context, opt connection.Options, clock diag.Clock) (*Sess
 	recorder := diag.NewRecorder(diagnosticWindow, clock)
 	reducer := screen.NewReducer()
 	session := &Session{
-		recorder: recorder,
-		reducer:  reducer,
-		stalls:   make(chan int, stallBuffer),
-		redraws:  make(chan []any, 128),
-		done:     make(chan struct{}),
+		recorder:     recorder,
+		reducer:      reducer,
+		stalls:       make(chan int, stallBuffer),
+		redraws:      make(chan []any, 128),
+		redrawNotify: make(chan struct{}, 1),
+		done:         make(chan struct{}),
 		meta: diag.Meta{
 			UIOptions: map[string]bool{
 				"rgb":           true,
@@ -122,6 +124,12 @@ func (s *Session) run() {
 			for _, state := range committed {
 				s.recorder.Keyframe(state)
 			}
+			if len(committed) > 0 {
+				select {
+				case s.redrawNotify <- struct{}{}:
+				default:
+				}
+			}
 			if err != nil {
 				continue
 			}
@@ -173,6 +181,13 @@ func (s *Session) tick() {
 }
 
 func (s *Session) Latest() *screen.State { return s.reducer.Latest() }
+
+func (s *Session) Redraws() <-chan struct{} {
+	if s == nil {
+		return nil
+	}
+	return s.redrawNotify
+}
 
 func (s *Session) Nvim() *nvim.Nvim { return s.conn.Nvim() }
 

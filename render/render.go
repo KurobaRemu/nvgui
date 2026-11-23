@@ -643,12 +643,19 @@ func drawStateFor(p *ui.Painter) (drawState, bool) {
 }
 
 type rowKey struct {
-	grid      int
 	row       int
 	text      string
 	attrMask  uint16
-	fg        uint32
-	bg        uint32
+	family    string
+	size      float32
+	weight    int
+	italic    bool
+	features  string
+	cellWidth float32
+}
+
+type shapeKey struct {
+	text      string
 	family    string
 	size      float32
 	weight    int
@@ -666,19 +673,32 @@ type rowCacheEntry struct {
 	ascent float32
 }
 
+type shapeCacheEntry struct {
+	key    shapeKey
+	glyphs []ui.Glyph
+	ascent float32
+}
+
 type rowCache struct {
-	mu       sync.Mutex
-	rows     map[rowKey]*list.Element
-	order    *list.List
-	capacity int
-	shaped   int
+	mu             sync.Mutex
+	rows           map[rowKey]*list.Element
+	order          *list.List
+	capacity       int
+	shaped         int
+	shapes         map[shapeKey]*list.Element
+	shapeOrder     *list.List
+	shapeCapacity  int
+	coreTextShapes int
 }
 
 func newRowCache() *rowCache {
 	return &rowCache{
-		rows:     make(map[rowKey]*list.Element),
-		order:    list.New(),
-		capacity: rowCacheCapacity,
+		rows:          make(map[rowKey]*list.Element),
+		order:         list.New(),
+		capacity:      rowCacheCapacity,
+		shapes:        make(map[shapeKey]*list.Element),
+		shapeOrder:    list.New(),
+		shapeCapacity: rowCacheCapacity,
 	}
 }
 
@@ -688,16 +708,23 @@ func (cache *rowCache) glyphs(command renderlist.Command, meta rowMeta) []ui.Gly
 }
 
 func (cache *rowCache) glyphRun(command renderlist.Command, meta rowMeta) ([]ui.Glyph, float32) {
-	key := rowCacheKey(command, meta)
+	rowKey := rowCacheKey(command, meta)
+	shapeKey := shapeCacheKey(rowKey)
 	cache.mu.Lock()
 	defer cache.mu.Unlock()
-	if element, ok := cache.rows[key]; ok {
+	if element, ok := cache.rows[rowKey]; ok {
 		cache.order.MoveToFront(element)
 		entry := element.Value.(*rowCacheEntry)
 		return entry.glyphs, entry.ascent
 	}
+	if element, ok := cache.shapes[shapeKey]; ok {
+		cache.shapeOrder.MoveToFront(element)
+		shape := element.Value.(*shapeCacheEntry)
+		entry := cache.storeRow(rowKey, shape.glyphs, shape.ascent)
+		return entry.glyphs, entry.ascent
+	}
 	entry := &rowCacheEntry{
-		key: key,
+		key: rowKey,
 	}
 	font := commandFont(command)
 	entry.glyphs = ui.Shape(command.Text, font)
@@ -705,6 +732,24 @@ func (cache *rowCache) glyphRun(command renderlist.Command, meta rowMeta) ([]ui.
 		anchorGlyphClustersToCells(entry.glyphs, meta.cellWidth)
 	}
 	entry.ascent = cachedAscent(font)
+	shape := &shapeCacheEntry{key: shapeKey, glyphs: entry.glyphs, ascent: entry.ascent}
+	shapeElement := cache.shapeOrder.PushFront(shape)
+	cache.shapes[shapeKey] = shapeElement
+	cache.coreTextShapes++
+	for len(cache.shapes) > cache.shapeCapacity {
+		oldest := cache.shapeOrder.Back()
+		if oldest == nil {
+			break
+		}
+		cache.shapeOrder.Remove(oldest)
+		delete(cache.shapes, oldest.Value.(*shapeCacheEntry).key)
+	}
+	entry = cache.storeRow(rowKey, entry.glyphs, entry.ascent)
+	return entry.glyphs, entry.ascent
+}
+
+func (cache *rowCache) storeRow(key rowKey, glyphs []ui.Glyph, ascent float32) *rowCacheEntry {
+	entry := &rowCacheEntry{key: key, glyphs: glyphs, ascent: ascent}
 	element := cache.order.PushFront(entry)
 	cache.rows[key] = element
 	cache.shaped++
@@ -716,7 +761,19 @@ func (cache *rowCache) glyphRun(command renderlist.Command, meta rowMeta) ([]ui.
 		cache.order.Remove(oldest)
 		delete(cache.rows, oldest.Value.(*rowCacheEntry).key)
 	}
-	return entry.glyphs, entry.ascent
+	return entry
+}
+
+func shapeCacheKey(key rowKey) shapeKey {
+	return shapeKey{
+		text:      key.text,
+		family:    key.family,
+		size:      key.size,
+		weight:    key.weight,
+		italic:    key.italic,
+		features:  key.features,
+		cellWidth: key.cellWidth,
+	}
 }
 
 func rowCacheKey(command renderlist.Command, meta rowMeta) rowKey {
@@ -725,12 +782,9 @@ func rowCacheKey(command renderlist.Command, meta rowMeta) rowKey {
 		row = int(meta.row)
 	}
 	return rowKey{
-		grid:      int(meta.grid),
 		row:       row,
 		text:      command.Text,
 		attrMask:  meta.attrMask,
-		fg:        command.FG,
-		bg:        command.BG,
 		family:    command.Family,
 		size:      command.Size,
 		weight:    command.Weight,
@@ -760,6 +814,12 @@ func (cache *rowCache) shapedRows() int {
 	cache.mu.Lock()
 	defer cache.mu.Unlock()
 	return cache.shaped
+}
+
+func (cache *rowCache) coreTextShapeCalls() int {
+	cache.mu.Lock()
+	defer cache.mu.Unlock()
+	return cache.coreTextShapes
 }
 
 func (cache *rowCache) size() int {
@@ -804,6 +864,11 @@ func viewDraw(view *View, c *ui.Context) ui.Element {
 	}
 	return ui.Box(c).Fill().Focusable().TextCaret(snapshot.caret).Draw(func(p *ui.Painter, r ui.Rect) {
 		paint := func() {
+			if r.W > 0 && r.H > 0 {
+				if background, ok := viewBackground(snapshot.frame, snapshot.meta.rows); ok {
+					p.Fill(ui.Rect{X: 0, Y: 0, W: r.W, H: r.H}, color(background), 0)
+				}
+			}
 			state := drawState{cache: snapshot.cache, meta: snapshot.meta}
 			done := pushDrawState(p, state)
 			defer done()
@@ -822,6 +887,31 @@ func viewDraw(view *View, c *ui.Context) ui.Element {
 			transformed()
 		}
 	})
+}
+
+func viewBackground(frame renderlist.Frame, metas []rowMeta) (uint32, bool) {
+	bestArea := float64(0)
+	background := uint32(0)
+	found := false
+	rootFound := false
+	for index, command := range frame.Commands {
+		if command.Op != "fill" || command.W <= 0 || command.H <= 0 {
+			continue
+		}
+		isRoot := index < len(metas) && metas[index].grid == 1
+		if rootFound && !isRoot {
+			continue
+		}
+		area := float64(command.W) * float64(command.H)
+		if isRoot && !rootFound {
+			rootFound = true
+			bestArea, background, found = 0, 0, false
+		}
+		if !found || area > bestArea {
+			bestArea, background, found = area, command.BG, true
+		}
+	}
+	return background, found
 }
 
 func viewSetFrame(view *View, frame renderlist.Frame) {
