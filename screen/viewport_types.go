@@ -19,12 +19,14 @@ type ViewportMargins struct {
 
 // FrameMeta 是一次 flush 提交后的不可变旁路元数据，不改变 screen.State 与 Canonical JSON v1。
 type FrameMeta struct {
-	Seq       uint64
-	Viewports map[int]Viewport
-	Margins   map[int]ViewportMargins
-	Busy      bool
-	GUIFont   string
-	LineSpace int
+	Seq            uint64
+	Viewports      map[int]Viewport
+	Margins        map[int]ViewportMargins
+	Busy           bool
+	GUIFont        string
+	LineSpace      int
+	MouseEnabled   bool
+	MouseMoveEvent bool
 }
 
 func (r *Reducer) LatestMeta() *FrameMeta           { return reducerLatestMeta(r) }

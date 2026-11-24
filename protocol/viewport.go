@@ -119,6 +119,26 @@ func parseBusyEvent(event Event) (bool, bool) {
 	}
 }
 
+func parseMouseEvent(event Event) (bool, bool) {
+	switch typed := event.(type) {
+	case MouseOn:
+		return true, true
+	case MouseOff:
+		return false, true
+	case Unknown:
+		switch typed.Name {
+		case "mouse_on":
+			return true, true
+		case "mouse_off":
+			return false, true
+		default:
+			return false, false
+		}
+	default:
+		return false, false
+	}
+}
+
 func parseOptionSet(event Event) (string, any, bool) {
 	unknown, ok := event.(Unknown)
 	if !ok || unknown.Name != "option_set" || len(unknown.Args) < 2 {
@@ -129,6 +149,15 @@ func parseOptionSet(event Event) (string, any, bool) {
 		return "", nil, false
 	}
 	return name, unknown.Args[1], true
+}
+
+func parseMouseMoveEventOption(event Event) (bool, bool) {
+	name, value, ok := parseOptionSet(event)
+	if !ok || name != "mousemoveevent" {
+		return false, false
+	}
+	enabled, ok := value.(bool)
+	return enabled, ok
 }
 
 func finiteFloat64(value float64) bool {

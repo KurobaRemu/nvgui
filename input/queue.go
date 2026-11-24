@@ -3,43 +3,68 @@ package input
 import (
 	"context"
 	"errors"
+	"fmt"
+	"math"
 	"sync"
 
 	"github.com/egoist/mygo/ui"
+	"github.com/neovim/go-client/nvim"
 )
 
 const queueCapacity = 256
 
 var (
-	errQueueClosed    = errors.New("input: queue closed")
-	errQueueNilSender = errors.New("input: queue sender is nil")
+	errQueueClosed           = errors.New("input: queue closed")
+	errQueueNilSender        = errors.New("input: queue sender is nil")
+	errQueueMouseUnsupported = errors.New("input: queue sender does not support mouse input")
+	errQueueEmptyMouseButton = errors.New("input: mouse button is empty")
 )
+
+type queueEntryKind uint8
+
+const (
+	queueEntryInput queueEntryKind = iota
+	queueEntryMouse
+)
+
+type queueEntry struct {
+	kind       queueEntryKind
+	ev         ui.InputEvent
+	mouse      MouseCommand
+	imeAllowed bool
+	resetAfter bool
+}
+
+type queueDelivery struct {
+	kind  queueEntryKind
+	keys  string
+	mouse MouseCommand
+}
 
 type queueImpl struct {
 	sender   Sender
 	recorder *TraceRecorder
 
-	mu          sync.Mutex
-	events      [queueCapacity]ui.InputEvent
-	slotAllowed [queueCapacity]bool
-	head        int
-	length      int
-	wakeup      *sync.Cond
-	closing     chan struct{}
-	stopped     chan struct{}
-	sent        []string
-	runErr      error
-	started     bool
-	closed      bool
-	done        bool
-	ctx         context.Context
+	mu        sync.Mutex
+	entries   [queueCapacity]queueEntry
+	head      int
+	length    int
+	wakeup    *sync.Cond
+	closing   chan struct{}
+	stopped   chan struct{}
+	sent      []string
+	sentMouse []MouseCommand
+	runErr    error
+	started   bool
+	closed    bool
+	done      bool
+	ctx       context.Context
 
 	pending    *ui.InputEvent
 	swallowKey ui.Key
 	swallowAlt bool
 	composing  bool
 	lastCode   ui.KeyCode
-	resetAfter [queueCapacity]bool
 }
 
 func newQueue(sender Sender, recorder *TraceRecorder) *Queue {
@@ -230,39 +255,151 @@ func (impl *queueImpl) finish(err error) {
 	close(impl.stopped)
 }
 
-func (impl *queueImpl) pop() (ui.InputEvent, bool, bool, bool) {
+func (impl *queueImpl) pop() (queueEntry, bool) {
 	if impl.length == 0 {
-		return ui.InputEvent{}, false, false, false
+		return queueEntry{}, false
 	}
 	slot := impl.head
-	ev := impl.events[impl.head]
-	imeAllowed := impl.slotAllowed[slot]
-	resetAfter := impl.resetAfter[slot]
-	impl.events[impl.head] = ui.InputEvent{}
-	impl.slotAllowed[slot] = false
-	impl.resetAfter[slot] = false
+	entry := impl.entries[slot]
+	impl.entries[slot] = queueEntry{}
 	impl.head = (impl.head + 1) % queueCapacity
 	impl.length--
 	impl.wakeup.Broadcast()
-	return ev, true, imeAllowed, resetAfter
+	return entry, true
 }
 
-func (impl *queueImpl) prepareDelivery() (string, bool, error) {
-	ev, ok, imeAllowed, resetAfter := impl.pop()
+func canMergeWheel(existing queueEntry, next MouseCommand) bool {
+	if existing.kind != queueEntryMouse {
+		return false
+	}
+	return existing.mouse.Button == "wheel" && next.Button == "wheel" &&
+		existing.mouse.Action == next.Action &&
+		existing.mouse.Grid == next.Grid &&
+		existing.mouse.Row == next.Row &&
+		existing.mouse.Col == next.Col &&
+		existing.mouse.Modifier == next.Modifier
+}
+
+func saturatingAddInt(a, b int) int {
+	if b > 0 && a > math.MaxInt-b {
+		return math.MaxInt
+	}
+	return a + b
+}
+
+func mouseTraceEvent(cmd MouseCommand) ui.InputEvent {
+	return ui.InputEvent{
+		Kind:     ui.InputCommand,
+		Mods:     cmd.Mods,
+		Text:     fmt.Sprintf("mouse:%s:%s:mod=%s:grid=%d:row=%d:col=%d:count=%d", cmd.Button, cmd.Action, cmd.Modifier, cmd.Grid, cmd.Row, cmd.Col, cmd.Count),
+		Canceled: cmd.Canceled,
+		Time:     cmd.Time,
+	}
+}
+
+func supportsMouseSender(sender Sender) bool {
+	if sender == nil {
+		return false
+	}
+	if _, ok := sender.(MouseBatchSender); ok {
+		return true
+	}
+	if _, ok := sender.(*nvim.Nvim); ok {
+		return true
+	}
+	_, ok := sender.(MouseSender)
+	return ok
+}
+
+func (impl *queueImpl) prepareDelivery() (queueDelivery, bool, error) {
+	entry, ok := impl.pop()
 	if !ok {
-		return "", false, nil
+		return queueDelivery{}, false, nil
 	}
-	keys := impl.keys(ev, imeAllowed)
-	if resetAfter {
-		impl.composing = false
-	}
-	if keys != "" {
-		if impl.sender == nil {
-			return "", false, errQueueNilSender
+	switch entry.kind {
+	case queueEntryInput:
+		keys := impl.keys(entry.ev, entry.imeAllowed)
+		if entry.resetAfter {
+			impl.composing = false
 		}
-		impl.sent = append(impl.sent, keys)
+		if keys != "" {
+			if impl.sender == nil {
+				return queueDelivery{}, false, errQueueNilSender
+			}
+			impl.sent = append(impl.sent, keys)
+		}
+		return queueDelivery{kind: queueEntryInput, keys: keys}, true, nil
+	case queueEntryMouse:
+		if entry.resetAfter {
+			impl.composing = false
+		}
+		if entry.mouse.Button == "wheel" {
+			for impl.length > 0 && impl.entries[impl.head].kind == queueEntryMouse && canMergeWheel(entry, impl.entries[impl.head].mouse) {
+				next, _ := impl.pop()
+				entry.mouse.Count = saturatingAddInt(entry.mouse.Count, next.mouse.Count)
+				if !next.mouse.Time.IsZero() {
+					entry.mouse.Time = next.mouse.Time
+				}
+				if next.resetAfter {
+					impl.composing = false
+				}
+			}
+		}
+		if impl.sender == nil {
+			return queueDelivery{}, false, errQueueNilSender
+		}
+		if !supportsMouseSender(impl.sender) {
+			return queueDelivery{}, false, errQueueMouseUnsupported
+		}
+		if entry.mouse.Count <= 0 {
+			entry.mouse.Count = 1
+		}
+		impl.sentMouse = append(impl.sentMouse, entry.mouse)
+		return queueDelivery{kind: queueEntryMouse, mouse: entry.mouse}, true, nil
+	default:
+		return queueDelivery{}, true, nil
 	}
-	return keys, true, nil
+}
+
+func (impl *queueImpl) sendDelivery(delivery queueDelivery) error {
+	switch delivery.kind {
+	case queueEntryInput:
+		if delivery.keys == "" {
+			return nil
+		}
+		_, err := impl.sender.Input(delivery.keys)
+		return err
+	case queueEntryMouse:
+		cmd := delivery.mouse
+		count := cmd.Count
+		if count <= 0 {
+			count = 1
+		}
+		if batchSender, ok := impl.sender.(MouseBatchSender); ok {
+			return batchSender.InputMouseBatch(cmd.Button, cmd.Action, cmd.Modifier, cmd.Grid, cmd.Row, cmd.Col, count)
+		}
+		if count > 1 {
+			if nv, ok := impl.sender.(*nvim.Nvim); ok {
+				batch := nv.NewBatch()
+				for range count {
+					batch.InputMouse(cmd.Button, cmd.Action, cmd.Modifier, cmd.Grid, cmd.Row, cmd.Col)
+				}
+				return batch.Execute()
+			}
+		}
+		mouseSender, ok := impl.sender.(MouseSender)
+		if !ok {
+			return errQueueMouseUnsupported
+		}
+		for range count {
+			if err := mouseSender.InputMouse(cmd.Button, cmd.Action, cmd.Modifier, cmd.Grid, cmd.Row, cmd.Col); err != nil {
+				return err
+			}
+		}
+		return nil
+	default:
+		return nil
+	}
 }
 
 func (queue *Queue) resetComposition() {
@@ -277,7 +414,7 @@ func (queue *Queue) resetComposition() {
 		return
 	}
 	lastSlot := (impl.head + impl.length - 1) % queueCapacity
-	impl.resetAfter[lastSlot] = true
+	impl.entries[lastSlot].resetAfter = true
 }
 
 func queueRun(queue *Queue, ctx context.Context) error {
@@ -341,7 +478,7 @@ func queueRun(queue *Queue, ctx context.Context) error {
 			impl.mu.Unlock()
 			return err
 		}
-		keys, ok, err := impl.prepareDelivery()
+		delivery, ok, err := impl.prepareDelivery()
 		if err != nil {
 			impl.finish(err)
 			impl.mu.Unlock()
@@ -349,13 +486,11 @@ func queueRun(queue *Queue, ctx context.Context) error {
 		}
 		if ok {
 			impl.mu.Unlock()
-			if keys != "" {
-				if _, err := impl.sender.Input(keys); err != nil {
-					impl.mu.Lock()
-					impl.finish(err)
-					impl.mu.Unlock()
-					return err
-				}
+			if err := impl.sendDelivery(delivery); err != nil {
+				impl.mu.Lock()
+				impl.finish(err)
+				impl.mu.Unlock()
+				return err
 			}
 			continue
 		}
@@ -387,7 +522,7 @@ func queueClose(queue *Queue) error {
 		impl.mu.Unlock()
 		for {
 			impl.mu.Lock()
-			keys, ok, err := impl.prepareDelivery()
+			delivery, ok, err := impl.prepareDelivery()
 			impl.mu.Unlock()
 			if err != nil {
 				impl.mu.Lock()
@@ -398,13 +533,11 @@ func queueClose(queue *Queue) error {
 			if !ok {
 				break
 			}
-			if keys != "" {
-				if _, err := impl.sender.Input(keys); err != nil {
-					impl.mu.Lock()
-					impl.finish(err)
-					impl.mu.Unlock()
-					return err
-				}
+			if err := impl.sendDelivery(delivery); err != nil {
+				impl.mu.Lock()
+				impl.finish(err)
+				impl.mu.Unlock()
+				return err
 			}
 		}
 		impl.mu.Lock()
@@ -445,9 +578,11 @@ func (queue *Queue) enqueue(ev ui.InputEvent, imeAllowed bool) error {
 		return errQueueClosed
 	}
 	slot := (impl.head + impl.length) % queueCapacity
-	impl.events[slot] = ev
-	impl.slotAllowed[slot] = imeAllowed
-	impl.resetAfter[slot] = false
+	impl.entries[slot] = queueEntry{
+		kind:       queueEntryInput,
+		ev:         ev,
+		imeAllowed: imeAllowed,
+	}
 	impl.length++
 	impl.wakeup.Broadcast()
 	if impl.recorder != nil {
@@ -459,6 +594,93 @@ func (queue *Queue) enqueue(ev ui.InputEvent, imeAllowed bool) error {
 
 func queueEnqueue(queue *Queue, ev ui.InputEvent) error {
 	return queue.enqueue(ev, true)
+}
+
+func queueInputMouse(queue *Queue, button, action, modifier string, grid, row, col int) error {
+	return queueEnqueueMouse(queue, MouseCommand{
+		Button:   button,
+		Action:   action,
+		Modifier: modifier,
+		Grid:     grid,
+		Row:      row,
+		Col:      col,
+		Count:    1,
+	})
+}
+
+func queueEnqueueMouse(queue *Queue, cmd MouseCommand) error {
+	if queue == nil || queue.impl == nil {
+		return errors.New("input: nil queue")
+	}
+	if cmd.Button == "" {
+		return errQueueEmptyMouseButton
+	}
+	if cmd.Count <= 0 {
+		cmd.Count = 1
+	}
+	impl := queue.impl
+	impl.mu.Lock()
+	if err := ctxError(impl.ctx); err != nil {
+		impl.mu.Unlock()
+		return err
+	}
+	if impl.closed || impl.done {
+		impl.mu.Unlock()
+		return errQueueClosed
+	}
+	if impl.length > 0 {
+		tail := (impl.head + impl.length - 1) % queueCapacity
+		if canMergeWheel(impl.entries[tail], cmd) {
+			impl.entries[tail].mouse.Count = saturatingAddInt(impl.entries[tail].mouse.Count, cmd.Count)
+			if !cmd.Time.IsZero() {
+				impl.entries[tail].mouse.Time = cmd.Time
+			}
+			impl.wakeup.Broadcast()
+			if impl.recorder != nil {
+				impl.recorder.Observe(mouseTraceEvent(cmd))
+			}
+			impl.mu.Unlock()
+			return nil
+		}
+	}
+	for impl.length == queueCapacity && !impl.closed && !impl.done && ctxError(impl.ctx) == nil {
+		impl.wakeup.Wait()
+	}
+	if err := ctxError(impl.ctx); err != nil {
+		impl.mu.Unlock()
+		return err
+	}
+	if impl.closed || impl.done {
+		impl.mu.Unlock()
+		return errQueueClosed
+	}
+	if impl.length > 0 {
+		tail := (impl.head + impl.length - 1) % queueCapacity
+		if canMergeWheel(impl.entries[tail], cmd) {
+			impl.entries[tail].mouse.Count = saturatingAddInt(impl.entries[tail].mouse.Count, cmd.Count)
+			if !cmd.Time.IsZero() {
+				impl.entries[tail].mouse.Time = cmd.Time
+			}
+			impl.wakeup.Broadcast()
+			if impl.recorder != nil {
+				impl.recorder.Observe(mouseTraceEvent(cmd))
+			}
+			impl.mu.Unlock()
+			return nil
+		}
+	}
+	slot := (impl.head + impl.length) % queueCapacity
+	impl.entries[slot] = queueEntry{
+		kind:  queueEntryMouse,
+		mouse: cmd,
+	}
+	impl.length++
+	impl.wakeup.Broadcast()
+	if impl.recorder != nil {
+		impl.recorder.Observe(mouseTraceEvent(cmd))
+	}
+	impl.mu.Unlock()
+	return nil
 }
 
 func ctxError(ctx context.Context) error {
@@ -476,4 +698,14 @@ func queueSent(queue *Queue) []string {
 	impl.mu.Lock()
 	defer impl.mu.Unlock()
 	return append([]string(nil), impl.sent...)
+}
+
+func queueSentMouse(queue *Queue) []MouseCommand {
+	if queue == nil || queue.impl == nil {
+		return nil
+	}
+	impl := queue.impl
+	impl.mu.Lock()
+	defer impl.mu.Unlock()
+	return append([]MouseCommand(nil), impl.sentMouse...)
 }

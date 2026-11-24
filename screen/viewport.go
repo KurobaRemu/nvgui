@@ -48,8 +48,9 @@ func (r *Reducer) historyLocked() *metaHistory {
 
 func newFrameMeta() *FrameMeta {
 	return &FrameMeta{
-		Viewports: make(map[int]Viewport),
-		Margins:   make(map[int]ViewportMargins),
+		Viewports:    make(map[int]Viewport),
+		Margins:      make(map[int]ViewportMargins),
+		MouseEnabled: true,
 	}
 }
 
@@ -160,6 +161,10 @@ func (r *Reducer) applyFrameMetaEvent(state *State, event protocol.Event) {
 		if busy, ok := protocol.ParseBusyEvent(unknown); ok {
 			meta.Busy = busy
 		}
+	case "mouse_on", "mouse_off":
+		if enabled, ok := protocol.ParseMouseEvent(unknown); ok {
+			meta.MouseEnabled = enabled
+		}
 	case "option_set":
 		name, value, ok := protocol.ParseOptionSet(unknown)
 		if !ok {
@@ -173,6 +178,10 @@ func (r *Reducer) applyFrameMetaEvent(state *State, event protocol.Event) {
 		case "linespace":
 			if lineSpace, ok := parseOptionInt(value); ok {
 				meta.LineSpace = lineSpace
+			}
+		case "mousemoveevent":
+			if enabled, ok := value.(bool); ok {
+				meta.MouseMoveEvent = enabled
 			}
 		}
 	}

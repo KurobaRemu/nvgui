@@ -38,6 +38,7 @@ type shellImpl struct {
 	session        *session.Session
 	queue          *input.Queue
 	handler        *input.Handler
+	mouse          *input.MouseHandler
 	recorder       *input.TraceRecorder
 	resolver       *text.Resolver
 	planner        *render.Planner
@@ -56,6 +57,10 @@ type shellImpl struct {
 	animSnapMu            sync.Mutex
 	mu                    sync.Mutex
 	inputSyncMu           sync.Mutex
+	mouseSyncMu           sync.Mutex
+	mouseMetaSeq          uint64
+	mouseBoundsSeq        uint64
+	mouseBounds           input.GridBounds
 	services              ui.Services
 	resizeCh              chan struct{}
 	closed                bool
@@ -348,7 +353,7 @@ func (s *Shell) AttachInput(c *ui.Context) ui.Element {
 	}
 	impl := s.impl
 	inputBox := ui.Box(c).Fill().Focusable().AutoFocus().Label("nvgui-input").HandleInput(func(ev ui.InputEvent) bool {
-		return s.HandleEditCommand(c, ev) || impl.handler.Handle(ev)
+		return s.HandleEditCommand(c, ev) || impl.handleInputEvent(ev)
 	}).TextCaret(impl.caret()).InputMethod(impl.handler.IMEAllowed())
 	inputBox.Draw(func(p *ui.Painter, _ ui.Rect) { observePainterScale(s, p) })
 	inputBox.Children(func() {
@@ -597,6 +602,8 @@ func startShell(ctx context.Context, req LaunchRequest, clock diag.Clock, clipbo
 	impl.recorder = input.NewTraceRecorder()
 	impl.queue = input.NewQueue(sess.Nvim(), impl.recorder)
 	impl.handler = input.NewHandler(impl.queue)
+	impl.mouse = input.NewMouseHandler(impl.queue)
+	impl.syncMouseState(nil, nil)
 	impl.session = sess
 	impl.mu.Lock()
 	impl.started = true
@@ -829,7 +836,7 @@ func (impl *shellImpl) watchRedraw() {
 	}
 	var seenSeq uint64
 	redraw := func() {
-		state := impl.session.Latest()
+		state, meta := impl.session.LatestSnapshot()
 		if state == nil || state.Seq == seenSeq {
 			return
 		}
@@ -838,6 +845,7 @@ func (impl *shellImpl) watchRedraw() {
 		window, services := impl.window, impl.services
 		impl.mu.Unlock()
 		impl.handler.SetMode(state.Mode)
+		impl.syncMouseState(state, meta)
 		if window != nil {
 			window.Invalidate()
 		} else {
@@ -934,6 +942,7 @@ func (impl *shellImpl) refreshFrameWithContext(c *ui.Context, now time.Time, ins
 	if state == nil {
 		return
 	}
+	impl.syncMouseState(state, meta)
 	impl.mu.Lock()
 	session, view, planner, animator, resolver, handler := impl.session, impl.view, impl.planner, impl.animator, impl.resolver, impl.handler
 	impl.mu.Unlock()
@@ -1156,6 +1165,10 @@ func (impl *shellImpl) refreshFrameWithContext(c *ui.Context, now time.Time, ins
 	}
 	impl.mu.Unlock()
 	applyFrame(view, handler, state, frame, &displayFrameComplete)
+	if cellChanged {
+		latestState, latestMeta := impl.session.LatestSnapshot()
+		impl.syncMouseState(latestState, latestMeta)
+	}
 	if instant || snapNextFrame {
 		active = false
 	}

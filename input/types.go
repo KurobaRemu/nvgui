@@ -2,6 +2,7 @@ package input
 
 import (
 	"context"
+	"time"
 
 	"github.com/egoist/mygo/ui"
 	"github.com/neovim/go-client/nvim"
@@ -47,9 +48,35 @@ func Replay(events []TraceEvent, sink func(ui.InputEvent)) error {
 	return replayTrace(events, sink)
 }
 
-type Sender interface{ Input(keys string) (int, error) }
+type Sender interface {
+	Input(keys string) (int, error)
+}
 
-var _ Sender = (*nvim.Nvim)(nil)
+type MouseSender interface {
+	InputMouse(button, action, modifier string, grid, row, col int) error
+}
+
+type MouseBatchSender interface {
+	InputMouseBatch(button, action, modifier string, grid, row, col, count int) error
+}
+
+var (
+	_ Sender      = (*nvim.Nvim)(nil)
+	_ MouseSender = (*nvim.Nvim)(nil)
+)
+
+type MouseCommand struct {
+	Button   string
+	Action   string
+	Modifier string
+	Grid     int
+	Row      int
+	Col      int
+	Count    int
+	Mods     ui.Modifiers
+	Canceled bool
+	Time     time.Time
+}
 
 type Queue struct{ impl *queueImpl }
 
@@ -69,8 +96,20 @@ func (q *Queue) Enqueue(ev ui.InputEvent) error {
 	return queueEnqueue(q, ev)
 }
 
+func (q *Queue) InputMouse(button, action, modifier string, grid, row, col int) error {
+	return queueInputMouse(q, button, action, modifier, grid, row, col)
+}
+
+func (q *Queue) EnqueueMouse(cmd MouseCommand) error {
+	return queueEnqueueMouse(q, cmd)
+}
+
 func (q *Queue) Sent() []string {
 	return queueSent(q)
+}
+
+func (q *Queue) SentMouse() []MouseCommand {
+	return queueSentMouse(q)
 }
 
 type Handler struct{ impl *handlerImpl }
@@ -108,3 +147,43 @@ func EscapeText(text string) string {
 }
 
 type CellSize struct{ Width, Height float32 }
+
+type GridBounds struct{ Cols, Rows int }
+
+type MouseHandler struct{ impl *mouseHandlerImpl }
+
+func NewMouseHandler(q *Queue) *MouseHandler {
+	return newMouseHandler(q)
+}
+
+func (m *MouseHandler) Handle(ev ui.InputEvent) bool {
+	return mouseHandlerHandle(m, ev)
+}
+
+func (m *MouseHandler) SetEnabled(enabled bool) {
+	mouseHandlerSetEnabled(m, enabled)
+}
+
+func (m *MouseHandler) Enabled() bool {
+	return mouseHandlerEnabled(m)
+}
+
+func (m *MouseHandler) SetMouseMoveEvent(enabled bool) {
+	mouseHandlerSetMouseMoveEvent(m, enabled)
+}
+
+func (m *MouseHandler) MouseMoveEvent() bool {
+	return mouseHandlerMouseMoveEvent(m)
+}
+
+func (m *MouseHandler) SetGeometry(cell CellSize, bounds GridBounds) {
+	mouseHandlerSetGeometry(m, cell, bounds)
+}
+
+func (m *MouseHandler) Dragging() bool {
+	return mouseHandlerDragging(m)
+}
+
+func (m *MouseHandler) GridPos() (row, col int) {
+	return mouseHandlerGridPos(m)
+}
