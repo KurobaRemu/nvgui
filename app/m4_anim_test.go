@@ -2,6 +2,7 @@ package app
 
 import (
 	"context"
+	"math"
 	"os"
 	"strings"
 	"testing"
@@ -312,4 +313,34 @@ func TestM4Anim_InstantSettlesActiveAnimationImmediately(t *testing.T) {
 		}
 	}
 	t.Fatal("Instant() did not settle all animation state")
+}
+
+func TestLineHeightEnvAndLineSpaceHotUpdate(t *testing.T) {
+	if got := LineHeightFromEnv([]string{"NVGUI_LINE_HEIGHT=1.35"}); math.Abs(float64(got-1.35)) > 1e-4 {
+		t.Fatalf("LineHeightFromEnv = %v, want 1.35", got)
+	}
+	if got := LineHeightFromEnv([]string{"NVGUI_LINE_HEIGHT=-1"}); got != 0 {
+		t.Fatalf("LineHeightFromEnv(-1) = %v, want 0", got)
+	}
+
+	shell := m4AnimStart(t, nil, m4AnimFilteredEnv("NVGUI_GUIFONT=Menlo:h14"))
+	tester := ui.NewTester(func(c *ui.Context) {
+		shell.View(c)
+	}, 800, 480)
+	waitUntil(t, 5*time.Second, "initial linespace frame", func() bool {
+		tester.Frame()
+		return shell.impl.session.Latest() != nil
+	})
+	baseHeight := shell.impl.resolver.Cell().Height
+	if err := shell.impl.session.Nvim().Command("set linespace=6"); err != nil {
+		t.Fatalf("set linespace=6: %v", err)
+	}
+	waitUntil(t, 5*time.Second, "linespace hot update", func() bool {
+		tester.Frame()
+		shell.impl.mu.Lock()
+		ls := shell.impl.lastLineSpace
+		h := shell.impl.resolver.Cell().Height
+		shell.impl.mu.Unlock()
+		return ls == 6 && math.Abs(float64(h-(baseHeight+6))) < 0.05
+	})
 }

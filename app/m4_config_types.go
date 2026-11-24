@@ -10,6 +10,10 @@ func GUIFontFromEnv(env []string) string {
 	return guiFontFromEnv(env)
 }
 
+func LineHeightFromEnv(env []string) float32 {
+	return lineHeightFromEnv(env)
+}
+
 func (s *Shell) AnimationConfig() render.AnimationConfig {
 	return shellAnimationConfig(s)
 }

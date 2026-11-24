@@ -182,7 +182,7 @@ func mergeVisible(layer drawlist.Layer, item drawlist.Item, clipping bool) bool 
 
 func mergeCompatible(first, next drawlist.Item, mask uint16, clipping bool) bool {
 	if !mergeCandidate(next, clipping) || next.Row != first.Row || next.FG != first.FG ||
-		next.BG != first.BG || next.SP != first.SP || attrsMask(next.Attrs) != mask {
+		next.BG != first.BG || next.SP != first.SP || next.Blend != first.Blend || attrsMask(next.Attrs) != mask {
 		return false
 	}
 	if mask&attrOther != 0 && !slices.Equal(first.Attrs, next.Attrs) {
@@ -313,14 +313,15 @@ func (p *Planner) planItem(layer drawlist.Layer, item drawlist.Item, cell text.C
 		return renderlist.Command{}, false, fmt.Errorf("negative item size %dx%d", item.Width, item.Height)
 	}
 	command := renderlist.Command{
-		X:    float32(layer.ScreenCol+item.Col) * cell.Width,
-		Y:    float32(layer.ScreenRow+item.Row) * cell.Height,
-		W:    float32(item.Width) * cell.Width,
-		H:    float32(item.Height) * cell.Height,
-		FG:   colorValue(item.FG),
-		BG:   colorValue(item.BG),
-		SP:   colorValue(item.SP),
-		Rune: item.Rune,
+		X:     float32(layer.ScreenCol+item.Col) * cell.Width,
+		Y:     float32(layer.ScreenRow+item.Row) * cell.Height,
+		W:     float32(item.Width) * cell.Width,
+		H:     float32(item.Height) * cell.Height,
+		FG:    colorValue(item.FG),
+		BG:    colorValue(item.BG),
+		SP:    colorValue(item.SP),
+		Blend: clampBlend(item.Blend),
+		Rune:  item.Rune,
 	}
 	switch item.Kind {
 	case "fill":
@@ -550,6 +551,8 @@ func writeCommand(hash *maphash.Hash, command renderlist.Command, scratch *[8]by
 	writeUint32(hash, command.FG, scratch)
 	writeUint32(hash, command.BG, scratch)
 	writeUint32(hash, command.SP, scratch)
+	scratch[0] = command.Blend
+	_, _ = hash.Write(scratch[:1])
 	writeText(hash, command.Rune, scratch)
 }
 
@@ -676,15 +679,17 @@ const rowCacheCapacity = 4096
 const ascentCacheCapacity = 256
 
 type rowCacheEntry struct {
-	key    rowKey
-	glyphs []ui.Glyph
-	ascent float32
+	key        rowKey
+	glyphs     []ui.Glyph
+	ascent     float32
+	lineHeight float32
 }
 
 type shapeCacheEntry struct {
-	key    shapeKey
-	glyphs []ui.Glyph
-	ascent float32
+	key        shapeKey
+	glyphs     []ui.Glyph
+	ascent     float32
+	lineHeight float32
 }
 
 type rowCache struct {
@@ -716,6 +721,11 @@ func (cache *rowCache) glyphs(command renderlist.Command, meta rowMeta) []ui.Gly
 }
 
 func (cache *rowCache) glyphRun(command renderlist.Command, meta rowMeta) ([]ui.Glyph, float32) {
+	glyphs, ascent, _ := cache.glyphRunMetrics(command, meta)
+	return glyphs, ascent
+}
+
+func (cache *rowCache) glyphRunMetrics(command renderlist.Command, meta rowMeta) ([]ui.Glyph, float32, float32) {
 	rowKey := rowCacheKey(command, meta)
 	shapeKey := shapeCacheKey(rowKey)
 	cache.mu.Lock()
@@ -723,13 +733,13 @@ func (cache *rowCache) glyphRun(command renderlist.Command, meta rowMeta) ([]ui.
 	if element, ok := cache.rows[rowKey]; ok {
 		cache.order.MoveToFront(element)
 		entry := element.Value.(*rowCacheEntry)
-		return entry.glyphs, entry.ascent
+		return entry.glyphs, entry.ascent, entry.lineHeight
 	}
 	if element, ok := cache.shapes[shapeKey]; ok {
 		cache.shapeOrder.MoveToFront(element)
 		shape := element.Value.(*shapeCacheEntry)
-		entry := cache.storeRow(rowKey, shape.glyphs, shape.ascent)
-		return entry.glyphs, entry.ascent
+		entry := cache.storeRow(rowKey, shape.glyphs, shape.ascent, shape.lineHeight)
+		return entry.glyphs, entry.ascent, entry.lineHeight
 	}
 	entry := &rowCacheEntry{
 		key: rowKey,
@@ -739,8 +749,10 @@ func (cache *rowCache) glyphRun(command renderlist.Command, meta rowMeta) ([]ui.
 	if meta.cellWidth > 0 && len(command.Text) > 1 && allASCIIBytes(command.Text) {
 		anchorGlyphClustersToCells(entry.glyphs, meta.cellWidth)
 	}
-	entry.ascent = cachedAscent(font)
-	shape := &shapeCacheEntry{key: shapeKey, glyphs: entry.glyphs, ascent: entry.ascent}
+	vm := cachedVerticalMetrics(font)
+	entry.ascent = vm.ascent
+	entry.lineHeight = vm.lineHeight
+	shape := &shapeCacheEntry{key: shapeKey, glyphs: entry.glyphs, ascent: entry.ascent, lineHeight: entry.lineHeight}
 	shapeElement := cache.shapeOrder.PushFront(shape)
 	cache.shapes[shapeKey] = shapeElement
 	cache.coreTextShapes++
@@ -752,12 +764,12 @@ func (cache *rowCache) glyphRun(command renderlist.Command, meta rowMeta) ([]ui.
 		cache.shapeOrder.Remove(oldest)
 		delete(cache.shapes, oldest.Value.(*shapeCacheEntry).key)
 	}
-	entry = cache.storeRow(rowKey, entry.glyphs, entry.ascent)
-	return entry.glyphs, entry.ascent
+	entry = cache.storeRow(rowKey, entry.glyphs, entry.ascent, entry.lineHeight)
+	return entry.glyphs, entry.ascent, entry.lineHeight
 }
 
-func (cache *rowCache) storeRow(key rowKey, glyphs []ui.Glyph, ascent float32) *rowCacheEntry {
-	entry := &rowCacheEntry{key: key, glyphs: glyphs, ascent: ascent}
+func (cache *rowCache) storeRow(key rowKey, glyphs []ui.Glyph, ascent, lineHeight float32) *rowCacheEntry {
+	entry := &rowCacheEntry{key: key, glyphs: glyphs, ascent: ascent, lineHeight: lineHeight}
 	element := cache.order.PushFront(entry)
 	cache.rows[key] = element
 	cache.shaped++
@@ -903,7 +915,7 @@ func viewBackground(frame renderlist.Frame, metas []rowMeta) (uint32, bool) {
 	found := false
 	rootFound := false
 	for index, command := range frame.Commands {
-		if command.Op != "fill" || command.W <= 0 || command.H <= 0 {
+		if command.Op != "fill" || command.W <= 0 || command.H <= 0 || command.Blend > 0 {
 			continue
 		}
 		isRoot := index < len(metas) && metas[index].grid == 1
@@ -1025,7 +1037,9 @@ func drawCommandRange(p *ui.Painter, frame renderlist.Frame, cache *rowCache, fr
 		command := frame.Commands[index]
 		switch command.Op {
 		case "fill":
-			p.Fill(commandRect(command), color(command.BG), 0)
+			if command.Blend < 100 {
+				p.Fill(commandRect(command), colorWithBlend(command.BG, command.Blend), 0)
+			}
 			drawDecorations(p, command, meta, meta.cellWidth)
 		case "glyphs":
 			drawGlyphs(p, command, cache, meta, meta.cellWidth)
@@ -1046,8 +1060,8 @@ func drawGlyphs(p *ui.Painter, command renderlist.Command, cache *rowCache, meta
 	if command.Text == "" || command.W <= 0 || command.H <= 0 {
 		return
 	}
-	glyphs, ascent := cache.glyphRun(command, meta)
-	baseline := command.Y + ascent
+	glyphs, ascent, lineHeight := cache.glyphRunMetrics(command, meta)
+	baseline := verticalBaseline(command.Y, command.H, ascent, lineHeight)
 	offsetX := float32(0)
 	if !(meta.cellWidth > 0 && len(command.Text) > 1 && allASCIIBytes(command.Text)) {
 		offsetX = glyphCenterOffset(glyphs, command.W)
@@ -1056,23 +1070,39 @@ func drawGlyphs(p *ui.Painter, command renderlist.Command, cache *rowCache, meta
 	drawDecorations(p, command, meta, cellWidth)
 }
 
+type fontVerticalMetrics struct {
+	ascent     float32
+	lineHeight float32
+}
+
 var (
 	ascentCacheMu sync.Mutex
-	ascentCache   = make(map[ui.Font]float32)
+	ascentCache   = make(map[ui.Font]fontVerticalMetrics)
 )
 
-func cachedAscent(font ui.Font) float32 {
+func cachedVerticalMetrics(font ui.Font) fontVerticalMetrics {
 	ascentCacheMu.Lock()
 	defer ascentCacheMu.Unlock()
-	if ascent, ok := ascentCache[font]; ok {
-		return ascent
+	if metrics, ok := ascentCache[font]; ok {
+		return metrics
 	}
-	ascent := font.Metrics().Ascent
+	raw := font.Metrics()
+	metrics := fontVerticalMetrics{
+		ascent:     raw.Ascent,
+		lineHeight: raw.Ascent + raw.Descent + raw.LineGap,
+	}
 	if len(ascentCache) >= ascentCacheCapacity {
 		clear(ascentCache)
 	}
-	ascentCache[font] = ascent
-	return ascent
+	ascentCache[font] = metrics
+	return metrics
+}
+
+func verticalBaseline(y, cellHeight, ascent, lineHeight float32) float32 {
+	if cellHeight > lineHeight && lineHeight > 0 {
+		return y + (cellHeight-lineHeight)/2 + ascent
+	}
+	return y + ascent
 }
 
 func glyphCenterOffset(glyphs []ui.Glyph, room float32) float32 {
@@ -1219,6 +1249,29 @@ func color(value uint32) ui.Color {
 		return ui.Color{R: byte(value >> 16), G: byte(value >> 8), B: byte(value), A: byte(value >> 24)}
 	}
 	return ui.RGB(byte(value>>16), byte(value>>8), byte(value))
+}
+
+func clampBlend(blend int) uint8 {
+	if blend <= 0 {
+		return 0
+	}
+	if blend >= 100 {
+		return 100
+	}
+	return uint8(blend)
+}
+
+func colorWithBlend(value uint32, blend uint8) ui.Color {
+	base := color(value)
+	if blend == 0 {
+		return base
+	}
+	if blend >= 100 {
+		base.A = 0
+		return base
+	}
+	base.A = uint8(math.Round(float64(base.A) * float64(100-int(blend)) / 100.0))
+	return base
 }
 
 func positiveHeight(value float32) float32 {

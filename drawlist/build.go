@@ -23,6 +23,7 @@ var boxArms = [128]string{
 
 type resolvedStyle struct {
 	FG, BG, SP int64
+	Blend      int
 	Attrs      []string
 }
 
@@ -140,6 +141,7 @@ func buildItems(state *screen.State, grid *screen.Grid, styles map[int]resolvedS
 				Height: 1,
 				BG:     style.BG,
 				SP:     style.SP,
+				Blend:  style.Blend,
 				Attrs:  style.Attrs,
 			}
 			if last := len(fills) - 1; last >= 0 && canMergeFill(fills[last], fill) {
@@ -161,6 +163,7 @@ func buildItems(state *screen.State, grid *screen.Grid, styles map[int]resolvedS
 					FG:     style.FG,
 					BG:     style.BG,
 					SP:     style.SP,
+					Blend:  style.Blend,
 					Attrs:  style.Attrs,
 				}
 				if boxRune(cell.Text) {
@@ -180,6 +183,7 @@ func buildItems(state *screen.State, grid *screen.Grid, styles map[int]resolvedS
 func canMergeFill(previous, next Item) bool {
 	return previous.Row == next.Row && previous.Col+previous.Width == next.Col &&
 		previous.Height == next.Height && previous.BG == next.BG && previous.SP == next.SP &&
+		previous.Blend == next.Blend &&
 		sameAttrs(previous.Attrs, next.Attrs)
 }
 
@@ -225,6 +229,20 @@ func resolveStyle(state *screen.State, highlightID int, cache map[int]resolvedSt
 			case "special":
 				style.SP = color
 			}
+		case "blend":
+			if value == nil {
+				continue
+			}
+			blend, ok := value.(int64)
+			if !ok {
+				return resolvedStyle{}, fmt.Errorf("attribute %q has unsupported value type %T", key, value)
+			}
+			if blend < 0 {
+				blend = 0
+			} else if blend > 100 {
+				blend = 100
+			}
+			style.Blend = int(blend)
 		case "reverse":
 			continue
 		default:

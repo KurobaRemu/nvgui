@@ -14,6 +14,7 @@ import (
 const (
 	defaultFontSize        float32 = 14
 	defaultFontWeight      int     = 400
+	defaultLineHeight      float32 = 1.2
 	genericMonospaceFamily string  = "monospace"
 	defaultCJKFamily       string  = "PingFang SC"
 	defaultEmojiFamily     string  = "Apple Color Emoji"

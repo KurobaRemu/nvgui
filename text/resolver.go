@@ -214,12 +214,25 @@ func (impl *resolverImpl) calculateCellLocked() CellSize {
 	}
 	metrics := fontToMyGo(font).Metrics()
 	width := maxAdvance
-	height := metrics.Ascent + metrics.Descent + metrics.LineGap
+	baseHeight := metrics.Ascent + metrics.Descent + metrics.LineGap
 	if !isFinite(width) || width <= 0 {
 		width = font.Size * 0.6
 	}
-	if !isFinite(height) || height <= 0 {
-		height = font.Size * 1.25
+	if !isFinite(baseHeight) || baseHeight <= 0 {
+		baseHeight = font.Size * 1.25
+	}
+	lineHeight := impl.cfg.LineHeight
+	if !isFinite(lineHeight) || lineHeight <= 0 {
+		lineHeight = defaultLineHeight
+	}
+	lineSpace := impl.cfg.LineSpace
+	if !isFinite(lineSpace) {
+		lineSpace = 0
+	}
+	height := baseHeight*lineHeight + lineSpace
+	minHeight := max(float32(1), baseHeight*0.5)
+	if !isFinite(height) || height < minHeight {
+		height = minHeight
 	}
 	if scale := effectiveScale(impl.cfg.Scale); scale > 0 {
 		width = float32(math.Ceil(float64(width*scale)-0.05)) / scale

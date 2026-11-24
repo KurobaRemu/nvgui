@@ -72,6 +72,8 @@ type shellImpl struct {
 	forwardedInputSeq     uint64
 	lastGUIFont           string
 	failedGUIFont         string
+	lastLineSpace         int
+	lineHeight            float32
 	scale                 float32
 	fullScreen            bool
 	scaleRebuildCount     uint64
@@ -525,12 +527,17 @@ func (impl *shellImpl) preeditLayer(c *ui.Context, preedit string) {
 		width = caret.W
 	}
 	metrics := font.MyGo().Metrics()
+	fontHeight := metrics.Ascent + metrics.Descent + metrics.LineGap
+	baselineOffset := metrics.Ascent
+	if caret.H > fontHeight && fontHeight > 0 {
+		baselineOffset += (caret.H - fontHeight) / 2
+	}
 	foreground := ui.RGB(255, 255, 255)
 	background := ui.RGB(32, 32, 40)
 	ui.Box(c).Absolute().Left(caret.X).Top(caret.Y).Size(width, caret.H).IgnoreInput(true).
 		Draw(func(p *ui.Painter, r ui.Rect) {
 			p.Fill(ui.Rect{X: r.X, Y: r.Y, W: width, H: caret.H}, background, 0)
-			p.Glyphs(glyphs, r.X, r.Y+metrics.Ascent, foreground)
+			p.Glyphs(glyphs, r.X, r.Y+baselineOffset, foreground)
 			p.Fill(ui.Rect{X: r.X, Y: r.Y + caret.H - 1, W: width, H: 1}, foreground, 0)
 		})
 }
@@ -545,10 +552,11 @@ func startShell(ctx context.Context, req LaunchRequest, clock diag.Clock, clipbo
 	}
 	ctx, cancel := context.WithCancel(ctx)
 	guiFont := GUIFontFromEnv(req.Env)
-	resolver, err := text.NewResolver(text.Config{GUIFont: guiFont, Scale: 1})
+	lineHeight := LineHeightFromEnv(req.Env)
+	resolver, err := text.NewResolver(text.Config{GUIFont: guiFont, Scale: 1, LineHeight: lineHeight})
 	if err != nil {
 		guiFont = ""
-		resolver, err = text.NewResolver(text.Config{Scale: 1})
+		resolver, err = text.NewResolver(text.Config{Scale: 1, LineHeight: lineHeight})
 		if err != nil {
 			cancel()
 			return nil, fmt.Errorf("app: create font resolver: %w", err)
@@ -583,6 +591,7 @@ func startShell(ctx context.Context, req LaunchRequest, clock diag.Clock, clipbo
 	impl.planner = render.NewPlanner(resolver)
 	impl.animator = render.NewAnimator(impl.planner, cfg, impl.animClock)
 	impl.lastGUIFont = guiFont
+	impl.lineHeight = lineHeight
 	impl.envGUIFontOverride = guiFont != ""
 	impl.view = render.NewView()
 	impl.recorder = input.NewTraceRecorder()
@@ -944,6 +953,7 @@ func (impl *shellImpl) refreshFrameWithContext(c *ui.Context, now time.Time, ins
 		active                bool
 		lastGUIFont           string
 		failedGUIFont         string
+		lastLineSpace         int
 		envGUIFontOverride    bool
 		sawInitialNvimGUIFont bool
 		initialNvimGUIFont    string
@@ -958,6 +968,7 @@ func (impl *shellImpl) refreshFrameWithContext(c *ui.Context, now time.Time, ins
 		active:                impl.animator.Active(),
 		lastGUIFont:           impl.lastGUIFont,
 		failedGUIFont:         impl.failedGUIFont,
+		lastLineSpace:         impl.lastLineSpace,
 		envGUIFontOverride:    impl.envGUIFontOverride,
 		sawInitialNvimGUIFont: impl.sawInitialNvimGUIFont,
 		initialNvimGUIFont:    impl.initialNvimGUIFont,
@@ -979,8 +990,10 @@ func (impl *shellImpl) refreshFrameWithContext(c *ui.Context, now time.Time, ins
 
 	cellChanged := false
 	fontGUIFont := ""
+	targetLineSpace := snapshot.lastLineSpace
 	if meta != nil {
 		fontGUIFont = meta.GUIFont
+		targetLineSpace = meta.LineSpace
 	}
 	if snapshot.envGUIFontOverride && meta != nil {
 		initial := snapshot.initialNvimGUIFont
@@ -1001,24 +1014,40 @@ func (impl *shellImpl) refreshFrameWithContext(c *ui.Context, now time.Time, ins
 			impl.mu.Unlock()
 		}
 	}
-	for fontGUIFont != "" && fontGUIFont != snapshot.failedGUIFont {
+	targetGUIFont := snapshot.lastGUIFont
+	if fontGUIFont != "" && fontGUIFont != snapshot.failedGUIFont {
+		targetGUIFont = fontGUIFont
+	}
+	for targetGUIFont != snapshot.lastGUIFont || targetLineSpace != snapshot.lastLineSpace {
 		impl.mu.Lock()
-		if impl.closed || impl.lastGUIFont == fontGUIFont {
+		if impl.closed || (impl.lastGUIFont == targetGUIFont && impl.lastLineSpace == targetLineSpace) {
 			impl.mu.Unlock()
 			break
 		}
 		scale := impl.scale
+		lineHeight := impl.lineHeight
 		impl.mu.Unlock()
 		if scale <= 0 {
 			scale = 1
 		}
-		resolver, err := text.NewResolver(text.Config{GUIFont: fontGUIFont, Scale: scale})
+		resolver, err := text.NewResolver(text.Config{
+			GUIFont:    targetGUIFont,
+			Scale:      scale,
+			LineSpace:  float32(targetLineSpace),
+			LineHeight: lineHeight,
+		})
 		if err != nil {
-			impl.mu.Lock()
-			if !impl.closed {
-				impl.failedGUIFont = fontGUIFont
+			if targetGUIFont != snapshot.lastGUIFont {
+				impl.mu.Lock()
+				if !impl.closed {
+					impl.failedGUIFont = targetGUIFont
+				}
+				impl.mu.Unlock()
+				if targetLineSpace != snapshot.lastLineSpace {
+					targetGUIFont = snapshot.lastGUIFont
+					continue
+				}
 			}
-			impl.mu.Unlock()
 			break
 		}
 		impl.animSnapMu.Lock()
@@ -1046,8 +1075,11 @@ func (impl *shellImpl) refreshFrameWithContext(c *ui.Context, now time.Time, ins
 		impl.planner = nextPlanner
 		impl.animator = nextAnimator
 		planner, animator = impl.planner, impl.animator
-		impl.lastGUIFont = fontGUIFont
-		impl.failedGUIFont = ""
+		impl.lastGUIFont = targetGUIFont
+		impl.lastLineSpace = targetLineSpace
+		if fontGUIFont != "" && targetGUIFont == fontGUIFont {
+			impl.failedGUIFont = ""
+		}
 		impl.configDirty = true
 		impl.configGeneration++
 		snapshot.configDirty = true

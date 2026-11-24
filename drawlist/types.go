@@ -37,6 +37,7 @@ type Item struct {
 	FG     int64    `json:"fg,omitempty"`
 	BG     int64    `json:"bg,omitempty"`
 	SP     int64    `json:"sp,omitempty"`
+	Blend  int      `json:"blend,omitempty"`
 	Attrs  []string `json:"attrs,omitempty"`
 }
 

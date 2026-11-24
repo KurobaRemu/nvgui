@@ -1142,3 +1142,39 @@ func TestUnknownAttrsPreventMergingAcrossDifferentValues(t *testing.T) {
 		}
 	}
 }
+
+func TestBlendBackdropLeavesUnderlyingContentVisible(t *testing.T) {
+	base := renderImage(renderlist.Frame{Version: 1, Seq: 400, Commands: []renderlist.Command{
+		{Op: "fill", X: 0, Y: 0, W: 64, H: 32, BG: 0x2060c0},
+	}}, 64, 32)
+	blended := renderImage(renderlist.Frame{Version: 1, Seq: 401, Commands: []renderlist.Command{
+		{Op: "fill", X: 0, Y: 0, W: 64, H: 32, BG: 0x2060c0},
+		{Op: "fill", X: 0, Y: 0, W: 64, H: 32, BG: 0x000000, Blend: 60},
+	}}, 64, 32)
+	transparent := renderImage(renderlist.Frame{Version: 1, Seq: 402, Commands: []renderlist.Command{
+		{Op: "fill", X: 0, Y: 0, W: 64, H: 32, BG: 0x2060c0},
+		{Op: "fill", X: 0, Y: 0, W: 64, H: 32, BG: 0x000000, Blend: 100},
+	}}, 64, 32)
+
+	basePixel := base.RGBAAt(16, 16)
+	blendedPixel := blended.RGBAAt(16, 16)
+	transparentPixel := transparent.RGBAAt(16, 16)
+
+	if blendedPixel.B == 0 || blendedPixel.B >= basePixel.B {
+		t.Fatalf("blended pixel = %+v, base = %+v, want darkened but visible blue channel", blendedPixel, basePixel)
+	}
+	if transparentPixel != basePixel {
+		t.Fatalf("blend=100 pixel = %+v, want unchanged base %+v", transparentPixel, basePixel)
+	}
+}
+
+func TestVerticalBaselineCentersGlyphWithinExpandedCell(t *testing.T) {
+	tight := verticalBaseline(10, 16, 12, 16)
+	expanded := verticalBaseline(10, 24, 12, 16)
+	if tight != 22 {
+		t.Fatalf("tight baseline = %v, want 22", tight)
+	}
+	if expanded != 26 {
+		t.Fatalf("expanded baseline = %v, want 26 (10 + (24-16)/2 + 12)", expanded)
+	}
+}

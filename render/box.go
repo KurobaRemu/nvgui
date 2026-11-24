@@ -63,7 +63,9 @@ func drawBoxRune(p *ui.Painter, cmd renderlist.Command, fg ui.Color) {
 	}
 	if !drawnBoxRune(character) {
 		font := commandFont(cmd)
-		p.Glyphs(ui.Shape(cmd.Rune, font), rect.X, rect.Y+font.Metrics().Ascent, fg)
+		vm := cachedVerticalMetrics(font)
+		baseline := verticalBaseline(rect.Y, rect.H, vm.ascent, vm.lineHeight)
+		p.Glyphs(ui.Shape(cmd.Rune, font), rect.X, baseline, fg)
 		return
 	}
 	drawBox(p, character, rect, fg)

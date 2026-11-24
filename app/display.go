@@ -59,14 +59,25 @@ func shellSetScale(shell *Shell, scale float32) error {
 			return nil
 		}
 		guiFont := impl.lastGUIFont
+		lineSpace := impl.lastLineSpace
+		lineHeight := impl.lineHeight
 		impl.mu.Unlock()
 
-		newResolver, err := text.NewResolver(text.Config{GUIFont: guiFont, Scale: scale})
+		newResolver, err := text.NewResolver(text.Config{
+			GUIFont:    guiFont,
+			Scale:      scale,
+			LineSpace:  float32(lineSpace),
+			LineHeight: lineHeight,
+		})
 		if err != nil {
 			if guiFont == "" {
 				return fmt.Errorf("app: create font resolver for scale %v: %w", scale, err)
 			}
-			newResolver, err = text.NewResolver(text.Config{Scale: scale})
+			newResolver, err = text.NewResolver(text.Config{
+				Scale:      scale,
+				LineSpace:  float32(lineSpace),
+				LineHeight: lineHeight,
+			})
 			if err != nil {
 				return fmt.Errorf("app: create font resolver for scale %v: %w", scale, err)
 			}
@@ -84,7 +95,7 @@ func shellSetScale(shell *Shell, scale float32) error {
 			impl.animSnapMu.Unlock()
 			return nil
 		}
-		if impl.lastGUIFont != guiFont {
+		if impl.lastGUIFont != guiFont || impl.lastLineSpace != lineSpace {
 			impl.forceFullRepaint = true
 			impl.configDirty = true
 			impl.mu.Unlock()

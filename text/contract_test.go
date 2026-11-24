@@ -495,3 +495,27 @@ func shapeCacheTexts(impl *resolverImpl) []string {
 	}
 	return texts
 }
+
+func TestLineHeightAndLineSpaceAdjustCellHeight(t *testing.T) {
+	tight, err := NewResolver(Config{GUIFont: "Menlo:h14", Scale: 1, LineHeight: 1.0})
+	if err != nil {
+		t.Fatalf("NewResolver tight: %v", err)
+	}
+	defaultResolver, err := NewResolver(Config{GUIFont: "Menlo:h14", Scale: 1})
+	if err != nil {
+		t.Fatalf("NewResolver default: %v", err)
+	}
+	spaced, err := NewResolver(Config{GUIFont: "Menlo:h14", Scale: 1, LineHeight: 1.0, LineSpace: 4})
+	if err != nil {
+		t.Fatalf("NewResolver spaced: %v", err)
+	}
+	tightH := tight.Cell().Height
+	defaultH := defaultResolver.Cell().Height
+	spacedH := spaced.Cell().Height
+	if math.Abs(float64(defaultH-tightH*defaultLineHeight)) > 0.01 {
+		t.Fatalf("default Cell.Height = %v, want %v (tight=%v * %v)", defaultH, tightH*defaultLineHeight, tightH, defaultLineHeight)
+	}
+	if math.Abs(float64(spacedH-(tightH+4))) > 0.01 {
+		t.Fatalf("spaced Cell.Height = %v, want %v", spacedH, tightH+4)
+	}
+}

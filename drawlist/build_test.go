@@ -826,3 +826,57 @@ func TestBuildCursorWideCharHighContrastAndModes(test *testing.T) {
 		}
 	})
 }
+
+func TestBuildParsesBlendAndSplitsMergedFills(t *testing.T) {
+	row := []screen.Cell{
+		{Text: " ", HL: 1},
+		{Text: " ", HL: 1},
+		{Text: " ", HL: 2},
+		{Text: "A", HL: 3},
+	}
+	state := &screen.State{
+		Seq:           10,
+		DefaultColors: screen.Colors{FG: 0xffffff, BG: 0x101010, SP: 0},
+		Attrs: map[int]screen.Attr{
+			0: {},
+			1: {"background": int64(0x000000), "blend": int64(60)},
+			2: {"background": int64(0x000000), "blend": int64(20)},
+			3: {"foreground": int64(0xabcdef), "background": int64(0x000000), "blend": int64(150)},
+		},
+		Grids: map[int]*screen.Grid{
+			1: {Width: len(row), Height: 1, Cells: [][]screen.Cell{row}},
+		},
+		Placements: map[int]screen.Placement{},
+		Cursor:     screen.Cursor{Grid: 1},
+		Mode:       "normal",
+	}
+	list, err := Build(state)
+	if err != nil {
+		t.Fatalf("Build: %v", err)
+	}
+	var fills []Item
+	var texts []Item
+	for _, item := range list.Layers[0].Items {
+		switch item.Kind {
+		case "fill":
+			fills = append(fills, item)
+		case "text":
+			texts = append(texts, item)
+		}
+	}
+	if len(fills) != 3 {
+		t.Fatalf("fills = %+v, want 3 fills separated by Blend", fills)
+	}
+	if fills[0].Width != 2 || fills[0].Blend != 60 || len(fills[0].Attrs) != 0 {
+		t.Fatalf("fills[0] = %+v, want Width=2 Blend=60 Attrs=nil", fills[0])
+	}
+	if fills[1].Width != 1 || fills[1].Blend != 20 {
+		t.Fatalf("fills[1] = %+v, want Width=1 Blend=20", fills[1])
+	}
+	if fills[2].Width != 1 || fills[2].Blend != 100 {
+		t.Fatalf("fills[2] = %+v, want Width=1 Blend=100 (clamped)", fills[2])
+	}
+	if len(texts) != 1 || texts[0].Blend != 100 || len(texts[0].Attrs) != 0 {
+		t.Fatalf("texts = %+v, want 1 text with Blend=100 and no blend attr", texts)
+	}
+}

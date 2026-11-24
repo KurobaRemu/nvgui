@@ -3,8 +3,10 @@ package text
 import "github.com/egoist/mygo/ui"
 
 type Config struct {
-	GUIFont string
-	Scale   float32
+	GUIFont    string
+	Scale      float32
+	LineSpace  float32
+	LineHeight float32
 }
 
 type Font struct {

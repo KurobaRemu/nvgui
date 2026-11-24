@@ -162,14 +162,46 @@ func (r *Reducer) applyFrameMetaEvent(state *State, event protocol.Event) {
 		}
 	case "option_set":
 		name, value, ok := protocol.ParseOptionSet(unknown)
-		if !ok || name != "guifont" {
-			return
-		}
-		guifont, ok := value.(string)
 		if !ok {
 			return
 		}
-		meta.GUIFont = guifont
+		switch name {
+		case "guifont":
+			if guifont, ok := value.(string); ok {
+				meta.GUIFont = guifont
+			}
+		case "linespace":
+			if lineSpace, ok := parseOptionInt(value); ok {
+				meta.LineSpace = lineSpace
+			}
+		}
+	}
+}
+
+func parseOptionInt(value any) (int, bool) {
+	switch typed := value.(type) {
+	case int:
+		return typed, true
+	case int64:
+		return int(typed), true
+	case int32:
+		return int(typed), true
+	case int16:
+		return int(typed), true
+	case int8:
+		return int(typed), true
+	case uint64:
+		return int(typed), true
+	case uint32:
+		return int(typed), true
+	case uint16:
+		return int(typed), true
+	case uint8:
+		return int(typed), true
+	case uint:
+		return int(typed), true
+	default:
+		return 0, false
 	}
 }
 

@@ -39,6 +39,18 @@ func guiFontFromEnv(env []string) string {
 	return strings.TrimSpace(envValue(env, "NVGUI_GUIFONT"))
 }
 
+func lineHeightFromEnv(env []string) float32 {
+	raw := strings.TrimSpace(envValue(env, "NVGUI_LINE_HEIGHT"))
+	if raw == "" {
+		return 0
+	}
+	parsed, err := strconv.ParseFloat(raw, 32)
+	if err != nil || math.IsNaN(parsed) || math.IsInf(parsed, 0) || parsed <= 0 {
+		return 0
+	}
+	return float32(parsed)
+}
+
 func envBool(env []string, key string) (bool, bool) {
 	value, ok := envValueOK(env, key)
 	if !ok {

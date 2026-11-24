@@ -15,6 +15,7 @@ type Command struct {
 	FG       uint32  `json:"fg,omitempty"`
 	BG       uint32  `json:"bg,omitempty"`
 	SP       uint32  `json:"sp,omitempty"`
+	Blend    uint8   `json:"blend,omitempty"`
 	Rune     string  `json:"rune,omitempty"`
 }
 

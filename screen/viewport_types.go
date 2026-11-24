@@ -24,6 +24,7 @@ type FrameMeta struct {
 	Margins   map[int]ViewportMargins
 	Busy      bool
 	GUIFont   string
+	LineSpace int
 }
 
 func (r *Reducer) LatestMeta() *FrameMeta           { return reducerLatestMeta(r) }

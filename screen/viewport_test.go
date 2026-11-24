@@ -35,3 +35,19 @@ func TestNewReducerFromLazilyInitializesFrameMeta(t *testing.T) {
 		t.Fatal("MetaForSeq after restore returned nil")
 	}
 }
+
+func TestOptionSetLineSpaceUpdatesFrameMeta(t *testing.T) {
+	reducer := NewReducer()
+	states, err := reducer.Apply([]protocol.Event{
+		protocol.GridResize{Grid: 1, Width: 4, Height: 2},
+		protocol.Unknown{Name: "option_set", Args: []any{"linespace", int64(6)}},
+		protocol.Flush{},
+	})
+	if err != nil {
+		t.Fatalf("Apply: %v", err)
+	}
+	meta := reducer.MetaForSeq(states[0].Seq)
+	if meta == nil || meta.LineSpace != 6 {
+		t.Fatalf("MetaForSeq.LineSpace = %+v, want 6", meta)
+	}
+}
