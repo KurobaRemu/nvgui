@@ -14,6 +14,10 @@ func LineHeightFromEnv(env []string) float32 {
 	return lineHeightFromEnv(env)
 }
 
+func ScaleFactorFromEnv(env []string) (float32, bool) {
+	return scaleFactorFromEnv(env)
+}
+
 func (s *Shell) AnimationConfig() render.AnimationConfig {
 	return shellAnimationConfig(s)
 }

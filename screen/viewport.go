@@ -165,6 +165,11 @@ func (r *Reducer) applyFrameMetaEvent(state *State, event protocol.Event) {
 		if enabled, ok := protocol.ParseMouseEvent(unknown); ok {
 			meta.MouseEnabled = enabled
 		}
+	case "set_title":
+		if parsed, ok, err := protocol.ParseSetTitle(unknown); err == nil && ok {
+			meta.Title = parsed.Title
+			meta.HasTitle = true
+		}
 	case "option_set":
 		name, value, ok := protocol.ParseOptionSet(unknown)
 		if !ok {

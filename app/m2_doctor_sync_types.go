@@ -16,6 +16,7 @@ type NvimConfigSnapshot struct {
 	ScrollAnimationLength    float32      `json:"nvgui_scroll_animation_length"`
 	Ligatures                bool         `json:"nvgui_ligatures"`
 	OpenIn                   OpenInPolicy `json:"nvgui_open_in"`
+	ScaleFactor              float32      `json:"nvgui_scale_factor"`
 }
 
 type DoctorOptions struct {

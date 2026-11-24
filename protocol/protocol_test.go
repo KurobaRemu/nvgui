@@ -134,3 +134,42 @@ func TestNeovimMessagesKeepExplicitZero(t *testing.T) {
 		t.Fatalf("cells = %#v, want %#v", line.Cells, wantCells)
 	}
 }
+
+func TestSetTitleBypassDecoding(t *testing.T) {
+	events, err := protocol.DecodeRedraw([]any{
+		[]any{"set_title", []any{"hello-nvgui"}, []any{""}},
+	})
+	if err != nil {
+		t.Fatalf("DecodeRedraw(set_title): %v", err)
+	}
+	if len(events) != 2 {
+		t.Fatalf("event count = %d, want 2", len(events))
+	}
+	for index, want := range []string{"hello-nvgui", ""} {
+		if _, isUnknown := events[index].(protocol.Unknown); !isUnknown {
+			t.Fatalf("event %d type = %T, want protocol.Unknown", index, events[index])
+		}
+		parsed, ok, err := protocol.ParseSetTitle(events[index])
+		if err != nil || !ok {
+			t.Fatalf("ParseSetTitle(%d) = (%+v, %v, %v), want ok", index, parsed, ok, err)
+		}
+		if parsed.Title != want || parsed.EventName() != "set_title" {
+			t.Fatalf("parsed[%d] = %+v, want Title=%q", index, parsed, want)
+		}
+	}
+
+	direct, ok, err := protocol.ParseSetTitle(protocol.SetTitle{Title: "direct"})
+	if err != nil || !ok || direct.Title != "direct" {
+		t.Fatalf("ParseSetTitle(SetTitle) = (%+v, %v, %v), want Title=\"direct\"", direct, ok, err)
+	}
+
+	if _, ok, err := protocol.ParseSetTitle(protocol.Unknown{Name: "mouse_on"}); err != nil || ok {
+		t.Fatalf("ParseSetTitle(mouse_on) = (%v, %v), want (false, nil)", ok, err)
+	}
+	if _, _, err := protocol.ParseSetTitle(protocol.Unknown{Name: "set_title", Args: []any{}}); err == nil {
+		t.Fatal("ParseSetTitle with missing args returned nil error")
+	}
+	if _, _, err := protocol.ParseSetTitle(protocol.Unknown{Name: "set_title", Args: []any{int64(42)}}); err == nil {
+		t.Fatal("ParseSetTitle with non-string arg returned nil error")
+	}
+}

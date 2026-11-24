@@ -10,14 +10,20 @@ import (
 	"github.com/egoist/mygo/ui"
 )
 
-const shapeCacheCapacity = 4096
+const (
+	shapeCacheCapacity         = 4096
+	minScaleFactor     float32 = 0.5
+	maxScaleFactor     float32 = 4.0
+	defaultScaleFactor float32 = 1.0
+)
 
 type shapeKey struct {
-	text   string
-	font   Font
-	scale  float32
-	bold   bool
-	italic bool
+	text        string
+	font        Font
+	scale       float32
+	scaleFactor float32
+	bold        bool
+	italic      bool
 }
 
 type shapeEntry struct {
@@ -26,23 +32,25 @@ type shapeEntry struct {
 }
 
 type shapeCache struct {
-	capacity int
-	scale    float32
-	calls    int
-	entries  map[shapeKey]*list.Element
-	order    *list.List
+	capacity    int
+	scale       float32
+	scaleFactor float32
+	calls       int
+	entries     map[shapeKey]*list.Element
+	order       *list.List
 }
 
 type resolverImpl struct {
-	mu        sync.Mutex
-	cfg       Config
-	primary   []Font
-	fallbacks []fallbackEntry
-	familyIdx fontFamilyIndex
-	cell      CellSize
-	cellValid bool
-	cellScale float32
-	shaped    *shapeCache
+	mu              sync.Mutex
+	cfg             Config
+	primary         []Font
+	fallbacks       []fallbackEntry
+	familyIdx       fontFamilyIndex
+	cell            CellSize
+	cellValid       bool
+	cellScale       float32
+	cellScaleFactor float32
+	shaped          *shapeCache
 }
 
 func newResolver(cfg Config) (*Resolver, error) {
@@ -52,18 +60,22 @@ func newResolver(cfg Config) (*Resolver, error) {
 	if cfg.Scale == 0 {
 		cfg.Scale = 1
 	}
+	if cfg.ScaleFactor != 0 {
+		cfg.ScaleFactor = normalizeScaleFactor(cfg.ScaleFactor)
+	}
 	index := newFontFamilyIndex(ui.FontFamilies())
 	primary, err := parseUserFonts(cfg.GUIFont, index)
 	if err != nil {
 		return nil, err
 	}
 	impl := &resolverImpl{
-		cfg:       cfg,
-		primary:   primary,
-		fallbacks: builtinFallbackEntriesFromIndex(index),
-		familyIdx: index,
-		cellScale: cfg.Scale,
-		shaped:    newShapeCache(cfg.Scale),
+		cfg:             cfg,
+		primary:         primary,
+		fallbacks:       builtinFallbackEntriesFromIndex(index),
+		familyIdx:       index,
+		cellScale:       cfg.Scale,
+		cellScaleFactor: normalizeScaleFactor(cfg.ScaleFactor),
+		shaped:          newShapeCache(cfg.Scale, normalizeScaleFactor(cfg.ScaleFactor)),
 	}
 	return &Resolver{impl: impl}, nil
 }
@@ -95,6 +107,7 @@ func resolverFontFor(resolver *Resolver, textValue string, bold, italic bool) Fo
 
 	ordered := impl.orderedFonts(classifyText(textValue))
 	variant := impl.primary[0]
+	variant.Size = scaledFontSize(variant.Size, impl.cfg.ScaleFactor)
 	if variant.Weight <= 0 {
 		variant.Weight = defaultFontWeight
 	}
@@ -126,20 +139,22 @@ func resolverShape(resolver *Resolver, textValue string, font Font) []ui.Glyph {
 func (impl *resolverImpl) makeShapeKey(textValue string, font Font) shapeKey {
 	font = impl.normalizedFont(font)
 	return shapeKey{
-		text:   textValue,
-		font:   font,
-		scale:  impl.cfg.Scale,
-		bold:   font.Weight >= 700,
-		italic: font.Italic,
+		text:        textValue,
+		font:        font,
+		scale:       impl.cfg.Scale,
+		scaleFactor: normalizeScaleFactor(impl.cfg.ScaleFactor),
+		bold:        font.Weight >= 700,
+		italic:      font.Italic,
 	}
+}
+
+func (impl *resolverImpl) scaledPrimarySize() float32 {
+	return scaledFontSize(impl.primary[0].Size, impl.cfg.ScaleFactor)
 }
 
 func (impl *resolverImpl) normalizedFont(font Font) Font {
 	if !isFinite(font.Size) || font.Size <= 0 {
-		font.Size = impl.primary[0].Size
-		if !isFinite(font.Size) || font.Size <= 0 {
-			font.Size = defaultFontSize
-		}
+		font.Size = impl.scaledPrimarySize()
 	}
 	if font.Weight <= 0 {
 		font.Weight = defaultFontWeight
@@ -161,9 +176,11 @@ func resolverClearCache(resolver *Resolver) {
 	impl := resolver.impl
 	impl.mu.Lock()
 	defer impl.mu.Unlock()
-	impl.shaped.clear(impl.cfg.Scale)
+	factor := normalizeScaleFactor(impl.cfg.ScaleFactor)
+	impl.shaped.clearFor(impl.cfg.Scale, factor)
 	impl.cellValid = false
 	impl.cellScale = impl.cfg.Scale
+	impl.cellScaleFactor = factor
 }
 
 func parseUserFonts(value string, index fontFamilyIndex) ([]Font, error) {
@@ -196,16 +213,21 @@ func builtinFallbackEntriesFromIndex(index fontFamilyIndex) []fallbackEntry {
 
 func (impl *resolverImpl) refreshScaleLocked() {
 	rawScale := impl.cfg.Scale
-	if impl.shaped.scale == rawScale && impl.cellScale == rawScale {
+	rawFactor := normalizeScaleFactor(impl.cfg.ScaleFactor)
+	if impl.shaped.scale == rawScale && impl.shaped.scaleFactor == rawFactor &&
+		impl.cellScale == rawScale && impl.cellScaleFactor == rawFactor {
 		return
 	}
-	impl.shaped.clear(rawScale)
+	impl.shaped.clearFor(rawScale, rawFactor)
 	impl.cellValid = false
 	impl.cellScale = rawScale
+	impl.cellScaleFactor = rawFactor
 }
 
 func (impl *resolverImpl) calculateCellLocked() CellSize {
-	font := impl.normalizedFont(impl.firstMonospacedFont())
+	base := impl.firstMonospacedFont()
+	base.Size = scaledFontSize(base.Size, impl.cfg.ScaleFactor)
+	font := impl.normalizedFont(base)
 	var maxAdvance float32
 	for _, glyph := range ui.Shape("M", fontToMyGo(font)) {
 		if glyph.Advance > maxAdvance {
@@ -279,12 +301,12 @@ func (impl *resolverImpl) orderedFonts(classes textClass) []Font {
 	return fonts
 }
 
-func newShapeCache(scale float32) *shapeCache {
+func newShapeCache(scale, scaleFactor float32) *shapeCache {
 	cache := &shapeCache{
 		capacity: shapeCacheCapacity,
 		order:    list.New(),
 	}
-	cache.clear(scale)
+	cache.clearFor(scale, scaleFactor)
 	return cache
 }
 
@@ -318,7 +340,12 @@ func (cache *shapeCache) put(key shapeKey, glyphs []ui.Glyph) {
 }
 
 func (cache *shapeCache) clear(scale float32) {
+	cache.clearFor(scale, cache.scaleFactor)
+}
+
+func (cache *shapeCache) clearFor(scale, scaleFactor float32) {
 	cache.scale = scale
+	cache.scaleFactor = scaleFactor
 	cache.calls = 0
 	cache.entries = make(map[shapeKey]*list.Element, cache.capacity)
 	cache.order.Init()
@@ -335,6 +362,26 @@ func effectiveScale(scale float32) float32 {
 		return 1
 	}
 	return scale
+}
+
+func normalizeScaleFactor(factor float32) float32 {
+	if !isFinite(factor) || factor <= 0 {
+		return defaultScaleFactor
+	}
+	if factor < minScaleFactor {
+		return minScaleFactor
+	}
+	if factor > maxScaleFactor {
+		return maxScaleFactor
+	}
+	return factor
+}
+
+func scaledFontSize(baseSize, factor float32) float32 {
+	if !isFinite(baseSize) || baseSize <= 0 {
+		baseSize = defaultFontSize
+	}
+	return baseSize * normalizeScaleFactor(factor)
 }
 
 func isFinite(value float32) bool {

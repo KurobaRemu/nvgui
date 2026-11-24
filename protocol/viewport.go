@@ -160,6 +160,27 @@ func parseMouseMoveEventOption(event Event) (bool, bool) {
 	return enabled, ok
 }
 
+func parseSetTitle(event Event) (SetTitle, bool, error) {
+	switch typed := event.(type) {
+	case SetTitle:
+		return typed, true, nil
+	case Unknown:
+		if typed.Name != "set_title" {
+			return SetTitle{}, false, nil
+		}
+		if len(typed.Args) < 1 {
+			return SetTitle{}, false, fmt.Errorf("protocol: set_title has %d args, want at least 1", len(typed.Args))
+		}
+		title, err := asString(typed.Args[0])
+		if err != nil {
+			return SetTitle{}, false, fmt.Errorf("protocol: set_title title: %w", err)
+		}
+		return SetTitle{Title: title}, true, nil
+	default:
+		return SetTitle{}, false, nil
+	}
+}
+
 func finiteFloat64(value float64) bool {
 	return !math.IsNaN(value) && !math.IsInf(value, 0)
 }

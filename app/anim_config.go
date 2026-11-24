@@ -51,6 +51,18 @@ func lineHeightFromEnv(env []string) float32 {
 	return float32(parsed)
 }
 
+func scaleFactorFromEnv(env []string) (float32, bool) {
+	raw := strings.TrimSpace(envValue(env, "NVGUI_SCALE_FACTOR"))
+	if raw == "" {
+		return 0, false
+	}
+	parsed, err := strconv.ParseFloat(raw, 32)
+	if err != nil || math.IsNaN(parsed) || math.IsInf(parsed, 0) || parsed <= 0 {
+		return 0, false
+	}
+	return roundScaleFactor(clampUserScaleFactor(float32(parsed))), true
+}
+
 func envBool(env []string, key string) (bool, bool) {
 	value, ok := envValueOK(env, key)
 	if !ok {
@@ -114,7 +126,9 @@ func shellSetAnimationConfig(shell *Shell, cfg render.AnimationConfig) {
 	for _, key := range animationEnvKeys {
 		impl.explicitKeys[key] = true
 	}
-	next := nvimConfigSnapshotFrom(valid, impl.nvimConfig.snapshot.OpenIn).normalized()
+	next := nvimConfigSnapshotFrom(valid, impl.nvimConfig.snapshot.OpenIn)
+	next.ScaleFactor = impl.nvimConfig.snapshot.ScaleFactor
+	next = next.normalized()
 	snapshotUnchanged := impl.nvimConfig.snapshot.normalized() == next
 	impl.nvimConfig.snapshot = next
 	if !snapshotUnchanged {

@@ -12,9 +12,51 @@ import (
 	"nvgui/text"
 )
 
-const scaleEpsilon = 1e-4
+const (
+	scaleEpsilon       = 1e-4
+	minUserScaleFactor = float32(0.5)
+	maxUserScaleFactor = float32(4.0)
+	defaultScaleFactor = float32(1.0)
+	zoomStepDelta      = 0.1
+)
 
-var errInvalidScale = errors.New("app: scale must be finite and > 0")
+var (
+	errInvalidScale       = errors.New("app: scale must be finite and > 0")
+	errInvalidScaleFactor = errors.New("app: scale factor must be finite and > 0")
+)
+
+func finitePositiveFloat32(value float32) bool {
+	return value > 0 && !math.IsNaN(float64(value)) && !math.IsInf(float64(value), 0)
+}
+
+func clampUserScaleFactorFloat64(factor float64) float64 {
+	if math.IsNaN(factor) || math.IsInf(factor, 0) || factor <= 0 {
+		return float64(defaultScaleFactor)
+	}
+	if factor < float64(minUserScaleFactor) {
+		return float64(minUserScaleFactor)
+	}
+	if factor > float64(maxUserScaleFactor) {
+		return float64(maxUserScaleFactor)
+	}
+	return factor
+}
+
+func clampUserScaleFactor(factor float32) float32 {
+	return float32(clampUserScaleFactorFloat64(float64(factor)))
+}
+
+func roundScaleFactorFloat64(factor float64) float32 {
+	return float32(math.Round(factor*1_000_000) / 1_000_000)
+}
+
+func roundScaleFactor(factor float32) float32 {
+	return roundScaleFactorFloat64(float64(factor))
+}
+
+func normalizeUserScaleFactor(factor float32) float32 {
+	return roundScaleFactorFloat64(clampUserScaleFactorFloat64(float64(factor)))
+}
 
 func (impl *shellImpl) currentAnimConfigLocked() render.AnimationConfig {
 	if impl.snappingAnim {
@@ -34,27 +76,151 @@ func shellScale(shell *Shell) float32 {
 	impl := shell.impl
 	impl.mu.Lock()
 	defer impl.mu.Unlock()
-	if impl.scale <= 0 || math.IsNaN(float64(impl.scale)) || math.IsInf(float64(impl.scale), 0) {
+	if !finitePositiveFloat32(impl.scale) {
 		return 1
 	}
 	return impl.scale
 }
 
+func shellScaleFactor(shell *Shell) float32 {
+	if shell == nil || shell.impl == nil {
+		return defaultScaleFactor
+	}
+	impl := shell.impl
+	impl.mu.Lock()
+	defer impl.mu.Unlock()
+	if !finitePositiveFloat32(impl.scaleFactor) {
+		return defaultScaleFactor
+	}
+	return normalizeUserScaleFactor(impl.scaleFactor)
+}
+
 func shellSetScale(shell *Shell, scale float32) error {
-	if scale <= 0 || math.IsNaN(float64(scale)) || math.IsInf(float64(scale), 0) {
+	if !finitePositiveFloat32(scale) {
 		return fmt.Errorf("%w: %v", errInvalidScale, scale)
 	}
 	if shell == nil || shell.impl == nil {
 		return errShellClosed
 	}
 	impl := shell.impl
+	impl.mu.Lock()
+	if impl.closed || !impl.started {
+		impl.mu.Unlock()
+		return errShellClosed
+	}
+	if !scaleChanged(impl.scale, scale) && !scaleChanged(impl.builtScale, scale) && !scaleChanged(impl.builtScaleFactor, impl.scaleFactor) {
+		impl.mu.Unlock()
+		return nil
+	}
+	impl.scale = scale
+	impl.mu.Unlock()
+	return impl.rebuildDisplayResolver(shell)
+}
+
+func shellSetScaleFactor(shell *Shell, factor float32) error {
+	if !finitePositiveFloat32(factor) {
+		return fmt.Errorf("%w: %v", errInvalidScaleFactor, factor)
+	}
+	clamped := normalizeUserScaleFactor(factor)
+	return updateScaleFactor(shell, func(float32) float32 { return clamped })
+}
+
+func shellZoomIn(shell *Shell) error {
+	return shellZoomDelta(shell, zoomStepDelta)
+}
+
+func shellZoomOut(shell *Shell) error {
+	return shellZoomDelta(shell, -zoomStepDelta)
+}
+
+func shellZoomReset(shell *Shell) error {
+	return shellSetScaleFactor(shell, defaultScaleFactor)
+}
+
+func shellZoomDelta(shell *Shell, delta float64) error {
+	return updateScaleFactor(shell, func(current float32) float32 {
+		return roundScaleFactorFloat64(clampUserScaleFactorFloat64(float64(current) + delta))
+	})
+}
+
+func shellZoomBy(shell *Shell, multiplier float32) error {
+	if !finitePositiveFloat32(multiplier) {
+		return fmt.Errorf("%w: %v", errInvalidScaleFactor, multiplier)
+	}
+	return updateScaleFactor(shell, func(current float32) float32 {
+		return roundScaleFactorFloat64(clampUserScaleFactorFloat64(float64(current) * float64(multiplier)))
+	})
+}
+
+func updateScaleFactor(shell *Shell, nextFn func(current float32) float32) error {
+	if shell == nil || shell.impl == nil {
+		return errShellClosed
+	}
+	impl := shell.impl
+	impl.mu.Lock()
+	if impl.closed || !impl.started {
+		impl.mu.Unlock()
+		return errShellClosed
+	}
+	current := impl.scaleFactor
+	if !finitePositiveFloat32(current) {
+		current = defaultScaleFactor
+	}
+	next := nextFn(current)
+	impl.explicitScaleFactor = true
+	if scaleChanged(impl.scaleFactor, next) {
+		impl.scaleFactor = next
+		impl.nvimConfig.snapshot.ScaleFactor = next
+		impl.markSyncPendingLocked()
+	} else if !scaleChanged(impl.builtScaleFactor, impl.scaleFactor) && !scaleChanged(impl.builtScale, impl.scale) {
+		impl.mu.Unlock()
+		return nil
+	}
+	impl.mu.Unlock()
+	return impl.rebuildDisplayResolver(shell)
+}
+
+func (impl *shellImpl) handleZoomInput(ev ui.InputEvent) bool {
+	if impl == nil || impl.checkOpen() != nil {
+		return false
+	}
+	switch ev.Kind {
+	case ui.InputKeyDown:
+		switch {
+		case ev.Key == ui.KeyEqual && (ev.Mods == ui.Cmd || ev.Mods == ui.Cmd|ui.Shift):
+			_ = shellZoomIn(&Shell{impl: impl})
+			return true
+		case ev.Key == ui.KeyMinus && ev.Mods == ui.Cmd:
+			_ = shellZoomOut(&Shell{impl: impl})
+			return true
+		case ev.Key == ui.Key0 && ev.Mods == ui.Cmd:
+			_ = shellZoomReset(&Shell{impl: impl})
+			return true
+		}
+	case ui.InputZoom:
+		if finitePositiveFloat32(ev.Scale) {
+			if ev.Scale != 1 {
+				_ = shellZoomBy(&Shell{impl: impl}, ev.Scale)
+			}
+			return true
+		}
+	}
+	return false
+}
+
+func (impl *shellImpl) rebuildDisplayResolver(shell *Shell) error {
 	for {
 		impl.mu.Lock()
 		if impl.closed || !impl.started {
 			impl.mu.Unlock()
 			return errShellClosed
 		}
-		if !scaleChanged(impl.scale, scale) {
+		wantScale := impl.scale
+		if !finitePositiveFloat32(wantScale) {
+			wantScale = 1
+		}
+		wantFactor := normalizeUserScaleFactor(impl.scaleFactor)
+		if !scaleChanged(impl.builtScale, wantScale) && !scaleChanged(impl.builtScaleFactor, wantFactor) {
 			impl.mu.Unlock()
 			return nil
 		}
@@ -64,22 +230,24 @@ func shellSetScale(shell *Shell, scale float32) error {
 		impl.mu.Unlock()
 
 		newResolver, err := text.NewResolver(text.Config{
-			GUIFont:    guiFont,
-			Scale:      scale,
-			LineSpace:  float32(lineSpace),
-			LineHeight: lineHeight,
+			GUIFont:     guiFont,
+			Scale:       wantScale,
+			ScaleFactor: wantFactor,
+			LineSpace:   float32(lineSpace),
+			LineHeight:  lineHeight,
 		})
 		if err != nil {
 			if guiFont == "" {
-				return fmt.Errorf("app: create font resolver for scale %v: %w", scale, err)
+				return fmt.Errorf("app: create font resolver for scale %v/%v: %w", wantScale, wantFactor, err)
 			}
 			newResolver, err = text.NewResolver(text.Config{
-				Scale:      scale,
-				LineSpace:  float32(lineSpace),
-				LineHeight: lineHeight,
+				Scale:       wantScale,
+				ScaleFactor: wantFactor,
+				LineSpace:   float32(lineSpace),
+				LineHeight:  lineHeight,
 			})
 			if err != nil {
-				return fmt.Errorf("app: create font resolver for scale %v: %w", scale, err)
+				return fmt.Errorf("app: create font resolver for scale %v/%v: %w", wantScale, wantFactor, err)
 			}
 		}
 
@@ -90,17 +258,19 @@ func shellSetScale(shell *Shell, scale float32) error {
 			impl.animSnapMu.Unlock()
 			return errShellClosed
 		}
-		if !scaleChanged(impl.scale, scale) {
-			impl.mu.Unlock()
-			impl.animSnapMu.Unlock()
-			return nil
-		}
-		if impl.lastGUIFont != guiFont || impl.lastLineSpace != lineSpace {
-			impl.forceFullRepaint = true
-			impl.configDirty = true
+		if scaleChanged(impl.scale, wantScale) || scaleChanged(impl.scaleFactor, wantFactor) || impl.lastGUIFont != guiFont || impl.lastLineSpace != lineSpace {
+			if impl.lastGUIFont != guiFont || impl.lastLineSpace != lineSpace {
+				impl.forceFullRepaint = true
+				impl.configDirty = true
+			}
 			impl.mu.Unlock()
 			impl.animSnapMu.Unlock()
 			continue
+		}
+		if !scaleChanged(impl.builtScale, wantScale) && !scaleChanged(impl.builtScaleFactor, wantFactor) {
+			impl.mu.Unlock()
+			impl.animSnapMu.Unlock()
+			return nil
 		}
 		if impl.animator == nil || impl.planner == nil {
 			impl.mu.Unlock()
@@ -114,7 +284,8 @@ func shellSetScale(shell *Shell, scale float32) error {
 		impl.resolver = newResolver
 		impl.planner = nextPlanner
 		impl.animator = nextAnimator
-		impl.scale = scale
+		impl.builtScale = wantScale
+		impl.builtScaleFactor = wantFactor
 		impl.scaleRebuildCount++
 		impl.forceFullRepaint = true
 		impl.snapNextFrame = true
@@ -133,20 +304,26 @@ func shellSetScale(shell *Shell, scale float32) error {
 
 func shellDisplayMetrics(shell *Shell) DisplayMetrics {
 	if shell == nil || shell.impl == nil {
-		return DisplayMetrics{Scale: 1}
+		return DisplayMetrics{Scale: 1, ScaleFactor: defaultScaleFactor}
 	}
 	impl := shell.impl
 	impl.mu.Lock()
 	metrics := DisplayMetrics{
 		Scale:        impl.scale,
+		ScaleFactor:  impl.scaleFactor,
 		FullScreen:   impl.fullScreen,
 		RebuildCount: impl.scaleRebuildCount,
 		RepaintCount: impl.repaintCount,
 	}
 	resolver := impl.resolver
 	impl.mu.Unlock()
-	if metrics.Scale <= 0 || math.IsNaN(float64(metrics.Scale)) || math.IsInf(float64(metrics.Scale), 0) {
+	if !finitePositiveFloat32(metrics.Scale) {
 		metrics.Scale = 1
+	}
+	if !finitePositiveFloat32(metrics.ScaleFactor) {
+		metrics.ScaleFactor = defaultScaleFactor
+	} else {
+		metrics.ScaleFactor = normalizeUserScaleFactor(metrics.ScaleFactor)
 	}
 	if resolver != nil {
 		metrics.Cell = resolver.Cell()

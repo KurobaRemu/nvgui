@@ -363,14 +363,7 @@ func cleanBaseNvimArgs(args []string) []string {
 }
 
 func newWorkspaceWindow(shell *Shell, req LaunchRequest, id uint64, impl *workspaceImpl) (*mygo.Window, []func()) {
-	cell := shell.impl.cell()
-	window := mygo.NewWindow(mygo.WindowOptions{
-		Title:          "nvgui",
-		Width:          windowDimension(req.Width, defaultColumns, cell.Width),
-		Height:         windowDimension(req.Height, defaultRows, cell.Height),
-		UseContentSize: true,
-		Content:        ui.View(shell.View),
-	})
+	window := mygo.NewWindow(windowOptionsForShell(shell, req, id == 1))
 	shell.impl.mu.Lock()
 	shell.impl.window = window
 	shell.impl.mu.Unlock()
@@ -613,13 +606,28 @@ func workspaceHandleShortcut(w *Workspace, c *ui.Context, id uint64) bool {
 	}
 	newWin := c.Shortcut(ui.Cmd, ui.KeyN)
 	closeWin := c.Shortcut(ui.Cmd, ui.KeyW)
+	zoomIn := c.Shortcut(ui.Cmd, ui.KeyEqual) || c.Shortcut(ui.Cmd|ui.Shift, ui.KeyEqual)
+	zoomOut := c.Shortcut(ui.Cmd, ui.KeyMinus)
+	zoomReset := c.Shortcut(ui.Cmd, ui.Key0)
 	if newWin {
 		impl.asyncTask(func() { _, _, _ = workspaceNewWindow(w, context.Background(), LaunchRequest{}) })
 	}
 	if closeWin {
 		impl.asyncTask(func() { _ = workspaceCloseWindow(w, id) })
 	}
-	return newWin || closeWin
+	if zoomIn || zoomOut || zoomReset {
+		if sh := workspaceShell(w, id); sh != nil {
+			switch {
+			case zoomIn:
+				_ = sh.ZoomIn()
+			case zoomOut:
+				_ = sh.ZoomOut()
+			case zoomReset:
+				_ = sh.ZoomReset()
+			}
+		}
+	}
+	return newWin || closeWin || zoomIn || zoomOut || zoomReset
 }
 
 func workspaceBuildMenu(w *Workspace) *mygo.Menu {

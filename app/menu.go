@@ -64,6 +64,39 @@ func workspaceBuildMenuFor(w *Workspace) *mygo.Menu {
 			}
 		})
 	}
+	targetShell := func(win *mygo.Window) *Shell {
+		if impl == nil {
+			return nil
+		}
+		if win != nil {
+			impl.mu.Lock()
+			for _, entry := range impl.windows {
+				if entry != nil && entry.window == win {
+					sh := entry.shell
+					impl.mu.Unlock()
+					return sh
+				}
+			}
+			impl.mu.Unlock()
+		}
+		_, sh := workspaceFront(w)
+		return sh
+	}
+	zoomIn := func(_ *mygo.MenuItem, win *mygo.Window) {
+		if sh := targetShell(win); sh != nil {
+			_ = sh.ZoomIn()
+		}
+	}
+	zoomOut := func(_ *mygo.MenuItem, win *mygo.Window) {
+		if sh := targetShell(win); sh != nil {
+			_ = sh.ZoomOut()
+		}
+	}
+	zoomReset := func(_ *mygo.MenuItem, win *mygo.Window) {
+		if sh := targetShell(win); sh != nil {
+			_ = sh.ZoomReset()
+		}
+	}
 	return mygo.NewMenu([]*mygo.MenuItem{
 		{Role: mygo.RoleAppMenu},
 		{Label: "File", Submenu: []*mygo.MenuItem{
@@ -74,6 +107,10 @@ func workspaceBuildMenuFor(w *Workspace) *mygo.Menu {
 		}},
 		{Role: mygo.RoleEditMenu},
 		{Label: "View", Submenu: []*mygo.MenuItem{
+			{ID: "zoom-in", Label: "Zoom In", Accelerator: "CmdOrCtrl+Plus", Click: zoomIn},
+			{ID: "zoom-out", Label: "Zoom Out", Accelerator: "CmdOrCtrl+-", Click: zoomOut},
+			{ID: "zoom-reset", Label: "Actual Size", Accelerator: "CmdOrCtrl+0", Click: zoomReset},
+			mygo.Separator(),
 			{ID: "toggle-fullscreen", Role: mygo.RoleToggleFullScreen},
 		}},
 		{Role: mygo.RoleWindowMenu},

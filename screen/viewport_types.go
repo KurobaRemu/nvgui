@@ -27,6 +27,8 @@ type FrameMeta struct {
 	LineSpace      int
 	MouseEnabled   bool
 	MouseMoveEvent bool
+	Title          string
+	HasTitle       bool
 }
 
 func (r *Reducer) LatestMeta() *FrameMeta           { return reducerLatestMeta(r) }

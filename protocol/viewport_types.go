@@ -20,9 +20,11 @@ type WinViewportMargins struct {
 
 type MouseOn struct{}
 type MouseOff struct{}
+type SetTitle struct{ Title string }
 
 func (MouseOn) EventName() string  { return "mouse_on" }
 func (MouseOff) EventName() string { return "mouse_off" }
+func (SetTitle) EventName() string { return "set_title" }
 
 func ParseWinViewport(event Event) (WinViewport, bool, error) {
 	return parseWinViewport(event)
@@ -46,4 +48,8 @@ func ParseOptionSet(event Event) (name string, value any, ok bool) {
 
 func ParseMouseMoveEventOption(event Event) (enabled bool, ok bool) {
 	return parseMouseMoveEventOption(event)
+}
+
+func ParseSetTitle(event Event) (SetTitle, bool, error) {
+	return parseSetTitle(event)
 }

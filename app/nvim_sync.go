@@ -22,7 +22,8 @@ const (
 		`'nvgui_scroll_animation': get(g:, 'nvgui_scroll_animation', v:null), ` +
 		`'nvgui_scroll_animation_length': get(g:, 'nvgui_scroll_animation_length', v:null), ` +
 		`'nvgui_ligatures': get(g:, 'nvgui_ligatures', v:null), ` +
-		`'nvgui_open_in': get(g:, 'nvgui_open_in', v:null)}`
+		`'nvgui_open_in': get(g:, 'nvgui_open_in', v:null), ` +
+		`'nvgui_scale_factor': get(g:, 'nvgui_scale_factor', v:null)}`
 )
 
 type nvimConfigState struct {
@@ -45,6 +46,7 @@ func nvimConfigSnapshotFrom(cfg render.AnimationConfig, policy OpenInPolicy) Nvi
 		ScrollAnimationLength:    cfg.ScrollAnimationLength,
 		Ligatures:                cfg.LigaturesEnabled,
 		OpenIn:                   policy,
+		ScaleFactor:              defaultScaleFactor,
 	}
 }
 
@@ -58,6 +60,7 @@ func (snapshot NvimConfigSnapshot) withValidDefaults() NvimConfigSnapshot {
 	if _, ok := parseOpenInPolicy(string(snapshot.OpenIn)); !ok {
 		snapshot.OpenIn = OpenInFront
 	}
+	snapshot.ScaleFactor = normalizeUserScaleFactor(snapshot.ScaleFactor)
 	return snapshot
 }
 
@@ -75,6 +78,7 @@ func shellNvimConfig(shell *Shell) NvimConfigSnapshot {
 func (snapshot NvimConfigSnapshot) normalized() NvimConfigSnapshot {
 	snapshot.CursorAnimationLength = float32(math.Round(float64(snapshot.CursorAnimationLength)*1_000_000) / 1_000_000)
 	snapshot.ScrollAnimationLength = float32(math.Round(float64(snapshot.ScrollAnimationLength)*1_000_000) / 1_000_000)
+	snapshot.ScaleFactor = normalizeUserScaleFactor(snapshot.ScaleFactor)
 	snapshot = snapshot.withValidDefaults()
 	return snapshot
 }
@@ -163,6 +167,7 @@ func shellSyncNvimConfig(shell *Shell, ctx context.Context) (NvimConfigSnapshot,
 	initial := false
 	initialChanged := false
 	shouldSyncWorkspace := false
+	scaleFactorChanged := false
 	impl.mu.Lock()
 	services, window := impl.services, impl.window
 	before := impl.nvimConfig.snapshot.normalized()
@@ -171,11 +176,15 @@ func shellSyncNvimConfig(shell *Shell, ctx context.Context) (NvimConfigSnapshot,
 		merged := initialNvimConfig(impl, remote, before).normalized()
 		initialChanged = merged != before
 		shouldSyncWorkspace = initialChanged && merged.OpenIn != before.OpenIn && impl.workspace != nil
+		scaleFactorChanged = initialChanged && scaleChanged(merged.ScaleFactor, impl.scaleFactor)
 		impl.nvimConfig.snapshot = merged
 		impl.nvimConfig.initialSyncDone = true
 		impl.nvimConfig.syncPending = true
 		if initialChanged {
 			impl.applySnapshotToShellLocked(merged)
+			if scaleFactorChanged {
+				impl.scaleFactor = merged.ScaleFactor
+			}
 			impl.configDirty = true
 			impl.configGeneration++
 		}
@@ -186,6 +195,9 @@ func shellSyncNvimConfig(shell *Shell, ctx context.Context) (NvimConfigSnapshot,
 	impl.mu.Unlock()
 	if shouldSyncWorkspace {
 		workspace.SetOpenInPolicy(local.OpenIn)
+	}
+	if scaleFactorChanged {
+		_ = impl.rebuildDisplayResolver(shell)
 	}
 	if initialChanged {
 		invalidate(services, window)
@@ -274,6 +286,7 @@ type nvimConfigSession interface {
 func initialNvimConfig(impl *shellImpl, remote map[string]any, before NvimConfigSnapshot) NvimConfigSnapshot {
 	cfg := impl.animator.Config()
 	local := nvimConfigSnapshotFrom(cfg, before.OpenIn)
+	local.ScaleFactor = before.ScaleFactor
 	envKeys := impl.envConfigKeys
 	explicitKeys := impl.explicitKeys
 	masterValue, masterSet := envBool(impl.req.Env, "NVGUI_NO_ANIMATIONS")
@@ -320,6 +333,14 @@ func initialNvimConfig(impl *shellImpl, remote map[string]any, before NvimConfig
 		if value, ok := remote["nvgui_open_in"]; ok && value != nil {
 			if policy, ok := parseOpenInPolicy(toString(value)); ok {
 				merged.OpenIn = policy
+			}
+		}
+	}
+	_, envScaleSet := scaleFactorFromEnv(impl.req.Env)
+	if !envScaleSet && !impl.explicitScaleFactor && !impl.explicitConfig {
+		if value, ok := remote["nvgui_scale_factor"]; ok && value != nil {
+			if parsed, ok := valueToFloat(value); ok && parsed > 0 {
+				merged.ScaleFactor = normalizeUserScaleFactor(float32(parsed))
 			}
 		}
 	}
@@ -435,6 +456,17 @@ func applyRemoteConfig(shell *Shell, remote map[string]any, local NvimConfigSnap
 			}
 		}
 	}
+	if value, ok := remote["nvgui_scale_factor"]; ok && value != nil {
+		if parsed, ok := valueToFloat(value); ok && parsed > 0 {
+			clamped := normalizeUserScaleFactor(float32(parsed))
+			synced.ScaleFactor = clamped
+			remoteChanged = true
+			if scaleChanged(baseline.ScaleFactor, clamped) {
+				next.ScaleFactor = clamped
+				changed = true
+			}
+		}
+	}
 	next = next.normalized()
 	synced = synced.normalized()
 	if !remoteChanged {
@@ -446,8 +478,12 @@ func applyRemoteConfig(shell *Shell, remote map[string]any, local NvimConfigSnap
 		impl.mu.Unlock()
 		return nil
 	}
+	scaleFactorChanged := scaleChanged(next.ScaleFactor, impl.scaleFactor)
 	impl.nvimConfig.snapshot = next
 	impl.applySnapshotToShellLocked(next)
+	if scaleFactorChanged {
+		impl.scaleFactor = next.ScaleFactor
+	}
 	impl.configDirty = true
 	impl.configGeneration++
 	services, window := impl.services, impl.window
@@ -459,6 +495,9 @@ func applyRemoteConfig(shell *Shell, remote map[string]any, local NvimConfigSnap
 	}
 	if workspace != nil && next.OpenIn != local.OpenIn {
 		workspace.SetOpenInPolicy(next.OpenIn)
+	}
+	if scaleFactorChanged {
+		_ = impl.rebuildDisplayResolver(shell)
 	}
 	invalidate(services, window)
 	return nil

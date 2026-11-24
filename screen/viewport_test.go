@@ -137,3 +137,82 @@ func TestMouseFrameMetaLifecycleRollbackAndCanonicalInvariant(t *testing.T) {
 		t.Fatalf("restored FrameMeta = %+v, want MouseEnabled=true MouseMoveEvent=false", restored)
 	}
 }
+
+func TestSetTitleFrameMetaLifecycleRollbackAndCanonicalInvariant(t *testing.T) {
+	plain := NewReducer()
+	withTitle := NewReducer()
+
+	base := []protocol.Event{
+		protocol.GridResize{Grid: 1, Width: 20, Height: 6},
+		protocol.GridLine{Grid: 1, Row: 0, ColStart: 0, Cells: []protocol.LineCell{{Text: "A", Repeat: 1}}},
+		protocol.GridCursorGoto{Grid: 1, Row: 0, Col: 0},
+	}
+	plainStates, err := plain.Apply(append(append([]protocol.Event(nil), base...), protocol.Flush{}))
+	if err != nil {
+		t.Fatalf("plain.Apply: %v", err)
+	}
+	titleStates1, err := withTitle.Apply(append(append([]protocol.Event(nil), base...), protocol.Flush{}))
+	if err != nil {
+		t.Fatalf("withTitle.Apply frame 1: %v", err)
+	}
+	meta1 := withTitle.LatestMeta()
+	if meta1 == nil || meta1.HasTitle || meta1.Title != "" {
+		t.Fatalf("initial FrameMeta = %+v, want HasTitle=false Title=\"\"", meta1)
+	}
+
+	titleStates2, err := withTitle.Apply([]protocol.Event{
+		protocol.Unknown{Name: "set_title", Args: []any{"hello-nvgui"}},
+		protocol.Flush{},
+	})
+	if err != nil || len(titleStates2) != 1 {
+		t.Fatalf("withTitle.Apply frame 2: states=%d err=%v", len(titleStates2), err)
+	}
+	meta2 := withTitle.LatestMeta()
+	if meta2 == nil || !meta2.HasTitle || meta2.Title != "hello-nvgui" {
+		t.Fatalf("frame 2 FrameMeta = %+v, want HasTitle=true Title=\"hello-nvgui\"", meta2)
+	}
+	if hist1 := withTitle.MetaForSeq(titleStates1[0].Seq); hist1 == nil || hist1.HasTitle {
+		t.Fatalf("historical frame 1 mutated: %+v", hist1)
+	}
+
+	plainJSON, err := Canonical(plainStates[0])
+	if err != nil {
+		t.Fatalf("Canonical(plain): %v", err)
+	}
+	titleJSON, err := Canonical(titleStates2[0])
+	if err != nil {
+		t.Fatalf("Canonical(withTitle): %v", err)
+	}
+	if !bytes.Equal(plainJSON, titleJSON) {
+		t.Fatalf("set_title altered Committed Screen Canonical JSON:\n got %s\nwant %s", titleJSON, plainJSON)
+	}
+
+	// Failed batch must roll back set_title.
+	_, err = withTitle.Apply([]protocol.Event{
+		protocol.Unknown{Name: "set_title", Args: []any{"rolled-back"}},
+		protocol.GridLine{Grid: 999, Row: 0, ColStart: 0, Cells: []protocol.LineCell{{Text: "X", Repeat: 1}}},
+		protocol.Flush{},
+	})
+	if err == nil {
+		t.Fatal("expected error for unknown grid 999")
+	}
+	if _, err := withTitle.Apply([]protocol.Event{protocol.Flush{}}); err != nil {
+		t.Fatalf("clean Flush after rollback: %v", err)
+	}
+	afterRollback := withTitle.LatestMeta()
+	if afterRollback == nil || !afterRollback.HasTitle || afterRollback.Title != "hello-nvgui" {
+		t.Fatalf("rollback leaked title metadata: %+v", afterRollback)
+	}
+
+	// Empty title preserves HasTitle=true so app can fall back to "nvgui".
+	if _, err := withTitle.Apply([]protocol.Event{
+		protocol.Unknown{Name: "set_title", Args: []any{""}},
+		protocol.Flush{},
+	}); err != nil {
+		t.Fatalf("withTitle.Apply empty title: %v", err)
+	}
+	cleared := withTitle.LatestMeta()
+	if cleared == nil || !cleared.HasTitle || cleared.Title != "" {
+		t.Fatalf("cleared FrameMeta = %+v, want HasTitle=true Title=\"\"", cleared)
+	}
+}

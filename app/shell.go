@@ -80,6 +80,12 @@ type shellImpl struct {
 	lastLineSpace         int
 	lineHeight            float32
 	scale                 float32
+	scaleFactor           float32
+	builtScale            float32
+	builtScaleFactor      float32
+	explicitScaleFactor   bool
+	windowTitle           string
+	windowBackground      string
 	fullScreen            bool
 	scaleRebuildCount     uint64
 	repaintCount          uint64
@@ -169,17 +175,22 @@ func (clock *animClock) Sync(now time.Time) {
 
 func newShell(req LaunchRequest, clock diag.Clock, clipboard Clipboard) *Shell {
 	return &Shell{impl: &shellImpl{
-		req:           req,
-		clipboard:     clipboard,
-		scale:         1,
-		animClock:     newAnimClock(clock),
-		envConfigKeys: envConfigKeys(req.Env),
-		explicitKeys:  make(map[string]bool),
-		syncCh:        make(chan struct{}, 1),
-		syncSem:       newSyncSemaphore(),
-		closing:       make(chan struct{}),
-		closeDone:     make(chan struct{}),
-		resizeCh:      make(chan struct{}, 1),
+		req:              req,
+		clipboard:        clipboard,
+		scale:            1,
+		scaleFactor:      defaultScaleFactor,
+		builtScale:       1,
+		builtScaleFactor: defaultScaleFactor,
+		windowTitle:      defaultWindowTitle,
+		windowBackground: defaultWindowBackground,
+		animClock:        newAnimClock(clock),
+		envConfigKeys:    envConfigKeys(req.Env),
+		explicitKeys:     make(map[string]bool),
+		syncCh:           make(chan struct{}, 1),
+		syncSem:          newSyncSemaphore(),
+		closing:          make(chan struct{}),
+		closeDone:        make(chan struct{}),
+		resizeCh:         make(chan struct{}, 1),
 	}}
 }
 
@@ -353,7 +364,7 @@ func (s *Shell) AttachInput(c *ui.Context) ui.Element {
 	}
 	impl := s.impl
 	inputBox := ui.Box(c).Fill().Focusable().AutoFocus().Label("nvgui-input").HandleInput(func(ev ui.InputEvent) bool {
-		return s.HandleEditCommand(c, ev) || impl.handleInputEvent(ev)
+		return s.HandleEditCommand(c, ev) || impl.handleZoomInput(ev) || impl.handleInputEvent(ev)
 	}).TextCaret(impl.caret()).InputMethod(impl.handler.IMEAllowed())
 	inputBox.Draw(func(p *ui.Painter, _ ui.Rect) { observePainterScale(s, p) })
 	inputBox.Children(func() {
@@ -558,10 +569,14 @@ func startShell(ctx context.Context, req LaunchRequest, clock diag.Clock, clipbo
 	ctx, cancel := context.WithCancel(ctx)
 	guiFont := GUIFontFromEnv(req.Env)
 	lineHeight := LineHeightFromEnv(req.Env)
-	resolver, err := text.NewResolver(text.Config{GUIFont: guiFont, Scale: 1, LineHeight: lineHeight})
+	scaleFactor, scaleFactorSet := scaleFactorFromEnv(req.Env)
+	if !scaleFactorSet {
+		scaleFactor = defaultScaleFactor
+	}
+	resolver, err := text.NewResolver(text.Config{GUIFont: guiFont, Scale: 1, ScaleFactor: scaleFactor, LineHeight: lineHeight})
 	if err != nil {
 		guiFont = ""
-		resolver, err = text.NewResolver(text.Config{Scale: 1, LineHeight: lineHeight})
+		resolver, err = text.NewResolver(text.Config{Scale: 1, ScaleFactor: scaleFactor, LineHeight: lineHeight})
 		if err != nil {
 			cancel()
 			return nil, fmt.Errorf("app: create font resolver: %w", err)
@@ -578,6 +593,9 @@ func startShell(ctx context.Context, req LaunchRequest, clock diag.Clock, clipbo
 	impl.onExit = hooks.onExit
 	impl.onShortcut = hooks.onShortcut
 	impl.workspace = hooks.workspace
+	impl.scaleFactor = scaleFactor
+	impl.builtScaleFactor = scaleFactor
+	impl.explicitScaleFactor = scaleFactorSet
 	cfg := AnimationConfigFromEnv(req.Env)
 	if policy, ok := parseOpenInPolicy(envValue(req.Env, "NVGUI_OPEN_IN")); ok {
 		impl.nvimConfig.snapshot = nvimConfigSnapshotFrom(cfg, policy)
@@ -589,6 +607,7 @@ func startShell(ctx context.Context, req LaunchRequest, clock diag.Clock, clipbo
 			impl.nvimConfig.snapshot.OpenIn = hooksPolicy
 		}
 	}
+	impl.nvimConfig.snapshot.ScaleFactor = scaleFactor
 	impl.ctx = ctx
 	impl.cancel = cancel
 	impl.lastColumns, impl.lastRows = -1, -1
@@ -641,14 +660,7 @@ func startShell(ctx context.Context, req LaunchRequest, clock diag.Clock, clipbo
 				impl.quitOnce.Do(func() { mygo.App.Quit() })
 				return
 			}
-			cell := impl.cell()
-			window := mygo.NewWindow(mygo.WindowOptions{
-				Title:          "nvgui",
-				Width:          windowDimension(req.Width, defaultColumns, cell.Width),
-				Height:         windowDimension(req.Height, defaultRows, cell.Height),
-				UseContentSize: true,
-				Content:        ui.View(shell.View),
-			})
+			window := mygo.NewWindow(windowOptionsForShell(shell, req, true))
 			impl.mu.Lock()
 			impl.window = window
 			impl.mu.Unlock()
@@ -669,6 +681,11 @@ func startShell(ctx context.Context, req LaunchRequest, clock diag.Clock, clipbo
 	return shell, nil
 }
 
+const (
+	defaultWindowTitle      = "nvgui"
+	defaultWindowBackground = "light-dark(#f5f5f7, #1e1e1e)"
+)
+
 func windowDimension(cells, fallback int, size float32) int {
 	if cells <= 0 {
 		cells = fallback
@@ -677,6 +694,97 @@ func windowDimension(cells, fallback int, size float32) int {
 		size = 8
 	}
 	return int(math.Ceil(float64(cells) * float64(size)))
+}
+
+func shellTitle(shell *Shell) string {
+	if shell == nil || shell.impl == nil {
+		return defaultWindowTitle
+	}
+	shell.impl.mu.Lock()
+	title := shell.impl.windowTitle
+	shell.impl.mu.Unlock()
+	if title == "" {
+		return defaultWindowTitle
+	}
+	return title
+}
+
+func (impl *shellImpl) windowBackgroundColor() string {
+	if impl == nil {
+		return defaultWindowBackground
+	}
+	impl.mu.Lock()
+	bg := impl.windowBackground
+	impl.mu.Unlock()
+	if bg == "" {
+		return defaultWindowBackground
+	}
+	return bg
+}
+
+func windowOptionsForShell(shell *Shell, req LaunchRequest, isMain bool) mygo.WindowOptions {
+	cell := shell.impl.cell()
+	stateKey := ""
+	if isMain {
+		stateKey = "main"
+	}
+	return mygo.WindowOptions{
+		Title:           shellTitle(shell),
+		Width:           windowDimension(req.Width, defaultColumns, cell.Width),
+		Height:          windowDimension(req.Height, defaultRows, cell.Height),
+		UseContentSize:  true,
+		StateKey:        stateKey,
+		BackgroundColor: shell.impl.windowBackgroundColor(),
+		Content:         ui.View(shell.View),
+	}
+}
+
+func (impl *shellImpl) syncWindowAppearance(state *screen.State, meta *screen.FrameMeta) {
+	if impl == nil {
+		return
+	}
+	var nextTitle string
+	var titleChanged bool
+	var nextBG string
+	var bgChanged bool
+	var window *mygo.Window
+
+	impl.mu.Lock()
+	if impl.closed {
+		impl.mu.Unlock()
+		return
+	}
+	window = impl.window
+	if meta != nil && meta.HasTitle {
+		targetTitle := meta.Title
+		if targetTitle == "" {
+			targetTitle = defaultWindowTitle
+		}
+		if targetTitle != impl.windowTitle {
+			impl.windowTitle = targetTitle
+			nextTitle = targetTitle
+			titleChanged = true
+		}
+	}
+	if state != nil && state.DefaultColors != (screen.Colors{}) && state.DefaultColors.BG >= 0 && state.DefaultColors.BG <= 0xffffff {
+		targetBG := fmt.Sprintf("#%06x", uint32(state.DefaultColors.BG)&0xffffff)
+		if targetBG != impl.windowBackground {
+			impl.windowBackground = targetBG
+			nextBG = targetBG
+			bgChanged = true
+		}
+	}
+	impl.mu.Unlock()
+
+	if window == nil || window.IsDestroyed() {
+		return
+	}
+	if titleChanged {
+		window.SetTitle(nextTitle)
+	}
+	if bgChanged {
+		_ = window.SetBackgroundColor(nextBG)
+	}
 }
 
 func (impl *shellImpl) checkOpen() error {
@@ -943,6 +1051,7 @@ func (impl *shellImpl) refreshFrameWithContext(c *ui.Context, now time.Time, ins
 		return
 	}
 	impl.syncMouseState(state, meta)
+	impl.syncWindowAppearance(state, meta)
 	impl.mu.Lock()
 	session, view, planner, animator, resolver, handler := impl.session, impl.view, impl.planner, impl.animator, impl.resolver, impl.handler
 	impl.mu.Unlock()
@@ -1034,16 +1143,19 @@ func (impl *shellImpl) refreshFrameWithContext(c *ui.Context, now time.Time, ins
 			break
 		}
 		scale := impl.scale
+		scaleFactor := impl.scaleFactor
 		lineHeight := impl.lineHeight
 		impl.mu.Unlock()
 		if scale <= 0 {
 			scale = 1
 		}
+		scaleFactor = normalizeUserScaleFactor(scaleFactor)
 		resolver, err := text.NewResolver(text.Config{
-			GUIFont:    targetGUIFont,
-			Scale:      scale,
-			LineSpace:  float32(targetLineSpace),
-			LineHeight: lineHeight,
+			GUIFont:     targetGUIFont,
+			Scale:       scale,
+			ScaleFactor: scaleFactor,
+			LineSpace:   float32(targetLineSpace),
+			LineHeight:  lineHeight,
 		})
 		if err != nil {
 			if targetGUIFont != snapshot.lastGUIFont {
@@ -1066,7 +1178,7 @@ func (impl *shellImpl) refreshFrameWithContext(c *ui.Context, now time.Time, ins
 			impl.animSnapMu.Unlock()
 			return
 		}
-		if scaleChanged(impl.scale, scale) {
+		if scaleChanged(impl.scale, scale) || scaleChanged(impl.scaleFactor, scaleFactor) {
 			impl.forceFullRepaint = true
 			impl.configDirty = true
 			impl.configGeneration++
@@ -1083,6 +1195,8 @@ func (impl *shellImpl) refreshFrameWithContext(c *ui.Context, now time.Time, ins
 		impl.resolver = resolver
 		impl.planner = nextPlanner
 		impl.animator = nextAnimator
+		impl.builtScale = scale
+		impl.builtScaleFactor = scaleFactor
 		planner, animator = impl.planner, impl.animator
 		impl.lastGUIFont = targetGUIFont
 		impl.lastLineSpace = targetLineSpace
