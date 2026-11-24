@@ -509,3 +509,51 @@ func TestRecorderReplayAfterTrimmedWindowWithNewRedraw(t *testing.T) {
 		t.Fatalf("Replay last canonical = %s, want %s", gotCanonical, wantCanonical)
 	}
 }
+
+func TestRecorderRetainsOnlyLatestKeyframeState(t *testing.T) {
+	clock := &testClock{now: time.Unix(100, 0)}
+	recorder := NewRecorder(30*time.Second, clock)
+	reducer := screen.NewReducer()
+
+	for index := 0; index < 8; index++ {
+		applyRedrawMessages(t, recorder, reducer, testRedrawMessage(t, string(rune('a'+index))))
+		clock.Advance(100 * time.Millisecond)
+	}
+
+	recorder.mu.Lock()
+	total := len(recorder.keyframes)
+	nonNil := 0
+	for idx, kf := range recorder.keyframes {
+		if kf.state != nil {
+			nonNil++
+			if idx != total-1 {
+				recorder.mu.Unlock()
+				t.Fatalf("keyframe %d/%d still holds full screen state", idx, total)
+			}
+		}
+	}
+	recorder.mu.Unlock()
+	if total != 8 || nonNil != 1 {
+		t.Fatalf("keyframes=%d nonNil=%d, want total=8 nonNil=1", total, nonNil)
+	}
+
+	dir := filepath.Join(t.TempDir(), "bundle")
+	if err := recorder.Export(dir, Meta{}); err != nil {
+		t.Fatalf("Export: %v", err)
+	}
+	states, err := Replay(dir)
+	if err != nil {
+		t.Fatalf("Replay: %v", err)
+	}
+	want, err := screen.Canonical(reducer.Latest())
+	if err != nil {
+		t.Fatalf("Canonical(Latest): %v", err)
+	}
+	got, err := screen.Canonical(states[len(states)-1])
+	if err != nil {
+		t.Fatalf("Canonical(Replay): %v", err)
+	}
+	if !bytes.Equal(want, got) {
+		t.Fatalf("Replay mismatch: got %s, want %s", got, want)
+	}
+}

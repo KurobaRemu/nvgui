@@ -726,3 +726,25 @@ func waitQueueError(t *testing.T, ch <-chan error, what string) error {
 		return nil
 	}
 }
+
+func TestTraceRecorderBoundsEventsWithMonotonicSeq(t *testing.T) {
+	recorder := input.NewTraceRecorder()
+	const total = 65536 + 12
+	for index := 0; index < total; index++ {
+		recorder.Observe(ui.InputEvent{Kind: ui.InputText, Text: "a"})
+	}
+	events := recorder.Events()
+	if len(events) != 65536 {
+		t.Fatalf("len(events) = %d, want 65536", len(events))
+	}
+	if events[0].Seq != 13 || events[len(events)-1].Seq != total {
+		t.Fatalf("seq range = [%d..%d], want [13..%d]", events[0].Seq, events[len(events)-1].Seq, total)
+	}
+	raw, err := input.MarshalTrace(events[:5])
+	if err != nil {
+		t.Fatalf("MarshalTrace: %v", err)
+	}
+	if _, err := input.UnmarshalTrace(raw); err != nil {
+		t.Fatalf("UnmarshalTrace after trim: %v", err)
+	}
+}

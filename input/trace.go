@@ -10,9 +10,12 @@ import (
 	"github.com/egoist/mygo/ui"
 )
 
+const maxTraceEvents = 65536
+
 type traceRecorderImpl struct {
-	mu     sync.Mutex
-	events []TraceEvent
+	mu      sync.Mutex
+	nextSeq uint64
+	events  []TraceEvent
 }
 
 func newTraceRecorder() *TraceRecorder {
@@ -60,8 +63,9 @@ func traceRecorderObserve(recorder *TraceRecorder, ev ui.InputEvent) {
 	impl := recorder.impl
 	impl.mu.Lock()
 	defer impl.mu.Unlock()
+	impl.nextSeq++
 	impl.events = append(impl.events, TraceEvent{
-		Seq:       uint64(len(impl.events) + 1),
+		Seq:       impl.nextSeq,
 		At:        ev.Time,
 		Kind:      traceKindOf(ev.Kind),
 		Key:       uint16(ev.Key),
@@ -72,6 +76,11 @@ func traceRecorderObserve(recorder *TraceRecorder, ev ui.InputEvent) {
 		Caret:     ev.Caret,
 		Cancelled: ev.Canceled,
 	})
+	if excess := len(impl.events) - maxTraceEvents; excess > 0 {
+		kept := make([]TraceEvent, len(impl.events)-excess)
+		copy(kept, impl.events[excess:])
+		impl.events = kept
+	}
 }
 
 func traceRecorderEvents(recorder *TraceRecorder) []TraceEvent {

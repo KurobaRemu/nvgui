@@ -319,6 +319,9 @@ func (r *Recorder) Keyframe(s *screen.State) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	now := r.clock.Now()
+	if last := len(r.keyframes) - 1; last >= 0 {
+		r.keyframes[last].state = nil
+	}
 	r.keyframes = append(r.keyframes, keyframeRecord{
 		state: cloneState(s),
 		at:    now,
@@ -543,7 +546,6 @@ func (r *Recorder) snapshot(meta Meta) (recorderSnapshot, error) {
 	replayFrom := 0
 	if len(r.keyframes) > 0 {
 		exported := r.keyframes[0]
-		keyframe = cloneState(exported.state)
 		keyframeAt = exported.at
 		for start < len(r.messages) && r.messages[start].sequence < exported.end {
 			start++
@@ -554,7 +556,9 @@ func (r *Recorder) snapshot(meta Meta) (recorderSnapshot, error) {
 			baseSequence = r.nextSeq
 		}
 		latest := r.keyframes[len(r.keyframes)-1]
-		keyframe = cloneState(latest.state)
+		if latest.state != nil {
+			keyframe = cloneState(latest.state)
+		}
 		replayFrom = latest.end - baseSequence
 		exportedMessages := len(r.messages) - start
 		if replayFrom < 0 {
