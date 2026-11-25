@@ -31,8 +31,14 @@ go build -o nvgui ./cmd/nvgui
 - **Cross-DPI & fullscreen/Space resilience**: moving between Retina/non-Retina displays rebuilds font metrics off-lock and re-layouts the grid idempotently; fullscreen toggles, Space switches, and abrupt window-manager resizes snap in-flight animations, force a full repaint, and fill sub-cell canvas margins with the root background color to prevent blank frames or white edges.
 - **Restrained cursor & non-overlapping seamless scroll tape**:
   - Cursor defaults to crisp micro-elastic motion (`80ms` long jump / `30ms` short jump / `trail 0.25`, hard-clamped to `<= 1.5 * maxCell`), snaps instantly in insert mode and during rapid `j`/`k`/`h`/`l` key repeat, and tracks `cursorline` pixel-for-pixel during active scrolling.
-  - Smooth scrolling (`180ms`) advances springs continuously across both 120Hz `Step` frames and incoming `Submit` redraws, retaining a deep (`max(64, innerHeight+4)`) non-overlapping multi-snapshot scroll tape so sustained `<C-d>`/`<C-u>` or held `j`/`k` never expose blank top/bottom edges while keeping floating window borders pixel-stable (`win_viewport_margins`).
+  - Smooth scrolling (`180ms`) advances springs continuously across both 120Hz `Step` frames and incoming `Submit` redraws, coalesces `ScrollDelta` across multi-flush bursts (preventing jumps when plugins like `nvim-treesitter-context` emit follow-up float flushes), and retains a deep (`max(64, innerHeight+4)`) non-overlapping multi-snapshot scroll tape so sustained `<C-d>`/`<C-u>` or held `j`/`k` never expose blank top/bottom edges while keeping floating window borders pixel-stable (`win_viewport_margins`).
   - Settled frames match animations-off output identically (`screen.State` is never mutated), and `AnimationFrame()` stops completely at rest (`idle_frames_delta = 0` over 5s idle with `MYGO_FRAME_STATS=all`).
+- **Full mouse & macOS trackpad scrolling**: supports left/middle/right/x1/x2 clicks, double/triple clicks, cell-deduplicated drag selection, floating window hit-testing & passthrough via Neovim 0.12 native `grid=0` mouse dispatch (`mouse_on`/`mouse_off`, `mousemoveevent`, and `Canceled` drag-release guards), plus a floating-point pixel accumulator with same-direction wheel coalescing in the input queue for smooth vertical and horizontal trackpad scrolling.
+- **Decoupled live font zoom, window title & state persistence**:
+  - Zoom in/out/reset live with `Cmd+=` (`Cmd+Shift+=`) / `Cmd+-` / `Cmd+0`, the native **View** menu (**Zoom In** / **Zoom Out** / **Actual Size**), frame-throttled trackpad pinch (`InputZoom` with font-index reuse), or `:let g:nvgui_scale_factor = 1.25` (clamped `[0.5, 4.0]`). User zoom is decoupled from display backing DPI so moving across Retina/non-Retina displays preserves your zoom factor.
+  - Neovim's `:set title` / `titlestring` syncs live to the native macOS window title (empty title falls back to `"nvgui"`).
+  - The primary window persists its position and size (`StateKey: "main"`) across restarts without secondary `Cmd+N` windows overwriting it, and syncs its initial/default window background color to avoid startup flashes.
+- **Typography & blend polish**: supports highlight `blend`, Neovim `:set linespace`, `NVGUI_LINE_HEIGHT` multiplier, and vertically centered glyph positioning within each cell.
 - **Bidirectional live `vim.g.nvgui_*` hot sync**: environment variables override startup globals; at runtime, `:let g:nvgui_* = ...` applies live without blocking `-- More --` / `Press ENTER` prompts, and Go-side updates sync back to `vim.g.nvgui_*` (`g:nvgui = 1`).
 - **`NVGUI=1` is set in the child Neovim environment at spawn time**: `g:nvgui` only appears after the first RPC sync, so config that must branch during startup (input-method handoff, font setup) should test `vim.env.NVGUI == '1'`.
 
@@ -47,6 +53,8 @@ go build -o nvgui ./cmd/nvgui
 | File handoff target (`"front"` or `"new"`) | `"front"` | `NVGUI_OPEN_IN=front\|new` | `nvgui_open_in` |
 | Single-instance Unix socket path | User temp dir | `NVGUI_SOCKET=/path/to/sock` (or `--socket`) | — |
 | Override startup `guifont` (live `:set guifont=` preserved) | Unset | `NVGUI_GUIFONT="JetBrainsMono Nerd Font:h16"` | `:set guifont=...` |
+| User font zoom scale factor (`0.5`–`4.0`, decoupled from display DPI) | `1.0` | `NVGUI_SCALE_FACTOR=1.25` | `nvgui_scale_factor` (`Cmd+=`/`-`/`0`, View menu) |
+| Cell line height multiplier (`> 0`) | Unset (`1.0`) | `NVGUI_LINE_HEIGHT=1.2` | `:set linespace=...` |
 
 ## Architecture
 
@@ -75,8 +83,8 @@ Command: `go test -run '^$' -bench '^BenchmarkRender(Plan|Draw)4K$' -benchmem -b
 
 | Benchmark | Grid Size | Median Time / op | Batches / op | Bytes / op | Allocs / op | Notes |
 |---|---:|---:|---:|---:|---:|---|
-| `BenchmarkRenderPlan4K` | 240×70 (16,800 cells) | **2.152 ms/op** | **7,241** (**-56.9%** vs 16,800 unmerged cells) | 4.06 MB | 2,998 | Contiguous same-style ASCII run merging + 32B `rowMeta` + OpenType ligatures |
-| `BenchmarkRenderDraw4K` | 160×50 (with float `Clip`) | **1.223 ms/op** | **3,491** | 30.9 KB | 200 | Grouped contiguous `p.Clip` scopes + two-layer content glyph shaping cache |
+| `BenchmarkRenderPlan4K` | 240×70 (16,800 cells) | **2.152 ms/op** | **7,241** (**-56.9%** vs 16,800 unmerged cells) | 4.06 MB | 2,997 | Contiguous same-style ASCII run merging + 32B `rowMeta` + OpenType ligatures |
+| `BenchmarkRenderDraw4K` | 160×50 (with float `Clip`) | **1.130 ms/op** | **3,491** | 28.4 KB | 118 | Grouped contiguous `p.Clip` scopes + two-layer content glyph shaping cache |
 
 ### 2. Bare-Metal Apple M4 Pro (`Mac16,7`, macOS `26.6.2`)
 
