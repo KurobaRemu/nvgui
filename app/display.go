@@ -4,6 +4,7 @@ import (
 	"errors"
 	"fmt"
 	"math"
+	"time"
 
 	"github.com/egoist/mygo"
 	"github.com/egoist/mygo/ui"
@@ -13,12 +14,19 @@ import (
 )
 
 const (
-	scaleEpsilon       = 1e-4
-	minUserScaleFactor = float32(0.5)
-	maxUserScaleFactor = float32(4.0)
-	defaultScaleFactor = float32(1.0)
-	zoomStepDelta      = 0.1
+	scaleEpsilon          = 1e-4
+	minUserScaleFactor    = float32(0.5)
+	maxUserScaleFactor    = float32(4.0)
+	defaultScaleFactor    = float32(1.0)
+	zoomStepDelta         = 0.1
+	pinchThrottleInterval = 33 * time.Millisecond
+	pinchSettleDelay      = 50 * time.Millisecond
+	pinchMinRelativeDelta = 0.02
 )
+
+type pinchTimer interface {
+	Stop() bool
+}
 
 var (
 	errInvalidScale       = errors.New("app: scale must be finite and > 0")
@@ -162,6 +170,7 @@ func updateScaleFactor(shell *Shell, nextFn func(current float32) float32) error
 		impl.mu.Unlock()
 		return errShellClosed
 	}
+	impl.cancelPinchLocked()
 	current := impl.scaleFactor
 	if !finitePositiveFloat32(current) {
 		current = defaultScaleFactor
@@ -178,6 +187,119 @@ func updateScaleFactor(shell *Shell, nextFn func(current float32) float32) error
 	}
 	impl.mu.Unlock()
 	return impl.rebuildDisplayResolver(shell)
+}
+
+func (impl *shellImpl) stopPinchTimerLocked() {
+	impl.pinchGen++
+	if impl.pinchTimer != nil {
+		impl.pinchTimer.Stop()
+		impl.pinchTimer = nil
+	}
+}
+
+func (impl *shellImpl) cancelPinchLocked() {
+	impl.stopPinchTimerLocked()
+	impl.pinchActive = false
+	impl.pinchTarget = 0
+	impl.pinchLastApply = time.Time{}
+}
+
+func (impl *shellImpl) schedulePinchSettleLocked() {
+	impl.stopPinchTimerLocked()
+	gen := impl.pinchGen
+	factory := impl.newPinchTimerFn
+	if factory == nil {
+		factory = func(d time.Duration, fn func()) pinchTimer {
+			return time.AfterFunc(d, fn)
+		}
+	}
+	impl.pinchTimer = factory(pinchSettleDelay, func() {
+		impl.flushPinch(gen)
+	})
+}
+
+func (impl *shellImpl) flushPinch(gen uint64) {
+	impl.mu.Lock()
+	if impl.closed || !impl.started || impl.pinchGen != gen || !impl.pinchActive {
+		impl.mu.Unlock()
+		return
+	}
+	impl.wg.Add(1)
+	defer impl.wg.Done()
+
+	target := roundScaleFactorFloat64(clampUserScaleFactorFloat64(impl.pinchTarget))
+	impl.pinchActive = false
+	impl.pinchTarget = 0
+	impl.pinchTimer = nil
+	impl.pinchLastApply = impl.animClock.Now()
+	impl.explicitScaleFactor = true
+	needRebuild := false
+	if scaleChanged(impl.scaleFactor, target) {
+		impl.scaleFactor = target
+		impl.nvimConfig.snapshot.ScaleFactor = target
+		impl.markSyncPendingLocked()
+		needRebuild = true
+	} else if scaleChanged(impl.builtScaleFactor, impl.scaleFactor) || scaleChanged(impl.builtScale, impl.scale) {
+		needRebuild = true
+	}
+	impl.mu.Unlock()
+	if needRebuild {
+		_ = impl.rebuildDisplayResolver(&Shell{impl: impl})
+	}
+}
+
+func (impl *shellImpl) handlePinchZoom(multiplier float32) {
+	if !finitePositiveFloat32(multiplier) || multiplier == 1 {
+		return
+	}
+	impl.mu.Lock()
+	if impl.closed || !impl.started {
+		impl.mu.Unlock()
+		return
+	}
+	applied := impl.scaleFactor
+	if !finitePositiveFloat32(applied) {
+		applied = defaultScaleFactor
+	}
+	base := float64(applied)
+	if impl.pinchActive {
+		base = impl.pinchTarget
+	}
+	nextTarget := clampUserScaleFactorFloat64(base * float64(multiplier))
+	target := roundScaleFactorFloat64(nextTarget)
+	if !scaleChanged(applied, target) {
+		impl.stopPinchTimerLocked()
+		if nextTarget == float64(applied) || nextTarget == base {
+			impl.pinchActive = false
+			impl.pinchTarget = 0
+		} else {
+			impl.pinchActive = true
+			impl.pinchTarget = nextTarget
+		}
+		impl.mu.Unlock()
+		return
+	}
+	now := impl.animClock.Now()
+	relDelta := math.Abs(float64(target)-float64(applied)) / float64(applied)
+	elapsed := now.Sub(impl.pinchLastApply)
+	elapsedOK := impl.pinchLastApply.IsZero() || elapsed < 0 || elapsed >= pinchThrottleInterval
+	if elapsedOK && relDelta >= pinchMinRelativeDelta {
+		impl.stopPinchTimerLocked()
+		impl.pinchActive = false
+		impl.pinchTarget = 0
+		impl.pinchLastApply = now
+		impl.explicitScaleFactor = true
+		impl.scaleFactor = target
+		impl.nvimConfig.snapshot.ScaleFactor = target
+		impl.markSyncPendingLocked()
+		impl.mu.Unlock()
+		_ = impl.rebuildDisplayResolver(&Shell{impl: impl})
+		return
+	}
+	impl.pinchActive = true
+	impl.pinchTarget = nextTarget
+	impl.schedulePinchSettleLocked()
+	impl.mu.Unlock()
 }
 
 func (impl *shellImpl) handleZoomInput(ev ui.InputEvent) bool {
@@ -198,12 +320,10 @@ func (impl *shellImpl) handleZoomInput(ev ui.InputEvent) bool {
 			return true
 		}
 	case ui.InputZoom:
-		if finitePositiveFloat32(ev.Scale) {
-			if ev.Scale != 1 {
-				_ = shellZoomBy(&Shell{impl: impl}, ev.Scale)
-			}
-			return true
+		if finitePositiveFloat32(ev.Scale) && ev.Scale != 1 {
+			impl.handlePinchZoom(ev.Scale)
 		}
+		return true
 	}
 	return false
 }
@@ -227,27 +347,38 @@ func (impl *shellImpl) rebuildDisplayResolver(shell *Shell) error {
 		guiFont := impl.lastGUIFont
 		lineSpace := impl.lastLineSpace
 		lineHeight := impl.lineHeight
+		baseResolver := impl.resolver
 		impl.mu.Unlock()
 
-		newResolver, err := text.NewResolver(text.Config{
-			GUIFont:     guiFont,
-			Scale:       wantScale,
-			ScaleFactor: wantFactor,
-			LineSpace:   float32(lineSpace),
-			LineHeight:  lineHeight,
-		})
-		if err != nil {
-			if guiFont == "" {
-				return fmt.Errorf("app: create font resolver for scale %v/%v: %w", wantScale, wantFactor, err)
+		var newResolver *text.Resolver
+		var err error
+		if baseResolver != nil {
+			baseCfg := baseResolver.Config()
+			if baseCfg.GUIFont == guiFont && baseCfg.LineSpace == float32(lineSpace) && baseCfg.LineHeight == lineHeight {
+				newResolver, err = baseResolver.CloneForScale(wantScale, wantFactor)
 			}
+		}
+		if newResolver == nil {
 			newResolver, err = text.NewResolver(text.Config{
+				GUIFont:     guiFont,
 				Scale:       wantScale,
 				ScaleFactor: wantFactor,
 				LineSpace:   float32(lineSpace),
 				LineHeight:  lineHeight,
 			})
 			if err != nil {
-				return fmt.Errorf("app: create font resolver for scale %v/%v: %w", wantScale, wantFactor, err)
+				if guiFont == "" {
+					return fmt.Errorf("app: create font resolver for scale %v/%v: %w", wantScale, wantFactor, err)
+				}
+				newResolver, err = text.NewResolver(text.Config{
+					Scale:       wantScale,
+					ScaleFactor: wantFactor,
+					LineSpace:   float32(lineSpace),
+					LineHeight:  lineHeight,
+				})
+				if err != nil {
+					return fmt.Errorf("app: create font resolver for scale %v/%v: %w", wantScale, wantFactor, err)
+				}
 			}
 		}
 

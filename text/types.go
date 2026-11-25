@@ -53,3 +53,7 @@ func (r *Resolver) ShapeCalls() int {
 func (r *Resolver) ClearCache() {
 	resolverClearCache(r)
 }
+
+func (r *Resolver) CloneForScale(scale, scaleFactor float32) (*Resolver, error) {
+	return resolverCloneForScale(r, scale, scaleFactor)
+}

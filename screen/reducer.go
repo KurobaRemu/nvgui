@@ -67,6 +67,7 @@ func (r *Reducer) Apply(events []protocol.Event) ([]*State, error) {
 				viewport.HasScrollDelta = false
 				r.workingMeta.Viewports[gridID] = viewport
 			}
+			r.workingMeta.scrollResets = nil
 			if index+1 < len(events) {
 				metaCheckpoint = cloneFrameMeta(r.workingMeta)
 				checkpoint = cloneState(r.working)

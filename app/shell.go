@@ -84,6 +84,12 @@ type shellImpl struct {
 	builtScale            float32
 	builtScaleFactor      float32
 	explicitScaleFactor   bool
+	pinchActive           bool
+	pinchTarget           float64
+	pinchLastApply        time.Time
+	pinchGen              uint64
+	pinchTimer            pinchTimer
+	newPinchTimerFn       func(time.Duration, func()) pinchTimer
 	windowTitle           string
 	windowBackground      string
 	fullScreen            bool
@@ -889,6 +895,7 @@ func (impl *shellImpl) finishClose() {
 		return
 	}
 	impl.closed = true
+	impl.cancelPinchLocked()
 	close(impl.closing)
 	started := impl.started
 	offs := detachDisplayCleanup(impl)
@@ -1035,6 +1042,7 @@ func (impl *shellImpl) refreshFrameWithContext(c *ui.Context, now time.Time, ins
 		return
 	}
 	forceFullRepaint, snapNextFrame = impl.consumeDisplayFlags()
+	lastSeq := impl.lastSeq
 	impl.mu.Unlock()
 	if forceFullRepaint || snapNextFrame {
 		defer func() {
@@ -1046,7 +1054,13 @@ func (impl *shellImpl) refreshFrameWithContext(c *ui.Context, now time.Time, ins
 	if snapNextFrame {
 		instant = true
 	}
-	state, meta := impl.session.LatestSnapshot()
+	var state *screen.State
+	var meta *screen.FrameMeta
+	if instant || forceFullRepaint || lastSeq == 0 {
+		state, meta = impl.session.LatestSnapshot()
+	} else {
+		state, meta = impl.session.LatestSnapshotSince(lastSeq)
+	}
 	if state == nil {
 		return
 	}
@@ -1057,9 +1071,6 @@ func (impl *shellImpl) refreshFrameWithContext(c *ui.Context, now time.Time, ins
 	impl.mu.Unlock()
 	if session == nil || view == nil || planner == nil || animator == nil || resolver == nil || handler == nil {
 		return
-	}
-	if instant {
-		meta = cloneFrameMetaWithoutScroll(meta)
 	}
 
 	impl.mu.Lock()
@@ -1236,6 +1247,9 @@ func (impl *shellImpl) refreshFrameWithContext(c *ui.Context, now time.Time, ins
 		return
 	}
 
+	if instant || !snapshot.newSeq {
+		meta = cloneFrameMetaWithoutScroll(meta)
+	}
 	var frame renderlist.Frame
 	var active bool
 	if instant {
@@ -1272,7 +1286,9 @@ func (impl *shellImpl) refreshFrameWithContext(c *ui.Context, now time.Time, ins
 		return
 	}
 	impl.mu.Lock()
-	impl.lastSeq = state.Seq
+	if state.Seq > impl.lastSeq {
+		impl.lastSeq = state.Seq
+	}
 	impl.lastAnimNow = now
 	if snapshot.configDirty && impl.configGeneration == snapshot.generation {
 		impl.configDirty = false

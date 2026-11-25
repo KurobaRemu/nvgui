@@ -29,7 +29,11 @@ type FrameMeta struct {
 	MouseMoveEvent bool
 	Title          string
 	HasTitle       bool
+	scrollResets   map[int]bool
 }
 
 func (r *Reducer) LatestMeta() *FrameMeta           { return reducerLatestMeta(r) }
 func (r *Reducer) MetaForSeq(seq uint64) *FrameMeta { return reducerMetaForSeq(r, seq) }
+func (r *Reducer) AggregateMetaSince(sinceSeq, targetSeq uint64) *FrameMeta {
+	return reducerAggregateMetaSince(r, sinceSeq, targetSeq)
+}

@@ -166,6 +166,23 @@ func TestZoomTitleState_BidirectionalHotSync(t *testing.T) {
 		t.Fatalf("invalid g:nvgui_scale_factor altered ScaleFactor to %v, want 1.25", got)
 	}
 
+	// Huge finite float64 (> math.MaxFloat32) must clamp to 4.0 instead of overflowing float32 to +Inf -> 1.0.
+	if err := shell.impl.session.Nvim().Command("let g:nvgui_scale_factor = 1.0e308"); err != nil {
+		t.Fatalf("Command(1.0e308 scale_factor): %v", err)
+	}
+	waitUntil(t, 5*time.Second, "Neovim->Go huge float64 clamped to 4.0", func() bool {
+		s, syncErr := shell.SyncNvimConfig(context.Background())
+		return syncErr == nil && math.Abs(float64(s.ScaleFactor-4.0)) < 1e-4 && math.Abs(float64(shell.ScaleFactor()-4.0)) < 1e-4
+	})
+	if err := shell.SetScaleFactor(1.25); err != nil {
+		t.Fatalf("restore SetScaleFactor(1.25): %v", err)
+	}
+	waitUntil(t, 5*time.Second, "restore g:nvgui_scale_factor == 1.25", func() bool {
+		_, _ = shell.SyncNvimConfig(context.Background())
+		var got float64
+		return shell.impl.session.Nvim().Eval("get(g:, 'nvgui_scale_factor', 0)", &got) == nil && math.Abs(got-1.25) < 1e-4
+	})
+
 	// 3. Go -> Neovim reverse sync via ZoomIn / ZoomOut / ZoomReset.
 	if err := shell.ZoomIn(); err != nil {
 		t.Fatalf("ZoomIn: %v", err)

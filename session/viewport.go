@@ -8,6 +8,10 @@ type snapshotSource interface {
 	MetaForSeq(uint64) *screen.FrameMeta
 }
 
+type metaAggregator interface {
+	AggregateMetaSince(sinceSeq, targetSeq uint64) *screen.FrameMeta
+}
+
 func sessionLatestMeta(s *Session) *screen.FrameMeta {
 	if s == nil || s.reducer == nil {
 		return nil
@@ -20,6 +24,26 @@ func sessionLatestSnapshot(s *Session) (*screen.State, *screen.FrameMeta) {
 		return nil, nil
 	}
 	return sessionLatestSnapshotFrom(s.reducer)
+}
+
+func sessionLatestSnapshotSince(s *Session, sinceSeq uint64) (*screen.State, *screen.FrameMeta) {
+	if s == nil || s.reducer == nil {
+		return nil, nil
+	}
+	return sessionLatestSnapshotSinceFrom(s.reducer, sinceSeq)
+}
+
+func sessionLatestSnapshotSinceFrom(src snapshotSource, sinceSeq uint64) (*screen.State, *screen.FrameMeta) {
+	state, meta := sessionLatestSnapshotFrom(src)
+	if state == nil || meta == nil || sinceSeq == 0 || state.Seq <= sinceSeq+1 {
+		return state, meta
+	}
+	if aggregator, ok := src.(metaAggregator); ok {
+		if aggregated := aggregator.AggregateMetaSince(sinceSeq, state.Seq); aggregated != nil && aggregated.Seq == state.Seq {
+			return state, aggregated
+		}
+	}
+	return state, meta
 }
 
 func sessionLatestSnapshotFrom(src snapshotSource) (*screen.State, *screen.FrameMeta) {

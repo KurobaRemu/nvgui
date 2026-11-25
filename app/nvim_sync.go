@@ -183,6 +183,7 @@ func shellSyncNvimConfig(shell *Shell, ctx context.Context) (NvimConfigSnapshot,
 		if initialChanged {
 			impl.applySnapshotToShellLocked(merged)
 			if scaleFactorChanged {
+				impl.cancelPinchLocked()
 				impl.scaleFactor = merged.ScaleFactor
 			}
 			impl.configDirty = true
@@ -339,8 +340,8 @@ func initialNvimConfig(impl *shellImpl, remote map[string]any, before NvimConfig
 	_, envScaleSet := scaleFactorFromEnv(impl.req.Env)
 	if !envScaleSet && !impl.explicitScaleFactor && !impl.explicitConfig {
 		if value, ok := remote["nvgui_scale_factor"]; ok && value != nil {
-			if parsed, ok := valueToFloat(value); ok && parsed > 0 {
-				merged.ScaleFactor = normalizeUserScaleFactor(float32(parsed))
+			if parsed, ok := valueToFloat(value); ok && !math.IsNaN(parsed) && !math.IsInf(parsed, 0) && parsed > 0 {
+				merged.ScaleFactor = roundScaleFactorFloat64(clampUserScaleFactorFloat64(parsed))
 			}
 		}
 	}
@@ -457,8 +458,8 @@ func applyRemoteConfig(shell *Shell, remote map[string]any, local NvimConfigSnap
 		}
 	}
 	if value, ok := remote["nvgui_scale_factor"]; ok && value != nil {
-		if parsed, ok := valueToFloat(value); ok && parsed > 0 {
-			clamped := normalizeUserScaleFactor(float32(parsed))
+		if parsed, ok := valueToFloat(value); ok && !math.IsNaN(parsed) && !math.IsInf(parsed, 0) && parsed > 0 {
+			clamped := roundScaleFactorFloat64(clampUserScaleFactorFloat64(parsed))
 			synced.ScaleFactor = clamped
 			remoteChanged = true
 			if scaleChanged(baseline.ScaleFactor, clamped) {
@@ -482,6 +483,7 @@ func applyRemoteConfig(shell *Shell, remote map[string]any, local NvimConfigSnap
 	impl.nvimConfig.snapshot = next
 	impl.applySnapshotToShellLocked(next)
 	if scaleFactorChanged {
+		impl.cancelPinchLocked()
 		impl.scaleFactor = next.ScaleFactor
 	}
 	impl.configDirty = true

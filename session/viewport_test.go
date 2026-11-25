@@ -1,6 +1,7 @@
 package session
 
 import (
+	"math"
 	"testing"
 
 	"nvgui/protocol"
@@ -132,4 +133,103 @@ func (s *retrySnapshotSource) MetaForSeq(seq uint64) *screen.FrameMeta {
 		return s.meta
 	}
 	return meta
+}
+
+func sessionWinViewport(grid, win int, top, bot, curLine, curCol, lineCount int64, delta float64) protocol.Event {
+	return protocol.Unknown{
+		Name: "win_viewport",
+		Args: []any{
+			int64(grid),
+			protocol.Handle{Kind: 2, ID: int64(win)},
+			top, bot, curLine, curCol, lineCount, delta,
+		},
+	}
+}
+
+func TestLatestSnapshotSinceAggregatesMultiFlushScrollDelta(t *testing.T) {
+	reducer := screen.NewReducer()
+	s1, err := reducer.Apply([]protocol.Event{
+		protocol.GridResize{Grid: 1, Width: 80, Height: 24},
+		protocol.GridResize{Grid: 2, Width: 80, Height: 24},
+		protocol.WinPos{Grid: 2, Win: 1000, StartRow: 0, StartCol: 0, Width: 80, Height: 24},
+		sessionWinViewport(2, 1000, 0, 24, 0, 0, 300, 0),
+		protocol.Flush{},
+	})
+	if err != nil {
+		t.Fatalf("frame 1: %v", err)
+	}
+	sess := &Session{reducer: reducer}
+	seq1 := s1[0].Seq
+
+	// Flush 2 (+3) + Flush 3 (float update, main grid delta cleared) -> LatestSnapshotSince(seq1) keeps +3.
+	if _, err := reducer.Apply([]protocol.Event{
+		sessionWinViewport(2, 1000, 3, 27, 3, 0, 300, 3.0),
+		protocol.Flush{},
+		protocol.GridResize{Grid: 3, Width: 80, Height: 1},
+		protocol.WinFloatPos{Grid: 3, Win: 1008, Anchor: "NW", AnchorGrid: 2, ScreenRow: 0, ScreenCol: 0, ZIndex: 20, CompIndex: 2},
+		protocol.Flush{},
+	}); err != nil {
+		t.Fatalf("frames 2..3: %v", err)
+	}
+	state, meta := sess.LatestSnapshotSince(seq1)
+	if state == nil || meta == nil || state.Seq != meta.Seq {
+		t.Fatalf("LatestSnapshotSince(%d) = (%+v, %+v)", seq1, state, meta)
+	}
+	if vp := meta.Viewports[2]; !vp.HasScrollDelta || math.Abs(vp.ScrollDelta-3.0) > 1e-9 {
+		t.Fatalf("float-interleaved ScrollDelta = %+v, want 3.0", vp)
+	}
+
+	// Single-frame sinceSeq == state.Seq-1 or sinceSeq == 0 matches LatestSnapshot semantics.
+	singleState, singleMeta := sess.LatestSnapshotSince(state.Seq - 1)
+	if singleState != state || singleMeta == nil || singleMeta.Viewports[2].HasScrollDelta {
+		t.Fatalf("single-frame LatestSnapshotSince = (%p, %+v), want cleared delta on latest frame", singleState, singleMeta)
+	}
+	zeroState, zeroMeta := sess.LatestSnapshotSince(0)
+	if zeroState != state || zeroMeta == nil || zeroMeta.Viewports[2].HasScrollDelta {
+		t.Fatalf("sinceSeq=0 LatestSnapshotSince = (%p, %+v), want LatestSnapshot semantics", zeroState, zeroMeta)
+	}
+
+	// Flush 4 (+3) + Flush 5 (+2) -> aggregates to +5.
+	seq3 := state.Seq
+	if _, err := reducer.Apply([]protocol.Event{
+		sessionWinViewport(2, 1000, 6, 30, 6, 0, 300, 3.0),
+		protocol.Flush{},
+		sessionWinViewport(2, 1000, 8, 32, 8, 0, 300, 2.0),
+		protocol.Flush{},
+	}); err != nil {
+		t.Fatalf("frames 4..5: %v", err)
+	}
+	state5, meta5 := sess.LatestSnapshotSince(seq3)
+	if vp := meta5.Viewports[2]; !vp.HasScrollDelta || math.Abs(vp.ScrollDelta-5.0) > 1e-9 {
+		t.Fatalf("summed ScrollDelta = %+v, want 5.0", vp)
+	}
+
+	// Flush 6 (+3) + Flush 7 (grid_resize) + Flush 8 (+1) -> reset takes effect, returns +1.
+	seq5 := state5.Seq
+	if _, err := reducer.Apply([]protocol.Event{
+		sessionWinViewport(2, 1000, 11, 35, 11, 0, 300, 3.0),
+		protocol.Flush{},
+		protocol.GridResize{Grid: 2, Width: 70, Height: 20},
+		protocol.Flush{},
+		sessionWinViewport(2, 1000, 12, 32, 12, 0, 300, 1.0),
+		protocol.Flush{},
+	}); err != nil {
+		t.Fatalf("frames 6..8: %v", err)
+	}
+	_, meta8 := sess.LatestSnapshotSince(seq5)
+	if vp := meta8.Viewports[2]; !vp.HasScrollDelta || math.Abs(vp.ScrollDelta-1.0) > 1e-9 {
+		t.Fatalf("post-resize ScrollDelta = %+v, want 1.0", vp)
+	}
+
+	// Non-aggregating snapshotSource safely falls back to LatestSnapshotFrom.
+	stub := &stubSnapshotSource{
+		state: &screen.State{Seq: 5},
+		metaForSeq: map[uint64]*screen.FrameMeta{
+			5: {Seq: 5, Viewports: map[int]screen.Viewport{1: {Grid: 1, TopLine: 2}}},
+		},
+	}
+	gotState, gotMeta := sessionLatestSnapshotSinceFrom(stub, 1)
+	if gotState != stub.state || gotMeta == nil || gotMeta.Seq != 5 {
+		t.Fatalf("fallback LatestSnapshotSinceFrom = (%p, %+v)", gotState, gotMeta)
+	}
 }

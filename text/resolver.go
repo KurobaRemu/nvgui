@@ -183,6 +183,43 @@ func resolverClearCache(resolver *Resolver) {
 	impl.cellScaleFactor = factor
 }
 
+func resolverCloneForScale(resolver *Resolver, scale, scaleFactor float32) (*Resolver, error) {
+	if resolver == nil || resolver.impl == nil {
+		return nil, fmt.Errorf("text: nil resolver")
+	}
+	if !isFinite(scale) || scale < 0 {
+		return nil, fmt.Errorf("text: invalid scale %v", scale)
+	}
+	if scale == 0 {
+		scale = 1
+	}
+	if scaleFactor != 0 {
+		scaleFactor = normalizeScaleFactor(scaleFactor)
+	}
+	src := resolver.impl
+	src.mu.Lock()
+	cfg := src.cfg
+	primary := append([]Font(nil), src.primary...)
+	fallbacks := append([]fallbackEntry(nil), src.fallbacks...)
+	familyIdx := src.familyIdx
+	src.mu.Unlock()
+
+	cfg.Scale = scale
+	cfg.ScaleFactor = scaleFactor
+	normFactor := normalizeScaleFactor(cfg.ScaleFactor)
+	cloned := &resolverImpl{
+		cfg:             cfg,
+		primary:         primary,
+		fallbacks:       fallbacks,
+		familyIdx:       familyIdx,
+		cellValid:       false,
+		cellScale:       cfg.Scale,
+		cellScaleFactor: normFactor,
+		shaped:          newShapeCache(cfg.Scale, normFactor),
+	}
+	return &Resolver{impl: cloned}, nil
+}
+
 func parseUserFonts(value string, index fontFamilyIndex) ([]Font, error) {
 	if strings.TrimSpace(value) == "" {
 		return []Font{{

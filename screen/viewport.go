@@ -67,6 +67,14 @@ func cloneFrameMeta(source *FrameMeta) *FrameMeta {
 	for gridID, margins := range source.Margins {
 		clone.Margins[gridID] = margins
 	}
+	if len(source.scrollResets) > 0 {
+		clone.scrollResets = make(map[int]bool, len(source.scrollResets))
+		for gridID, reset := range source.scrollResets {
+			clone.scrollResets[gridID] = reset
+		}
+	} else {
+		clone.scrollResets = nil
+	}
 	return &clone
 }
 
@@ -110,6 +118,54 @@ func reducerMetaForSeq(r *Reducer, seq uint64) *FrameMeta {
 		return nil
 	}
 	return cloneFrameMeta(entry)
+}
+
+func reducerAggregateMetaSince(r *Reducer, sinceSeq, targetSeq uint64) *FrameMeta {
+	if r == nil || targetSeq == 0 {
+		return nil
+	}
+	history := r.history()
+	history.mu.Lock()
+	defer history.mu.Unlock()
+
+	target, exists := history.entries[targetSeq]
+	if !exists || target == nil {
+		return nil
+	}
+	if sinceSeq == 0 || targetSeq <= sinceSeq+1 || targetSeq-sinceSeq > frameMetaHistoryCapacity {
+		return cloneFrameMeta(target)
+	}
+	for seq := sinceSeq + 1; seq <= targetSeq; seq++ {
+		if entry := history.entries[seq]; entry == nil {
+			return cloneFrameMeta(target)
+		}
+	}
+	result := cloneFrameMeta(target)
+	for gridID, targetVP := range result.Viewports {
+		var sum float64
+		var has bool
+		for seq := sinceSeq + 1; seq <= targetSeq; seq++ {
+			entry := history.entries[seq]
+			if entry.scrollResets[gridID] {
+				sum = 0
+				has = false
+			}
+			vp, ok := entry.Viewports[gridID]
+			if !ok {
+				sum = 0
+				has = false
+				continue
+			}
+			if vp.HasScrollDelta {
+				sum += vp.ScrollDelta
+				has = true
+			}
+		}
+		targetVP.ScrollDelta = sum
+		targetVP.HasScrollDelta = has
+		result.Viewports[gridID] = targetVP
+	}
+	return result
 }
 
 func (r *Reducer) applyFrameMetaEvent(state *State, event protocol.Event) {
@@ -223,6 +279,10 @@ func (r *Reducer) clearFrameMetaScrollDelta(gridID int) {
 	r.metaMu.Lock()
 	defer r.metaMu.Unlock()
 	meta := r.workingFrameMetaLocked()
+	if meta.scrollResets == nil {
+		meta.scrollResets = make(map[int]bool)
+	}
+	meta.scrollResets[gridID] = true
 	viewport, exists := meta.Viewports[gridID]
 	if !exists {
 		return
@@ -236,6 +296,10 @@ func (r *Reducer) clearFrameMetaGrid(gridID int) {
 	r.metaMu.Lock()
 	defer r.metaMu.Unlock()
 	meta := r.workingFrameMetaLocked()
+	if meta.scrollResets == nil {
+		meta.scrollResets = make(map[int]bool)
+	}
+	meta.scrollResets[gridID] = true
 	delete(meta.Viewports, gridID)
 	delete(meta.Margins, gridID)
 }
