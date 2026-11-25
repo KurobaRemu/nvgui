@@ -34,6 +34,7 @@ go build -o nvgui ./cmd/nvgui
   - Smooth scrolling (`180ms`) advances springs continuously across both 120Hz `Step` frames and incoming `Submit` redraws, retaining a deep (`max(64, innerHeight+4)`) non-overlapping multi-snapshot scroll tape so sustained `<C-d>`/`<C-u>` or held `j`/`k` never expose blank top/bottom edges while keeping floating window borders pixel-stable (`win_viewport_margins`).
   - Settled frames match animations-off output identically (`screen.State` is never mutated), and `AnimationFrame()` stops completely at rest (`idle_frames_delta = 0` over 5s idle with `MYGO_FRAME_STATS=all`).
 - **Bidirectional live `vim.g.nvgui_*` hot sync**: environment variables override startup globals; at runtime, `:let g:nvgui_* = ...` applies live without blocking `-- More --` / `Press ENTER` prompts, and Go-side updates sync back to `vim.g.nvgui_*` (`g:nvgui = 1`).
+- **`NVGUI=1` is set in the child Neovim environment at spawn time**: `g:nvgui` only appears after the first RPC sync, so config that must branch during startup (input-method handoff, font setup) should test `vim.env.NVGUI == '1'`.
 
 | Feature | Default | Environment Variable | Live Neovim Global (`vim.g.*`) |
 |---|---|---|---|

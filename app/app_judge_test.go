@@ -402,3 +402,26 @@ func TestAppDiagnosticsShortcut(t *testing.T) {
 		t.Fatalf("Shortcut triggered %d times after Cmd+Shift+D, want 1", triggered)
 	}
 }
+
+func TestLaunchConnectionOptionsMarksChildNVGUI(t *testing.T) {
+	req := app.LaunchRequest{
+		Env:        []string{"PATH=/usr/bin", "NVGUI=0", "HOME=/tmp"},
+		WorkingDir: "/tmp",
+	}
+	opts := req.ConnectionOptions()
+	count := 0
+	for _, entry := range opts.Env {
+		if strings.HasPrefix(entry, "NVGUI=") {
+			count++
+			if entry != "NVGUI=1" {
+				t.Errorf("child NVGUI entry = %q, want NVGUI=1", entry)
+			}
+		}
+	}
+	if count != 1 {
+		t.Fatalf("child NVGUI entries = %d, want exactly 1: %v", count, opts.Env)
+	}
+	if last := opts.Env[len(opts.Env)-1]; last != "NVGUI=1" {
+		t.Errorf("last child env = %q, want NVGUI=1 appended last", last)
+	}
+}

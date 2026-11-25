@@ -195,11 +195,25 @@ func envHasKey(env []string, key string) bool {
 func launchConnectionOptions(req LaunchRequest) connection.Options {
 	return connection.Options{
 		Args:   append([]string(nil), req.Args...),
-		Env:    append([]string(nil), req.Env...),
+		Env:    guiChildEnv(req.Env),
 		Dir:    req.WorkingDir,
 		Width:  req.Width,
 		Height: req.Height,
 	}
+}
+
+// guiChildEnv marks the embedded Neovim process as started by nvgui so that
+// user config can tell the GUI apart before any RPC message arrives. The flag
+// is set at spawn time because g:nvgui only lands after the first sync.
+func guiChildEnv(env []string) []string {
+	child := make([]string, 0, len(env)+1)
+	for _, entry := range env {
+		if strings.HasPrefix(entry, "NVGUI=") {
+			continue
+		}
+		child = append(child, entry)
+	}
+	return append(child, "NVGUI=1")
 }
 
 func envValue(env []string, key string) string {
